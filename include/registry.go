@@ -38,6 +38,9 @@ import (
 	"github.com/sagernet/sing-box/service/resolved"
 	"github.com/sagernet/sing-box/service/ssmapi"
 	E "github.com/sagernet/sing/common/exceptions"
+
+    // Новое
+	"github.com/sagernet/sing-box/adapter/inbound/custom"
 )
 
 func Context(ctx context.Context) context.Context {
@@ -46,6 +49,9 @@ func Context(ctx context.Context) context.Context {
 
 func InboundRegistry() *inbound.Registry {
 	registry := inbound.NewRegistry()
+
+	// РЕГИСТРАЦИЯ:
+    inbound.Register[custom.Options](registry, "custom_internal", custom.New)
 
 	tun.RegisterInbound(registry)
 	redirect.RegisterRedirect(registry)

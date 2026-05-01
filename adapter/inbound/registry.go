@@ -8,6 +8,8 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
+
+	"github.com/sagernet/sing-box/adapter/inbound/custom"
 )
 
 type ConstructorFunc[T any] func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options T) (adapter.Inbound, error)
@@ -38,10 +40,16 @@ type Registry struct {
 }
 
 func NewRegistry() *Registry {
-	return &Registry{
-		optionsType: make(map[string]optionsConstructorFunc),
-		constructor: make(map[string]constructorFunc),
-	}
+	// Создаем экземпляр реестра
+    r := &Registry{
+       optionsType: make(map[string]optionsConstructorFunc),
+       constructor: make(map[string]constructorFunc),
+    }
+
+    // === NEKODESK: РЕГИСТРИРУЕМ НАШ ИНБАУНД ===
+    Register[custom.Options](r, "custom_internal", custom.New)
+
+    return r
 }
 
 func (m *Registry) CreateOptions(outboundType string) (any, bool) {

@@ -123,10 +123,37 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	if deadline.NeedAdditionalReadDeadline(conn) {
 		conn = deadline.NewConn(conn)
 	}
-	selectedRule, _, buffers, _, err := r.matchRule(ctx, &metadata, false, conn, nil)
-	if err != nil {
-		return err
-	}
+	// В этот момент Sing-box определяет ProcessInfo
+    selectedRule, _, buffers, _, err := r.matchRule(ctx, &metadata, false, conn, nil)
+    if err != nil {
+    	return err
+    }
+
+    // --- НАЧАЛО: ЖЕСТКИЙ БЕЛЫЙ СПИСОК ДЛЯ TUN ---
+    if metadata.InboundType == "tun" {
+    	isAllowed := false
+
+    	if metadata.ProcessInfo != nil {
+    		uid := int(metadata.ProcessInfo.UserId)      // UID процесса
+
+    		// Прописываем разрешенные приложения
+    		if !sharedfirewall.IsUidAllowed(uid) {
+            	buf.ReleaseMulti(buffers) // Очищаем буфер
+            	return fmt.Errorf("TCP connection from UID %d blocked by strict TUN rules", uid)
+            }
+            // Или можно пускать по определенному UID (например, системные)
+    		if uid == 1000 {
+    	    	isAllowed = false
+    		}
+        }
+
+    	if !isAllowed {
+    		buf.ReleaseMulti(buffers) // Обязательно освобождаем память
+    		// Имитируем reject-правило: закрываем соединение
+    		return errors.New("Direct connection blocked by strict TUN whitelist")
+    	}
+    }
+    // --- КОНЕЦ ---
 	var selectedOutbound adapter.Outbound
 	if selectedRule != nil {
 		switch action := selectedRule.Action().(type) {
@@ -261,6 +288,18 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	if err != nil {
 		return err
 	}
+
+    // --- ВТОРИЧНАЯ ЗАЩИТА TUN ДЛЯ UDP ---
+    if metadata.InboundType == "tun" && metadata.ProcessInfo != nil {
+        uid := int(metadata.ProcessInfo.UserId)
+
+        // Проверяем только Android-приложения (UID >= 10000)
+        if !sharedfirewall.IsUidAllowed(uid) {
+            N.ReleaseMultiPacketBuffer(packetBuffers) // В UDP очищаем packetBuffers!
+            return fmt.Errorf("UDP packet from UID %d blocked by strict TUN rules", uid)
+        }
+    }
+    // --- КОНЕЦ ---
 	var selectedOutbound adapter.Outbound
 	var selectReturn bool
 	if selectedRule != nil {

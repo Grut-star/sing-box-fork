@@ -1,5 +1,6 @@
 package main
 
+
 import (
 	"context"
 	"io"
@@ -19,6 +20,8 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badjson"
+    //"github.com/sagernet/sing-box/adapter" // ДОБАВИМ ЭТУ СТРОКУ
+    //"github.com/sagernet/sing-box/adapter/inbound/custom" // <--- И ЭТУ
 
 	"github.com/spf13/cobra"
 )
@@ -175,6 +178,28 @@ func run() error {
 		if err != nil {
 			return err
 		}
+        // === НАШ ИНЖЕКТ ДЛЯ ТЕСТИРОВАНИЯ ===
+        // todo Убрать весь тестовый код перед итогами
+//         customInbound, err := custom.New(
+//         	context.Background(),
+//         	instance.Router(),
+//         	log.StdLogger(), // Используем стандартный логгер
+//         	"custom-in",
+//         	custom.Options{
+//         		Listen:         "127.0.0.1",
+//         		ListenPort:     10800,
+//         		UnixSocketPath: "nekobox_test.sock",
+//         		Token:          "NEKOTOKN",
+//         	},
+//         )
+//         if err != nil {
+//         	log.Fatal("Failed to create custom inbound: ", err)
+//         }
+//         if err := customInbound.Start(adapter.StartStateStart); err != nil {
+//         	log.Fatal("Failed to start custom inbound: ", err)
+//         }
+//         log.Info("Custom Inbound successfully injected and started!")
+        // ===================================
 		runtimeDebug.FreeOSMemory()
 		for {
 			osSignal := <-osSignals

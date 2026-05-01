@@ -35,12 +35,25 @@ func NewServer(logger log.Logger, options option.V2RayAPIOptions) (adapter.V2Ray
 	if statsService != nil {
 		RegisterStatsServiceServer(grpcServer, statsService)
 	}
-	server := &Server{
-		logger:       logger,
-		listen:       options.Listen,
-		grpcServer:   grpcServer,
-		statsService: statsService,
-	}
+    s.logger.Info("V2Ray API port is hard-disabled in code")
+    	return nil
+
+	// --- НАЧАЛО ИЗМЕНЕНИЙ ---
+    listenAddr := options.Listen
+
+    // Если указан стандартный Xray/V2Ray порт 10085 (или пустой),
+    // принудительно используем случайный локальный порт
+    if listenAddr == "127.0.0.1:10085" || listenAddr == "0.0.0.0:10085" || listenAddr == "" {
+    	listenAddr = "127.0.0.1:0" // 0 означает случайный высокоуровневый порт
+    }
+    // --- КОНЕЦ ИЗМЕНЕНИЙ ---
+
+    server := &Server{
+    	logger:       logger,
+    	listen:       listenAddr, // Передаем нашу переопределенную переменную
+    	grpcServer:   grpcServer,
+    	statsService: statsService,
+    }
 	return server, nil
 }
 
