@@ -1,0 +1,59 @@
+name: Build Chromium Stack (Android ARM64)
+
+on:
+  push:
+    paths:
+      - 'stack_builder/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 ninja-build wget git
+
+      - name: Setup Depot Tools
+        run: |
+          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+          echo "$GITHUB_WORKSPACE/depot_tools" >> $GITHUB_PATH
+
+      - name: Fetch Chromium v152 Source (Shallow)
+        run: |
+          mkdir chromium_build && cd chromium_build
+          cat <<EOF > .gclient
+          solutions = [
+            { "name"        : "src",
+              "url"         : "https://chromium.googlesource.com/chromium/src.git@152.0.7977.42",
+              "deps_file"   : "DEPS",
+              "managed"     : False,
+              "custom_deps" : {},
+            },
+          ]
+          target_os = ['android']
+          EOF
+          gclient sync --no-history --shallow
+
+      - name: Apply Eidolon Patches
+        run: |
+          cd chromium_build/src
+          python3 ../../stack_builder/patch_chromium_v152.py
+          cp ../../stack_builder/eidolon_bridge.* net/socket/
+          sed -i '/"socket\/tcp_client_socket.cc",/a \    "socket/eidolon_bridge.cc",' net/BUILD.gn
+
+      - name: Compile Library
+        run: |
+          cd chromium_build/src
+          gn gen out/Android --args='target_os="android" target_cpu="arm64" is_debug=false is_component_build=true symbol_level=0'
+          autoninja -C out/Android net boringssl
+
+      - name: Upload Native Stack Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libeidolon_net_arm64
+          path: chromium_build/src/out/Android/libnet.so
