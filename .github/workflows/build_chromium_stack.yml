@@ -1,41 +1,33 @@
 name: Build Chromium Stack (Android ARM64)
 
 on:
-  push:
-    paths:
-      - 'stack_builder/**'
-  workflow_dispatch:
+  workflow_dispatch: # Ручной запуск через кнопку "Run workflow"
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # 1. Агрессивная очистка диска: освобождает ~50 ГБ места!
+      - name: Maximize Build Space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 1024
+          remove-dotnet: 'true'
+          remove-android: 'true' # gclient скачает нужный NDK сам
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+
       - name: Checkout Code
         uses: actions/checkout@v4
-
-      # ВАЖНО: Агрессивная очистка диска GitHub-раннера (+30 ГБ)
-      - name: Maximize Build Space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3 ninja-build wget git
 
       - name: Setup Depot Tools
         run: |
           git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
           echo "$GITHUB_WORKSPACE/depot_tools" >> $GITHUB_PATH
 
-      - name: Fetch Chromium v152 Source (Shallow)
+      # 2. Правильное скачивание: ТОЛЬКО 1 коммит, ТОЛЬКО нужная ОС (Android)
+      - name: Fetch Chromium v152 (Shallow)
         run: |
           mkdir chromium_build && cd chromium_build
           cat <<EOF > .gclient
@@ -44,31 +36,37 @@ jobs:
               "url"         : "https://chromium.googlesource.com/chromium/src.git@152.0.7977.42",
               "deps_file"   : "DEPS",
               "managed"     : False,
-              "custom_deps" : {
-                # Отключаем загрузку гигантских и ненужных компонентов (тесты и телеметрия)
-                "src/chrome/test/data/perf/canvas_bench": None,
-                "src/chrome/test/data/perf/frame_rate/content": None,
-              },
+              "custom_deps" : {},
             },
           ]
           target_os = ['android']
           EOF
-          gclient sync --no-history --shallow
+          # --no-history и --shallow экономят гигантское количество места
+          gclient sync --no-history --shallow -j 8
 
+      # 3. Применяем наш питоновский патчер и закидываем мост
       - name: Apply Eidolon Patches
         run: |
           cd chromium_build/src
           python3 ../../stack_builder/patch_chromium_v152.py
           cp ../../stack_builder/eidolon_bridge.* net/socket/
+          # Внедряем наш файл в систему сборки Chromium
           sed -i '/"socket\/tcp_client_socket.cc",/a \    "socket/eidolon_bridge.cc",' net/BUILD.gn
 
-      - name: Compile Library
+      # 4. Настраиваем компиляцию без отладочных символов (экономия памяти и места)
+      - name: Configure GN Build
         run: |
           cd chromium_build/src
           gn gen out/Android --args='target_os="android" target_cpu="arm64" is_debug=false is_component_build=true symbol_level=0 blink_symbol_level=0 v8_symbol_level=0'
+
+      # 5. Компилируем только нужные модули (net и boringssl)
+      - name: Compile Native Stack
+        run: |
+          cd chromium_build/src
           autoninja -C out/Android net boringssl
 
-      - name: Upload Native Stack Artifact
+      # 6. Сохраняем готовую библиотеку
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: libeidolon_net_arm64
