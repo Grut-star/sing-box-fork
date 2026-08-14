@@ -13,6 +13,18 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      # ВАЖНО: Агрессивная очистка диска GitHub-раннера (+30 ГБ)
+      - name: Maximize Build Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
       - name: Install Dependencies
         run: |
           sudo apt-get update
@@ -32,7 +44,11 @@ jobs:
               "url"         : "https://chromium.googlesource.com/chromium/src.git@152.0.7977.42",
               "deps_file"   : "DEPS",
               "managed"     : False,
-              "custom_deps" : {},
+              "custom_deps" : {
+                # Отключаем загрузку гигантских и ненужных компонентов (тесты и телеметрия)
+                "src/chrome/test/data/perf/canvas_bench": None,
+                "src/chrome/test/data/perf/frame_rate/content": None,
+              },
             },
           ]
           target_os = ['android']
@@ -49,7 +65,7 @@ jobs:
       - name: Compile Library
         run: |
           cd chromium_build/src
-          gn gen out/Android --args='target_os="android" target_cpu="arm64" is_debug=false is_component_build=true symbol_level=0'
+          gn gen out/Android --args='target_os="android" target_cpu="arm64" is_debug=false is_component_build=true symbol_level=0 blink_symbol_level=0 v8_symbol_level=0'
           autoninja -C out/Android net boringssl
 
       - name: Upload Native Stack Artifact
