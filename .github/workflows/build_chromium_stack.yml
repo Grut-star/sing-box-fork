@@ -125,12 +125,22 @@ jobs:
           python3 ../stack_builder/patch_chromium_v152.py
           cp ../stack_builder/eidolon_bridge.* net/socket/
           
-          # СОЗДАЕМ ФЕЙКОВЫЕ ЗАГЛУШКИ вместо удаления строк из BUILD.gn
-          # GN удовлетворен, если папка существует и содержит базовый таргет
-          for dir in "third_party/blink/web_tests" "chrome/test/data" "third_party/catapult" "third_party/catapult/devil" "v8/test" "native_client" "third_party/angle/src/tests"; do
+          echo "Generatig dummy BUILD.gn stubs for excluded directories..."
+          
+          # 1. Базовые заглушки для корневых удаленных папок
+          for dir in "third_party/blink/web_tests" "chrome/test/data" "third_party/catapult" "v8/test" "native_client" "third_party/angle/src/tests"; do
             mkdir -p "$dir"
-            TARGET_NAME=$(basename "$dir")
-            echo "group(\"$TARGET_NAME\") {}" > "$dir/BUILD.gn"
+            echo "group(\"$(basename $dir)\") {}" > "$dir/BUILD.gn"
+          done
+          
+          # 2. Автоматическое сканирование: ищем все вложенные вызовы в BUILD.gn и глушим их
+          grep -oE '"//(third_party/catapult|third_party/blink/web_tests|v8/test|native_client|third_party/angle/src/tests|chrome/test/data)[^"]*"' BUILD.gn | sed 's/"//g; s/^\/\///g' | while read -r dir; do
+            if [ ! -f "$dir/BUILD.gn" ]; then
+              mkdir -p "$dir"
+              TARGET_NAME=$(basename "$dir")
+              echo "group(\"$TARGET_NAME\") {}" > "$dir/BUILD.gn"
+              echo "Auto-stubbed: $dir"
+            fi
           done
           
           # Добавляем наш кастомный таргет в конец net/BUILD.gn
