@@ -100,7 +100,8 @@ jobs:
           # 1. Запускаем только runhooks (скачает компилятор Clang без проверок Git)
           gclient runhooks
           
-          # 2. Принудительно включаем Android-флаги для GN (подстраховка)
+          # 2. Принудительно включаем Android-флаги для GN (подстраховка с переносом строки)
+          echo "" >> build/config/gclient_args.gni
           echo 'checkout_android = true' >> build/config/gclient_args.gni
           echo 'checkout_android_native_support = true' >> build/config/gclient_args.gni
           
