@@ -1,18 +1,40 @@
-name: Build Chromium Stack (Android ARM64)
+name: Build Eidolon Stack (Android ARM64)
 
 on:
+  release:
+    types: [published] # Запускается автоматически при публикации нового релиза (тега)
   workflow_dispatch:
+    inputs:
+      chromium_version:
+        description: 'Hardcode Chromium Version (leave empty to auto-fetch latest Stable)'
+        required: false
+        type: string
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    env:
+      CACHE_EPOCH: 1
     steps:
-      # 1. Используем более агрессивный чистильщик (освобождает ~40-45 ГБ надежнее)
-      - name: Free Disk Space (Ubuntu)
+      # 1. Автоматическое определение версии Chromium
+      - name: Resolve Chromium Version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.chromium_version }}" ]; then
+            VERSION="${{ github.event.inputs.chromium_version }}"
+          else
+            echo "Fetching latest stable Android release from ChromiumDash..."
+            VERSION=$(curl -s "https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Android" | jq -r '.[0].version')
+          fi
+          echo "Target Chromium Version: $VERSION"
+          echo "CHROMIUM_VERSION=$VERSION" >> $GITHUB_ENV
+
+      # 2. Освобождение места (всё ещё нужно для спокойной сборки)
+      - name: Free Disk Space
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: true
-          android: false # Удаляем системный Android, т.к. Chromium скачает свой герметичный NDK
+          android: true # Удаляем всё, NDK скачаем сами как в NaiveProxy
           dotnet: true
           haskell: true
           large-packages: true
@@ -22,134 +44,97 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Depot Tools
+      # 3. Установка системных пакетов
+      - name: Install Dependencies
         run: |
-          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
-          echo "$GITHUB_WORKSPACE/depot_tools" >> $GITHUB_PATH
-          echo "Remaining disk space:"
-          df -h
+          sudo apt update
+          sudo apt install -y ninja-build pkg-config ccache curl unzip jq
 
-      # 2. Потоковая распаковка и тотальный фейковый Git
-      - name: Stream Extract & Purge Chromium
+      # 4. Настройка Ccache (ускорит пересборки при отладке)
+      - id: ccache-timestamp
+        run: echo "TIMESTAMP=$(date +%s)" >> $GITHUB_OUTPUT
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-android-arm64-${{ env.CHROMIUM_VERSION }}-${{ steps.ccache-timestamp.outputs.TIMESTAMP }}
+          restore-keys: ccache-android-arm64-${{ env.CHROMIUM_VERSION }}-
+
+      # 5. Загрузка исходников Chromium и жесткая обрезка (Streaming)
+      - name: Download and Extract Chromium
         run: |
           mkdir src && cd src
-          echo "Starting streaming extraction with on-the-fly filtering..."
-          
-          curl -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-152.0.7977.42.tar.xz" | tar -xJ --strip-components=1 \
-            --exclude="third_party/blink/web_tests" \
-            --exclude="chrome/test/data" \
+          echo "Downloading and extracting Chromium $CHROMIUM_VERSION..."
+          curl -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-$CHROMIUM_VERSION.tar.xz" | tar -xJ --strip-components=1 \
+            --exclude="third_party/blink" \
+            --exclude="v8" \
             --exclude="third_party/catapult" \
-            --exclude="v8/test" \
-            --exclude="native_client" \
-            --exclude="third_party/angle/src/tests"
-          
-          echo "Initializing dummy Git repository in root..."
-          git init >/dev/null 2>&1
-          git config user.name "Builder"
-          git config user.email "build@example.com"
-          git commit --allow-empty -m "Init dummy repo" >/dev/null 2>&1
-          
-          echo "Initializing dummy Git repositories for all DEPS..."
-          python3 -c '
-          import os, re
-          
-          # Читаем конфигурацию зависимостей Chromium
-          with open("DEPS", "r") as f:
-              data = f.read()
-          
-          # Ищем все пути вида "src/third_party/angle", "src/v8" и т.д.
-          paths = set(re.findall(r"[\x27\x22]src/([a-zA-Z0-9_/-]+)[\x27\x22]", data))
-          
-          for p in paths:
-              if os.path.isdir(p):
-                  # Создаем фейковый git-репозиторий в каждой зависимости
-                  os.system(f"cd {p} && git init >/dev/null 2>&1 && git config user.name \"B\" && git config user.email \"b@b.com\" && git commit --allow-empty -m \"Init\" >/dev/null 2>&1")
-          '
-          
-          echo "Remaining disk space:"
-          df -h
+            --exclude="third_party/angle/src/tests" \
+            --exclude="chrome/test/data" \
+            --exclude="native_client"
 
-      # 3. Генерация gclient конфига с ЖЕСТКИМИ ограничениями
-      - name: Generate gclient config
+      # 6. Магия NaiveProxy: Ручная установка Toolchains (Без gclient!)
+      - name: Fetch Toolchains (Clang, GN, NDK)
+        working-directory: src
         run: |
-          cat <<EOF > .gclient
-          solutions = [{
-            "name": "src",
-            "url": "https://chromium.googlesource.com/chromium/src.git",
-            "deps_file": "DEPS",
-            "managed": False, # ОЧЕНЬ ВАЖНО: блокирует скачивание всех git-репозиториев
-            "custom_vars": {
-              "checkout_telemetry_dependencies": False,
-              "checkout_android_emulator": False,
-              "checkout_android_native_support": True, # ИСПРАВЛЕНО: Разрешаем NDK/SDK
-              "checkout_pgo_profiles": False,
-              "checkout_nacl": False,
-              "checkout_clang_tidy": False,
-              "download_remoteexec_cfg": False,
-              "checkout_src_internal": False
-            }
-          }]
-          target_os = ['android']
-          EOF
+          # --- CLANG ---
+          # Читаем нужную ревизию Clang из скрипта самого Chromium
+          CLANG_REVISION=$(python3 -c '
+          import sys
+          sys.path.append("tools/clang/scripts")
+          import update
+          print(update.PACKAGE_VERSION)
+          ')
+          echo "Fetching Clang $CLANG_REVISION..."
+          mkdir -p third_party/llvm-build/Release+Asserts
+          echo $CLANG_REVISION > third_party/llvm-build/Release+Asserts/cr_build_revision
+          curl -L "https://commondatastorage.googleapis.com/chromium-browser-clang/Linux_x64/clang-$CLANG_REVISION.tar.xz" | tar xJf - -C third_party/llvm-build/Release+Asserts
 
-      # 4. Установка Toolchains (Обходим gclient sync и используем NDK раннера)
-      - name: Fetch Toolchains & Link System NDK
-        run: |
-          cd src
-          
-          # 1. Запускаем только runhooks (скачает компилятор Clang без проверок Git)
-          gclient runhooks
-          
-          # 2. Принудительно включаем Android-флаги для GN (подстраховка с переносом строки)
-          echo "" >> build/config/gclient_args.gni
-          echo 'checkout_android = true' >> build/config/gclient_args.gni
-          echo 'checkout_android_native_support = true' >> build/config/gclient_args.gni
-          
-          # 3. Создаем папки, которые ожидает Chromium
-          mkdir -p third_party/android_toolchain
-          mkdir -p third_party/android_sdk
-          
-          # 4. Линкуем NDK и SDK, которые УЖЕ установлены на GitHub Actions ($ANDROID_HOME)
-          NDK_PATH=$(ls -d $ANDROID_HOME/ndk/* | sort -V | tail -n 1)
-          echo "Linking NDK from: $NDK_PATH"
-          ln -sf $NDK_PATH third_party/android_toolchain/ndk
-          ln -sf $ANDROID_HOME third_party/android_sdk/public
-          
-          # 5. Вырезаем из конфигов Chromium жесткие проверки на конкретную версию NDK
-          sed -i '/assert.*_ndk_/d' build/config/android/config.gni
+          # --- GN ---
+          # Вытягиваем хэш GN из DEPS
+          GN_VERSION=$(grep "'gn_version':" DEPS | head -n 1 | cut -d"'" -f4)
+          echo "Fetching GN $GN_VERSION..."
+          mkdir -p gn/out
+          curl -L "https://chrome-infra-packages.appspot.com/dl/gn/gn/linux-amd64/+/$GN_VERSION" -o gn.zip
+          unzip -q gn.zip -d gn/out
+          rm gn.zip
 
-      # 5. Накатываем патчи и создаем таргет для единой .so библиотеки
+          # --- ANDROID NDK ---
+          # Используем методику агрессивной очистки NaiveProxy
+          NDK_VER="r24"
+          echo "Fetching Android NDK $NDK_VER..."
+          curl -L -O https://dl.google.com/android/repository/android-ndk-$NDK_VER-linux.zip
+          unzip -q android-ndk-$NDK_VER-linux.zip
+          mkdir -p third_party/android_toolchain/ndk
+          
+          cd android-ndk-$NDK_VER
+          cp -r --parents sources/android/cpufeatures ../third_party/android_toolchain/ndk
+          cp -r --parents toolchains/llvm/prebuilt ../third_party/android_toolchain/ndk
+          cd ..
+          
+          # Удаляем мусор из NDK (оставляем только библиотеки для линковки)
+          cd third_party/android_toolchain/ndk
+          find toolchains -type f -regextype egrep \! -regex \
+            '.*(lib(atomic|gcc|gcc_real|compiler_rt-extras|android_support|unwind).a|crt.*o|lib(android|c|dl|log|m).so|usr/local.*|usr/include.*)' -delete
+          
+          # Фикс бага NDK r24 для Chromium
+          sed -i 's/AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1UL /AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1ULL /' toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/android/hardware_buffer.h
+          cd ../../../
+          rm -rf android-ndk-$NDK_VER android-ndk-$NDK_VER-linux.zip
+
+      # 7. Накатываем патчи
       - name: Apply Eidolon Patches
+        working-directory: src
         run: |
-          cd src
-          python3 ../stack_builder/patch_chromium_v152.py
-          cp ../stack_builder/eidolon_bridge.* net/socket/
+          python3 ../stack_builder/patch_chromium.py || echo "No python patcher found, skipping"
+          cp ../stack_builder/eidolon_bridge.* net/socket/ || echo "No bridge files found, skipping"
           
-          echo "Generatig dummy BUILD.gn stubs for excluded directories..."
-          
-          # 1. Базовые заглушки для корневых удаленных папок
-          for dir in "third_party/blink/web_tests" "chrome/test/data" "third_party/catapult" "v8/test" "native_client" "third_party/angle/src/tests"; do
-            mkdir -p "$dir"
-            echo "group(\"$(basename $dir)\") {}" > "$dir/BUILD.gn"
-          done
-          
-          # 2. Автоматическое сканирование: ищем все вложенные вызовы в BUILD.gn и глушим их
-          grep -oE '"//(third_party/catapult|third_party/blink/web_tests|v8/test|native_client|third_party/angle/src/tests|chrome/test/data)[^"]*"' BUILD.gn | sed 's/"//g; s/^\/\///g' | while read -r dir; do
-            if [ ! -f "$dir/BUILD.gn" ]; then
-              mkdir -p "$dir"
-              TARGET_NAME=$(basename "$dir")
-              echo "group(\"$TARGET_NAME\") {}" > "$dir/BUILD.gn"
-              echo "Auto-stubbed: $dir"
-            fi
-          done
-          
-          # Добавляем наш кастомный таргет в конец net/BUILD.gn
+          # Создаем наш таргет
           cat << 'EOF' >> net/BUILD.gn
           
           shared_library("libeidolon") {
-            sources = [
-              "socket/eidolon_bridge.cc",
-            ]
+            sources = [ "socket/eidolon_bridge.cc" ]
             deps = [
               "//net:net",
               "//base:base",
@@ -160,32 +145,66 @@ jobs:
           }
           EOF
 
-      # 6. Конфигурируем и собираем нашу кастомную .so
-      - name: Configure and Compile
+      # 8. Конфигурация GN с флагами NaiveProxy
+      - name: Generate GN Args
+        working-directory: src
         run: |
-          cd src
+          mkdir -p out/Release
           
-          mkdir -p third_party/llvm-build/Release+Asserts
-          echo "llvmorg-dummy-revision-1" > third_party/llvm-build/Release+Asserts/cr_build_revision
-          
-          gn gen out/Android --args='
+          # Флаги NaiveProxy: максимально отрезают UI, графику и системные зависимости
+          ./gn/out/gn gen out/Release --args='
             target_os="android"
             target_cpu="arm64"
-            is_debug=false
-            is_component_build=false
+            is_desktop_android=true
+            default_min_sdk_version=24
+            is_high_end_android=true
             is_official_build=true
-            use_thin_lto=true
+            is_chrome_branded=true
+            is_debug=false
+            is_cronet_build=true
+            use_sysroot=false
+            cc_wrapper="ccache"
             symbol_level=0
             blink_symbol_level=0
             v8_symbol_level=0
             exclude_unwind_tables=true
+            enable_resource_allowlist_generation=false
+            fatal_linker_warnings=false
+            treat_warnings_as_errors=false
+            use_aura=false
+            use_ozone=false
+            use_gio=false
+            use_platform_icu_alternatives=true
+            use_glib=false
+            is_perfetto_embedder=false
+            enable_websockets=false
+            use_kerberos=false
+            disable_file_support=true
+            enable_mdns=false
+            enable_reporting=false
+            enable_device_bound_sessions=false
+            enable_disk_cache_sql_backend=false
+            use_nss_certs=false
+            enable_backup_ref_ptr_support=false
+            enable_dangling_raw_ptr_checks=false
+            use_clang_modules=false
           '
-          # Собираем ТОЛЬКО наш таргет
-          autoninja -C out/Android net:libeidolon
 
-      # 7. Забираем сжатый артефакт
+      # 9. Сборка Ninja
+      - name: Compile library
+        working-directory: src
+        run: |
+          export CCACHE_SLOPPINESS=time_macros
+          export CCACHE_BASEDIR="$PWD"
+          export CCACHE_CPP2=yes
+          
+          ccache -z
+          ninja -C out/Release net:libeidolon
+          ccache -s
+
+      # 10. Загрузка готовой библиотеки
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: libeidolon_net_arm64
-          path: src/out/Android/libeidolon.so
+          name: libeidolon_${{ env.CHROMIUM_VERSION }}_arm64
+          path: src/out/Release/libeidolon.so
