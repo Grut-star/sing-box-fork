@@ -26,22 +26,46 @@ jobs:
           git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
           echo "$GITHUB_WORKSPACE/depot_tools" >> $GITHUB_PATH
 
-      # 2. Потоковая распаковка (экономит 5.5 ГБ диска)
-      - name: Stream Extract Chromium v152
+      # 2. Потоковая распаковка и агрессивная чистка мусора
+      - name: Stream Extract & Purge Chromium
         run: |
           mkdir src && cd src
           echo "Starting streaming extraction... This will take some time."
-          # Скачиваем и сразу распаковываем, --strip-components=1 убирает корневую папку архива
           curl -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-152.0.7977.42.tar.xz" | tar -xJ --strip-components=1
+          
+          echo "Purging massive unused directories to free disk space..."
+          # Удаляем тестовые данные Blink (~6-8 ГБ)
+          rm -rf third_party/blink/web_tests
+          # Удаляем тестовые данные Chrome (~3 ГБ)
+          rm -rf chrome/test/data
+          # Удаляем инструменты телеметрии и тесты V8 (~2-3 ГБ)
+          rm -rf third_party/catapult
+          rm -rf v8/test
+          # Удаляем Native Client, если он есть
+          rm -rf native_client
+          
+          echo "Remaining disk space:"
+          df -h
 
+      # 3. Генерация gclient конфига с ограничениями (чтобы runhooks качал меньше)
       - name: Generate gclient config
         run: |
           cat <<EOF > .gclient
-          solutions = [{"name": "src", "url": "https://chromium.googlesource.com/chromium/src.git", "deps_file": "DEPS", "managed": False}]
+          solutions = [{
+            "name": "src",
+            "url": "https://chromium.googlesource.com/chromium/src.git",
+            "deps_file": "DEPS",
+            "managed": False,
+            "custom_vars": {
+              "checkout_telemetry_dependencies": False,
+              "checkout_android_emulator": False,
+              "checkout_android_native_support": False
+            }
+          }]
           target_os = ['android']
           EOF
 
-      # 3. Установка NDK и Clang (скачает еще ~3-4 ГБ)
+      # 4. Установка NDK и Clang (теперь места хватит)
       - name: Fetch Toolchains (runhooks)
         run: |
           cd src
