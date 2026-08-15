@@ -77,12 +77,12 @@ jobs:
             "name": "src",
             "url": "https://chromium.googlesource.com/chromium/src.git",
             "deps_file": "DEPS",
-            "managed": False,
+            "managed": False, # ОЧЕНЬ ВАЖНО: блокирует скачивание всех git-репозиториев
             "custom_vars": {
               "checkout_telemetry_dependencies": False,
               "checkout_android_emulator": False,
-              "checkout_android_native_support": False,
-              "checkout_pgo_profiles": False, # ОЧЕНЬ ВАЖНО: Отключает скачивание ~2 ГБ профилей
+              "checkout_android_native_support": True, # ИСПРАВЛЕНО: Разрешаем NDK/SDK
+              "checkout_pgo_profiles": False,
               "checkout_nacl": False,
               "checkout_clang_tidy": False,
               "download_remoteexec_cfg": False,
@@ -92,9 +92,14 @@ jobs:
           target_os = ['android']
           EOF
 
-      # 4. Установка NDK и Clang (теперь ничего лишнего не скачается)
-      - name: Fetch Toolchains (runhooks)
+      # 4. Установка NDK, SDK и Clang (только бинарники)
+      - name: Fetch Toolchains (sync & runhooks)
         run: |
+          # Запускаем sync в корне (там, где лежит .gclient).
+          # Он скачает Android NDK и SDK из хранилища CIPD, игнорируя git.
+          gclient sync --nohooks
+          
+          # Переходим в src и запускаем хуки для скачивания Clang и генерации gclient_args.gni
           cd src
           gclient runhooks
 
