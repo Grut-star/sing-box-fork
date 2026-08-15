@@ -164,6 +164,10 @@ jobs:
       - name: Configure and Compile
         run: |
           cd src
+          
+          mkdir -p third_party/llvm-build/Release+Asserts
+          echo "llvmorg-dummy-revision-1" > third_party/llvm-build/Release+Asserts/cr_build_revision
+          
           gn gen out/Android --args='
             target_os="android"
             target_cpu="arm64"
