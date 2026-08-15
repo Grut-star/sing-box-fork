@@ -29,7 +29,7 @@ jobs:
           echo "Remaining disk space:"
           df -h
 
-      # 2. Потоковая распаковка и фейковый Git
+      # 2. Потоковая распаковка и тотальный фейковый Git
       - name: Stream Extract & Purge Chromium
         run: |
           mkdir src && cd src
@@ -43,12 +43,28 @@ jobs:
             --exclude="native_client" \
             --exclude="third_party/angle/src/tests"
           
-          echo "Initializing dummy Git repository for gclient..."
-          git init
+          echo "Initializing dummy Git repository in root..."
+          git init >/dev/null 2>&1
           git config user.name "Builder"
           git config user.email "build@example.com"
-          # Делаем пустой коммит, чтобы ветка master/main официально существовала
-          git commit --allow-empty -m "Init dummy repo"
+          git commit --allow-empty -m "Init dummy repo" >/dev/null 2>&1
+          
+          echo "Initializing dummy Git repositories for all DEPS..."
+          python3 -c '
+          import os, re
+          
+          # Читаем конфигурацию зависимостей Chromium
+          with open("DEPS", "r") as f:
+              data = f.read()
+          
+          # Ищем все пути вида "src/third_party/angle", "src/v8" и т.д.
+          paths = set(re.findall(r"[\x27\x22]src/([a-zA-Z0-9_/-]+)[\x27\x22]", data))
+          
+          for p in paths:
+              if os.path.isdir(p):
+                  # Создаем фейковый git-репозиторий в каждой зависимости
+                  os.system(f"cd {p} && git init >/dev/null 2>&1 && git config user.name \"B\" && git config user.email \"b@b.com\" && git commit --allow-empty -m \"Init\" >/dev/null 2>&1")
+          '
           
           echo "Remaining disk space:"
           df -h
