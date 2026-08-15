@@ -12,7 +12,7 @@ jobs:
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: true
-          android: true # Удаляем системный Android, т.к. Chromium скачает свой герметичный NDK
+          android: false # Удаляем системный Android, т.к. Chromium скачает свой герметичный NDK
           dotnet: true
           haskell: true
           large-packages: true
