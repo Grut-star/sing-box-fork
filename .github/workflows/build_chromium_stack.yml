@@ -125,13 +125,13 @@ jobs:
           python3 ../stack_builder/patch_chromium_v152.py
           cp ../stack_builder/eidolon_bridge.* net/socket/
           
-          # УБИРАЕМ ссылки на ВСЕ удаленные компоненты из корневого графа сборки
-          sed -i '/third_party\/angle\/src\/tests/d' BUILD.gn
-          sed -i '/v8\/test/d' BUILD.gn
-          sed -i '/third_party\/catapult/d' BUILD.gn
-          sed -i '/native_client/d' BUILD.gn
-          sed -i '/third_party\/blink\/web_tests/d' BUILD.gn
-          sed -i '/chrome\/test\/data/d' BUILD.gn
+          # СОЗДАЕМ ФЕЙКОВЫЕ ЗАГЛУШКИ вместо удаления строк из BUILD.gn
+          # GN удовлетворен, если папка существует и содержит базовый таргет
+          for dir in "third_party/blink/web_tests" "chrome/test/data" "third_party/catapult" "third_party/catapult/devil" "v8/test" "native_client" "third_party/angle/src/tests"; do
+            mkdir -p "$dir"
+            TARGET_NAME=$(basename "$dir")
+            echo "group(\"$TARGET_NAME\") {}" > "$dir/BUILD.gn"
+          done
           
           # Добавляем наш кастомный таргет в конец net/BUILD.gn
           cat << 'EOF' >> net/BUILD.gn
