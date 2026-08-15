@@ -104,18 +104,46 @@ jobs:
           cd src
           python3 ../stack_builder/patch_chromium_v152.py
           cp ../stack_builder/eidolon_bridge.* net/socket/
-          sed -i '/"socket\/tcp_client_socket.cc",/a \    "socket/eidolon_bridge.cc",' net/BUILD.gn
+          
+          # Добавляем наш кастомный таргет в конец net/BUILD.gn
+          cat << 'EOF' >> net/BUILD.gn
+          
+          shared_library("libeidolon") {
+            sources = [
+              "socket/eidolon_bridge.cc",
+            ]
+            deps = [
+              "//net:net",
+              "//base:base",
+              "//url:url",
+              "//crypto:crypto",
+              "//third_party/boringssl:boringssl",
+            ]
+          }
+          EOF
 
-      # 6. Конфигурируем и собираем ТОЛЬКО сетевой стек
+      # 6. Конфигурируем и собираем нашу кастомную .so
       - name: Configure and Compile
         run: |
           cd src
-          gn gen out/Android --args='target_os="android" target_cpu="arm64" is_debug=false is_component_build=true symbol_level=0 blink_symbol_level=0 v8_symbol_level=0'
-          autoninja -C out/Android net boringssl
+          gn gen out/Android --args='
+            target_os="android"
+            target_cpu="arm64"
+            is_debug=false
+            is_component_build=false
+            is_official_build=true
+            use_thin_lto=true
+            symbol_level=0
+            blink_symbol_level=0
+            v8_symbol_level=0
+            exclude_unwind_tables=true
+          '
+          # Собираем ТОЛЬКО наш таргет
+          autoninja -C out/Android net:libeidolon
 
-      # 7. Забираем артефакты
+      # 7. Забираем сжатый артефакт
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: libeidolon_net_arm64
-          path: src/out/Android/libnet.so
+          path: src/out/Android/libeidolon.so
