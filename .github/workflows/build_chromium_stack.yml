@@ -129,6 +129,7 @@ jobs:
           sed -i '/third_party\/angle\/src\/tests/d' BUILD.gn
           sed -i '/v8\/test/d' BUILD.gn
           sed -i '/third_party\/catapult/d' BUILD.gn
+          sed -i '/native_client/d' BUILD.gn
           
           # Добавляем наш кастомный таргет в конец net/BUILD.gn
           cat << 'EOF' >> net/BUILD.gn
