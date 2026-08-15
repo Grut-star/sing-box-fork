@@ -11,7 +11,7 @@ def apply_patch(filepath, pattern, replacement, flags=0, replace_all=False):
         content = f.read()
 
     # Защита от двойного патчинга
-    if "eidolon_active" in content or "eidolon_token" in content:
+    if "eidolon_active" in content or "eidolon_token" in content or "GetSSL()" in content:
         if "ProofVerifyContextChromium" not in content or "eidolon_active" in content:
             print(f"[~] Already patched: {filepath}")
             return
@@ -59,7 +59,7 @@ def main():
         r'\1\n\n  // EIDOLON:\n  bool eidolon_active = false;'
     )
 
-    # 4. QUIC: Обход проверки сертификата (применяем ко всем методам: VerifyProof и VerifyCertChain)
+    # 4. QUIC: Обход проверки сертификата
     apply_patch(
         'net/quic/crypto/proof_verifier_chromium.cc',
         r'(const ProofVerifyContextChromium\* chromium_context =\n\s*reinterpret_cast<const ProofVerifyContextChromium\*>\(verify_context\);)',
@@ -68,20 +68,28 @@ def main():
         r'    *error_details = "";\n'
         r'    return quic::QUIC_SUCCESS;\n'
         r'  }\n',
-        replace_all=True # Заменит в обоих местах
+        replace_all=True
     )
 
-    # 5. TCP: Внедрение токена в SSL сокет
-    # Так как вы не скинули метод SSLClientSocketImpl::Init(), мы цепляемся
-    # за стандартный вызов SSL_set_app_data, который всегда есть в Chromium
+    # 5. TCP: Внедрение токена в SSL сокет (Обновлено под v152)
     apply_patch(
         'net/socket/ssl_client_socket_impl.cc',
-        r'(SSL_set_app_data\(ssl_\.get\(\), this\);)',
-        r'\1\n\n  // EIDOLON: Передаем токен вниз в BoringSSL\n'
+        r'(if \(!ssl_ \|\| !context->SetClientSocketForSSL\(ssl_\.get\(\), this\)\)[\s\n]*return ERR_UNEXPECTED;)',
+        r'\1\n\n'
+        r'  // EIDOLON: Передаем токен вниз в BoringSSL\n'
         r'  if (ssl_config_.eidolon_active) {\n'
         r'    ssl_config_.ignore_certificate_errors = true;\n'
         r'    SSL_set_ex_data(ssl_.get(), 0, (void*)ssl_config_.eidolon_token.data());\n'
         r'  }\n'
+    )
+
+    # 6. TCP: Экспортируем GetSSL() для нашего моста
+    # Ищем объявление метода IsConnectedAndIdle() и добавляем GetSSL() рядом с ним
+    apply_patch(
+        'net/socket/ssl_client_socket_impl.h',
+        r'(bool IsConnectedAndIdle\(\) const override;)',
+        r'\1\n\n  // EIDOLON: Доступ к низкоуровневому SSL объекту для экспорта ключей\n'
+        r'  SSL* GetSSL() const { return ssl_.get(); }\n'
     )
 
 if __name__ == '__main__':
