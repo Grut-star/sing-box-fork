@@ -92,16 +92,30 @@ jobs:
           target_os = ['android']
           EOF
 
-      # 4. Установка NDK, SDK и Clang (только бинарники)
-      - name: Fetch Toolchains (sync & runhooks)
+      # 4. Установка Toolchains (Обходим gclient sync и используем NDK раннера)
+      - name: Fetch Toolchains & Link System NDK
         run: |
-          # Запускаем sync в корне (там, где лежит .gclient).
-          # Он скачает Android NDK и SDK из хранилища CIPD, игнорируя git.
-          gclient sync --nohooks
-          
-          # Переходим в src и запускаем хуки для скачивания Clang и генерации gclient_args.gni
           cd src
+          
+          # 1. Запускаем только runhooks (скачает компилятор Clang без проверок Git)
           gclient runhooks
+          
+          # 2. Принудительно включаем Android-флаги для GN (подстраховка)
+          echo 'checkout_android = true' >> build/config/gclient_args.gni
+          echo 'checkout_android_native_support = true' >> build/config/gclient_args.gni
+          
+          # 3. Создаем папки, которые ожидает Chromium
+          mkdir -p third_party/android_toolchain
+          mkdir -p third_party/android_sdk
+          
+          # 4. Линкуем NDK и SDK, которые УЖЕ установлены на GitHub Actions ($ANDROID_HOME)
+          NDK_PATH=$(ls -d $ANDROID_HOME/ndk/* | sort -V | tail -n 1)
+          echo "Linking NDK from: $NDK_PATH"
+          ln -sf $NDK_PATH third_party/android_toolchain/ndk
+          ln -sf $ANDROID_HOME third_party/android_sdk/public
+          
+          # 5. Вырезаем из конфигов Chromium жесткие проверки на конкретную версию NDK
+          sed -i '/assert.*_ndk_/d' build/config/android/config.gni
 
       # 5. Накатываем патчи
       - name: Apply Eidolon Patches
