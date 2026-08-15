@@ -151,6 +151,11 @@ jobs:
         run: |
           mkdir -p out/Release
           
+          # ФЕЙКУЕМ результат работы gclient, чтобы обойти жесткие проверки GN
+          echo 'checkout_android = true' >> build/config/gclient_args.gni
+          echo 'checkout_android_native_support = true' >> build/config/gclient_args.gni
+          echo 'checkout_pgo_profiles = false' >> build/config/gclient_args.gni
+          
           # Флаги NaiveProxy: максимально отрезают UI, графику и системные зависимости
           ./gn/out/gn gen out/Release --args='
             target_os="android"
