@@ -118,12 +118,18 @@ jobs:
           # 5. Вырезаем из конфигов Chromium жесткие проверки на конкретную версию NDK
           sed -i '/assert.*_ndk_/d' build/config/android/config.gni
 
-      # 5. Накатываем патчи
+      # 5. Накатываем патчи и создаем таргет для единой .so библиотеки
       - name: Apply Eidolon Patches
         run: |
           cd src
           python3 ../stack_builder/patch_chromium_v152.py
           cp ../stack_builder/eidolon_bridge.* net/socket/
+          
+          # УБИРАЕМ ссылки на удаленные тесты из корневого графа сборки
+          sed -i '/third_party\/angle\/src\/tests/d' BUILD.gn
+          
+          # На всякий случай вырежем и V8 тесты, так как мы их тоже удаляли
+          sed -i '/v8\/test/d' BUILD.gn
           
           # Добавляем наш кастомный таргет в конец net/BUILD.gn
           cat << 'EOF' >> net/BUILD.gn
