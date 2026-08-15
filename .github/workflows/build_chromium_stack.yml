@@ -61,17 +61,19 @@ jobs:
           key: ccache-android-arm64-${{ env.CHROMIUM_VERSION }}-${{ steps.ccache-timestamp.outputs.TIMESTAMP }}
           restore-keys: ccache-android-arm64-${{ env.CHROMIUM_VERSION }}-
 
-      # 5. Загрузка исходников Chromium и жесткая обрезка (Streaming)
+      # 5. Загрузка исходников Chromium и аккуратная обрезка (Streaming)
       - name: Download and Extract Chromium
         run: |
           mkdir src && cd src
           echo "Downloading and extracting Chromium $CHROMIUM_VERSION..."
+          
+          # Оставляем исходники Blink и V8 для GN, но вырезаем их тяжелые тесты
           curl -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-$CHROMIUM_VERSION.tar.xz" | tar -xJ --strip-components=1 \
-            --exclude="third_party/blink" \
-            --exclude="v8" \
+            --exclude="third_party/blink/web_tests" \
+            --exclude="v8/test" \
+            --exclude="chrome/test/data" \
             --exclude="third_party/catapult" \
             --exclude="third_party/angle/src/tests" \
-            --exclude="chrome/test/data" \
             --exclude="native_client"
 
       # 6. Магия NaiveProxy: Ручная установка Toolchains (Без gclient!)
