@@ -67,14 +67,12 @@ jobs:
           mkdir src && cd src
           echo "Downloading and extracting Chromium $CHROMIUM_VERSION..."
           
-          # Оставляем исходники Blink и V8 для GN, но вырезаем их тяжелые тесты
+          # Вырезаем ТОЛЬКО гигантские папки с ресурсами для тестов.
+          # catapult, native_client и angle оставляем, чтобы не ломать дерево BUILD.gn!
           curl -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-$CHROMIUM_VERSION.tar.xz" | tar -xJ --strip-components=1 \
             --exclude="third_party/blink/web_tests" \
             --exclude="v8/test" \
-            --exclude="chrome/test/data" \
-            --exclude="third_party/catapult" \
-            --exclude="third_party/angle/src/tests" \
-            --exclude="native_client"
+            --exclude="chrome/test/data"
 
       # 6. Магия NaiveProxy: Ручная установка Toolchains (Без gclient!)
       - name: Fetch Toolchains (Clang, GN, NDK)
