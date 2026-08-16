@@ -6,6 +6,11 @@
 #include "net/base/io_buffer.h"
 #include "third_party/boringssl/src/include/openssl/ssl.h"
 
+// Добавленные заголовочные файлы для исправления ошибок компиляции
+#include "base/functional/callback_helpers.h"
+#include "net/base/network_handle.h"
+#include "net/traffic_annotation/network_traffic_annotation_test_helper.h"
+
 #include "eidolon_bridge.h"
 
 extern "C" {
@@ -21,8 +26,14 @@ EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* t
     if (!ip.AssignFromIPLiteral(host)) return nullptr;
     net::AddressList addr_list(net::IPEndPoint(ip, port));
 
+    // Исправлен вызов конструктора TCPClientSocket (добавлен 6-й аргумент kInvalidNetworkHandle)
     auto tcp_socket = std::make_unique<net::TCPClientSocket>(
-            addr_list, nullptr, nullptr, nullptr, net::NetLogSource());
+            addr_list,
+            nullptr,
+            nullptr,
+            nullptr,
+            net::NetLogSource(),
+            net::handles::kInvalidNetworkHandle);
 
     if (tcp_socket->Connect(base::DoNothing()) != net::OK) return nullptr;
 
@@ -66,7 +77,14 @@ int eidolon_write(EidolonHandle handle, const uint8_t* buffer, size_t buffer_len
     auto* session = static_cast<EidolonSession*>(handle);
     auto io_buffer = base::MakeRefCounted<net::IOBufferWithSize>(buffer_len);
     memcpy(io_buffer->data(), buffer, buffer_len);
-    return session->socket->Write(io_buffer.get(), buffer_len, base::DoNothing(), net::NetworkTrafficAnnotationTag());
+
+    // Исправлена аннотация трафика на TRAFFIC_ANNOTATION_FOR_TESTS
+    return session->socket->Write(
+            io_buffer.get(),
+            buffer_len,
+            base::DoNothing(),
+            TRAFFIC_ANNOTATION_FOR_TESTS
+    );
 }
 
 void eidolon_close(EidolonHandle handle) {
