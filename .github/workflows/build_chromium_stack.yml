@@ -2,7 +2,7 @@ name: Build Eidolon Stack (Android ARM64)
 
 on:
   release:
-    types: [published] # Запускается автоматически при публикации нового релиза (тега)
+    types: [published]
   workflow_dispatch:
     inputs:
       chromium_version:
@@ -29,12 +29,12 @@ jobs:
           echo "Target Chromium Version: $VERSION"
           echo "CHROMIUM_VERSION=$VERSION" >> $GITHUB_ENV
 
-      # 2. Освобождение места (всё ещё нужно для спокойной сборки)
+      # 2. Освобождение места (ОЧЕНЬ ВАЖНО, Chromium весит >30GB)
       - name: Free Disk Space
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: true
-          android: true # Удаляем всё, NDK скачаем сами как в NaiveProxy
+          android: true
           dotnet: true
           haskell: true
           large-packages: true
@@ -48,9 +48,9 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt update
-          sudo apt install -y ninja-build pkg-config ccache curl unzip jq
+          sudo apt install -y ninja-build pkg-config ccache curl unzip jq python3
 
-      # 4. Настройка Ccache (ускорит пересборки при отладке)
+      # 4. Настройка Ccache
       - id: ccache-timestamp
         run: echo "TIMESTAMP=$(date +%s)" >> $GITHUB_OUTPUT
 
@@ -61,49 +61,33 @@ jobs:
           key: ccache-android-arm64-${{ env.CHROMIUM_VERSION }}-${{ steps.ccache-timestamp.outputs.TIMESTAMP }}
           restore-keys: ccache-android-arm64-${{ env.CHROMIUM_VERSION }}-
 
-      # 5. Загрузка исходников Chromium и аккуратная обрезка (Streaming)
+      # 5. Загрузка исходников Chromium (БЕЗ УДАЛЕНИЯ ПАПОК, чтобы не ломать BUILD.gn)
       - name: Download and Extract Chromium
         run: |
           mkdir src && cd src
           echo "Downloading and extracting Chromium $CHROMIUM_VERSION..."
-          
-          # Вырезаем ТОЛЬКО гигантские папки с ресурсами для тестов.
-          # catapult, native_client и angle оставляем, чтобы не ломать дерево BUILD.gn!
-          curl -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-$CHROMIUM_VERSION.tar.xz" | tar -xJ --strip-components=1 \
-            --exclude="third_party/blink/web_tests" \
-            --exclude="v8/test" \
-            --exclude="chrome/test/data"
+          # Распаковываем всё. Исключать папки на лету нельзя - GN упадет из-за отсутствующих файлов в deps.
+          curl -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-$CHROMIUM_VERSION.tar.xz" | tar -xJ --strip-components=1
 
-      # 6. Магия NaiveProxy: Ручная установка Toolchains (Без gclient!)
+      # 6. Установка Toolchains (Clang, GN, NDK)
       - name: Fetch Toolchains (Clang, GN, NDK)
         working-directory: src
         run: |
           # --- CLANG ---
-          # Читаем нужную ревизию Clang из скрипта самого Chromium
-          CLANG_REVISION=$(python3 -c '
-          import sys
-          sys.path.append("tools/clang/scripts")
-          import update
-          print(update.PACKAGE_VERSION)
-          ')
-          echo "Fetching Clang $CLANG_REVISION..."
           mkdir -p third_party/llvm-build/Release+Asserts
+          CLANG_REVISION=$(python3 -c 'import sys; sys.path.append("tools/clang/scripts"); import update; print(update.PACKAGE_VERSION)')
           echo $CLANG_REVISION > third_party/llvm-build/Release+Asserts/cr_build_revision
           curl -L "https://commondatastorage.googleapis.com/chromium-browser-clang/Linux_x64/clang-$CLANG_REVISION.tar.xz" | tar xJf - -C third_party/llvm-build/Release+Asserts
 
           # --- GN ---
-          # Вытягиваем хэш GN из DEPS
           GN_VERSION=$(grep "'gn_version':" DEPS | head -n 1 | cut -d"'" -f4)
-          echo "Fetching GN $GN_VERSION..."
           mkdir -p gn/out
           curl -L "https://chrome-infra-packages.appspot.com/dl/gn/gn/linux-amd64/+/$GN_VERSION" -o gn.zip
           unzip -q gn.zip -d gn/out
           rm gn.zip
 
           # --- ANDROID NDK ---
-          # Используем методику агрессивной очистки NaiveProxy
           NDK_VER="r24"
-          echo "Fetching Android NDK $NDK_VER..."
           curl -L -O https://dl.google.com/android/repository/android-ndk-$NDK_VER-linux.zip
           unzip -q android-ndk-$NDK_VER-linux.zip
           mkdir -p third_party/android_toolchain/ndk
@@ -113,24 +97,28 @@ jobs:
           cp -r --parents toolchains/llvm/prebuilt ../third_party/android_toolchain/ndk
           cd ..
           
-          # Удаляем мусор из NDK (оставляем только библиотеки для линковки)
+          # Очистка NDK от мусора
           cd third_party/android_toolchain/ndk
           find toolchains -type f -regextype egrep \! -regex \
             '.*(lib(atomic|gcc|gcc_real|compiler_rt-extras|android_support|unwind).a|crt.*o|lib(android|c|dl|log|m).so|usr/local.*|usr/include.*)' -delete
           
-          # Фикс бага NDK r24 для Chromium
+          # Фикс бага NDK r24 для Chromium (сдвиг битов)
           sed -i 's/AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1UL /AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1ULL /' toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/android/hardware_buffer.h
           cd ../../../
           rm -rf android-ndk-$NDK_VER android-ndk-$NDK_VER-linux.zip
 
-      # 7. Накатываем патчи
+      # 7. Накатываем патчи Eidolon и монтируем Bridge
       - name: Apply Eidolon Patches
         working-directory: src
         run: |
-          python3 ../stack_builder/patch_chromium.py || echo "No python patcher found, skipping"
-          cp ../stack_builder/eidolon_bridge.* net/socket/ || echo "No bridge files found, skipping"
+          # Вызываем твой патчер из корня репозитория
+          python3 ../stack_builder/patch_chromium_v152.py
           
-          # Создаем наш таргет
+          # Копируем C++ мосты в net/socket
+          cp ../stack_builder/eidolon_bridge.cc net/socket/
+          cp ../stack_builder/eidolon_bridge.h net/socket/
+          
+          # Создаем таргет сборки для нашей разделяемой библиотеки
           cat << 'EOF' >> net/BUILD.gn
           
           shared_library("libeidolon") {
@@ -145,31 +133,28 @@ jobs:
           }
           EOF
 
-      # 8. Конфигурация GN с флагами NaiveProxy
+      # 8. Генерация GN (С отключенным official_build для обхода PGO)
       - name: Generate GN Args
         working-directory: src
         run: |
           mkdir -p out/Release
           
-          # ФЕЙКУЕМ результат работы gclient, чтобы обойти жесткие проверки GN
+          # ФЕЙКУЕМ gclient_args, чтобы GN не ругался на отсутствие gclient
           echo "" >> build/config/gclient_args.gni
           echo 'checkout_android = true' >> build/config/gclient_args.gni
           echo 'checkout_android_native_support = true' >> build/config/gclient_args.gni
-          echo 'checkout_pgo_profiles = false' >> build/config/gclient_args.gni
           
-          # Флаги NaiveProxy: максимально отрезают UI, графику и системные зависимости
+          # Отключаем is_official_build, чтобы не возиться с PGO профилями.
+          # is_debug=false и symbol_level=0 дадут достаточно оптимизированную сборку.
           ./gn/out/gn gen out/Release --args='
             target_os="android"
             target_cpu="arm64"
             is_desktop_android=true
             default_min_sdk_version=24
             is_high_end_android=true
-            is_official_build=true
-            is_chrome_branded=true
             is_debug=false
-            is_cronet_build=true
-            use_sysroot=false
-            cc_wrapper="ccache"
+            is_official_build=false
+            is_component_build=false
             symbol_level=0
             blink_symbol_level=0
             v8_symbol_level=0
@@ -177,6 +162,8 @@ jobs:
             enable_resource_allowlist_generation=false
             fatal_linker_warnings=false
             treat_warnings_as_errors=false
+            use_sysroot=false
+            cc_wrapper="ccache"
             use_aura=false
             use_ozone=false
             use_gio=false
@@ -196,7 +183,7 @@ jobs:
             use_clang_modules=false
           '
 
-      # 9. Сборка Ninja
+      # 9. Сборка (СЕКРЕТНЫЙ ИНГРЕДИЕНТ: Сначала хост-тулзы, потом Android)
       - name: Compile library
         working-directory: src
         run: |
@@ -205,10 +192,21 @@ jobs:
           export CCACHE_CPP2=yes
           
           ccache -z
+          
+          # 1. Находим и собираем генераторы (протобуфы, JNI, V8) под Linux x64
+          echo "Building host tools..."
+          HOST_TARGETS=$(grep -o ' | .*' out/Release/toolchain.ninja | grep -o ' clang_x64/[^ ]*' | sort -u || true)
+          if [ ! -z "$HOST_TARGETS" ]; then
+            ninja -C out/Release $HOST_TARGETS
+          fi
+          
+          # 2. Собираем нашу библиотеку под Android ARM64
+          echo "Building libeidolon for Android..."
           ninja -C out/Release net:libeidolon
+          
           ccache -s
 
-      # 10. Загрузка готовой библиотеки
+      # 10. Сохранение артефакта
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
