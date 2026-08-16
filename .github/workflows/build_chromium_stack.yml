@@ -44,6 +44,13 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      # Добавляем установку правильной версии JDK (как в naiveproxy)
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
       # 3. Установка системных пакетов
       - name: Install Dependencies
         run: |
@@ -128,13 +135,12 @@ jobs:
           # --- JDK (Фикс для JNI генератора) ---
           echo "Setting up JDK mock..."
           mkdir -p third_party/jdk
-          # Находим путь к системной Java, если JAVA_HOME вдруг пустой
-          if [ -z "$JAVA_HOME" ]; then
-            JAVA_HOME=$(readlink -f /usr/bin/javac | sed "s:/bin/javac::")
-          fi
-          echo "Using JAVA_HOME: $JAVA_HOME"
-          # Делаем симлинк. Теперь third_party/jdk/current/bin/javap будет смотреть на системный javap
-          ln -s $JAVA_HOME third_party/jdk/current
+          
+          # Очищаем директорию на случай, если она пришла с тарболом исходников
+          rm -rf third_party/jdk/current
+          
+          # Жестко копируем JDK внутрь дерева исходников вместо симлинка
+          cp -R "$JAVA_HOME" third_party/jdk/current
           
           mkdir -p third_party/libunwindstack
           cd third_party/libunwindstack
