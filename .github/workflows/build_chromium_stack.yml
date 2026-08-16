@@ -69,7 +69,7 @@ jobs:
           # Распаковываем всё. Исключать папки на лету нельзя - GN упадет из-за отсутствующих файлов в deps.
           curl -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-$CHROMIUM_VERSION.tar.xz" | tar -xJ --strip-components=1
 
-      # 6. Установка Toolchains (Clang, GN, NDK)
+      # 6. Установка Toolchains (Clang, GN, NDK, Libunwind)
       - name: Fetch Toolchains (Clang, GN, NDK)
         working-directory: src
         run: |
@@ -97,15 +97,28 @@ jobs:
           cp -r --parents toolchains/llvm/prebuilt ../third_party/android_toolchain/ndk
           cd ..
           
-          # Очистка NDK от мусора
           cd third_party/android_toolchain/ndk
           find toolchains -type f -regextype egrep \! -regex \
             '.*(lib(atomic|gcc|gcc_real|compiler_rt-extras|android_support|unwind).a|crt.*o|lib(android|c|dl|log|m).so|usr/local.*|usr/include.*)' -delete
           
-          # Фикс бага NDK r24 для Chromium (сдвиг битов)
           sed -i 's/AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1UL /AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1ULL /' toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/android/hardware_buffer.h
           cd ../../../
           rm -rf android-ndk-$NDK_VER android-ndk-$NDK_VER-linux.zip
+
+          # --- LIBUNWINDSTACK (Отсутствует в Desktop-архиве Chromium) ---
+          echo "Fetching libunwindstack..."
+          # Вытаскиваем точный хэш из DEPS для совместимости
+          UNWIND_HASH=$(grep -A 3 "'src/third_party/libunwindstack':" DEPS | grep 'url' | grep -oE '[a-f0-9]{40}')
+          if [ -z "$UNWIND_HASH" ]; then UNWIND_HASH="main"; fi
+          echo "Target libunwindstack hash: $UNWIND_HASH"
+          
+          mkdir -p third_party/libunwindstack
+          cd third_party/libunwindstack
+          git init
+          git remote add origin https://chromium.googlesource.com/chromium/src/third_party/libunwindstack.git
+          git fetch --depth 1 origin $UNWIND_HASH
+          git checkout FETCH_HEAD
+          cd ../..
 
       # 7. Накатываем патчи Eidolon и монтируем Bridge
       - name: Apply Eidolon Patches
