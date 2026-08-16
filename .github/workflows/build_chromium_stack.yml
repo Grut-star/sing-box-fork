@@ -125,6 +125,17 @@ jobs:
           if [ -z "$UNWIND_HASH" ]; then UNWIND_HASH="main"; fi
           echo "Target libunwindstack hash: $UNWIND_HASH"
           
+          # --- JDK (Фикс для JNI генератора) ---
+          echo "Setting up JDK mock..."
+          mkdir -p third_party/jdk
+          # Находим путь к системной Java, если JAVA_HOME вдруг пустой
+          if [ -z "$JAVA_HOME" ]; then
+            JAVA_HOME=$(readlink -f /usr/bin/javac | sed "s:/bin/javac::")
+          fi
+          echo "Using JAVA_HOME: $JAVA_HOME"
+          # Делаем симлинк. Теперь third_party/jdk/current/bin/javap будет смотреть на системный javap
+          ln -s $JAVA_HOME third_party/jdk/current
+          
           mkdir -p third_party/libunwindstack
           cd third_party/libunwindstack
           git init
