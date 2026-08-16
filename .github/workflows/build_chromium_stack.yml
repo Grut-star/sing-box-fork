@@ -48,8 +48,7 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt update
-          sudo apt install -y ninja-build pkg-config ccache curl unzip jq python3
-
+          sudo apt install -y ninja-build pkg-config ccache curl unzip jq python3 libudev-dev
       # 4. Настройка Ccache
       - id: ccache-timestamp
         run: echo "TIMESTAMP=$(date +%s)" >> $GITHUB_OUTPUT
@@ -177,6 +176,7 @@ jobs:
             treat_warnings_as_errors=false
             use_sysroot=false
             cc_wrapper="ccache"
+            use_udev=false
             use_aura=false
             use_ozone=false
             use_gio=false
