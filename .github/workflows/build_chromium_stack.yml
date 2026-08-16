@@ -103,6 +103,20 @@ jobs:
           sed -i 's/AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1UL /AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1ULL /' toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/android/hardware_buffer.h
           cd ../../../
           rm -rf android-ndk-$NDK_VER android-ndk-$NDK_VER-linux.zip
+          
+          # --- ANDROID SDK (Фикс для JNI генератора) ---
+          echo "Setting up Android SDK mock..."
+          # Chromium для генерации JNI заголовков требует android.jar из API 37.0.
+          # Чтобы не качать тяжелый SDK, берем системный из образа GitHub Actions 
+          # и кладем по ожидаемому пути (для базовых классов вроде UUID подойдет любой современный API)
+          mkdir -p third_party/android_sdk/public/platforms/android-37.0
+          
+          # Ищем последний установленный API в раннере (обычно это 34 или 35)
+          LATEST_API=$(ls -1 $ANDROID_HOME/platforms | grep 'android-[0-9]' | sort -V | tail -n 1)
+          echo "Using $LATEST_API as a fallback for android-37.0..."
+          
+          # Копируем jar файл, чтобы обмануть Ninja и дать JNI-генератору нужные базовые классы
+          cp $ANDROID_HOME/platforms/$LATEST_API/android.jar third_party/android_sdk/public/platforms/android-37.0/
 
           # --- LIBUNWINDSTACK (Отсутствует в Desktop-архиве Chromium) ---
           echo "Fetching libunwindstack..."
