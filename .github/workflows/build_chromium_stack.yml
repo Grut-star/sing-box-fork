@@ -46,6 +46,7 @@ jobs:
         run: |
           mkdir -p src
           cp -R stack_builder/* src/
+          chmod +x src/*.sh
           echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
       - name: Cache toolchains (Linux, OpenWrt, Android)
         uses: actions/cache@v4
@@ -86,6 +87,7 @@ jobs:
         run: |
           mkdir -p src
           cp -R stack_builder/* src/
+          chmod +x src/*.sh
           echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
       - name: Cache toolchains
         uses: actions/cache@v4
@@ -116,6 +118,7 @@ jobs:
         run: |
           mkdir -p src
           cp -R stack_builder/* src/
+          chmod +x src/*.sh
           echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
       - uses: actions/cache@v4
         with:
@@ -137,6 +140,7 @@ jobs:
         run: |
           mkdir -p src
           cp -R stack_builder/* src/
+          chmod +x src/*.sh
           echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
       - uses: actions/cache@v4
         with:
@@ -164,6 +168,7 @@ jobs:
         run: |
           mkdir -p src
           cp -R stack_builder/* src/
+          chmod +x src/*.sh
           echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
       - name: Free Disk Space
         uses: jlumbroso/free-disk-space@main
@@ -233,6 +238,7 @@ jobs:
         run: |
           mkdir -p src
           cp -R stack_builder/* src/
+          chmod +x src/*.sh
           echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
       - uses: actions/setup-java@v4
         with:
@@ -292,6 +298,7 @@ jobs:
         run: |
           mkdir -p src
           cp -R stack_builder/* src/
+          chmod +x src/*.sh
           echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
       - name: Cache toolchains
         uses: actions/cache@v4
@@ -338,6 +345,7 @@ jobs:
         run: |
           mkdir -p src
           cp -R stack_builder/* src/
+          chmod +x src/*.sh
           echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
       - name: Cache toolchains
         uses: actions/cache@v4
@@ -380,6 +388,7 @@ jobs:
         run: |
           mkdir -p src
           cp -R stack_builder/* src/
+          chmod +x src/*.sh
           echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
       - name: Cache toolchains
         uses: actions/cache@v4
