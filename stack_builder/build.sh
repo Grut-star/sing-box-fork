@@ -103,9 +103,9 @@ fi
 
 # ФЕЙКУЕМ gclient_args (отключаем checkout_android, чтобы GN не искал Java SDK/AIDL для //content)
 mkdir -p build/config
-echo "" > build/config/gclient_args.gni
-echo 'checkout_android = false' >> build/config/gclient_args.gni
-echo 'checkout_android_native_support = false' >> build/config/gclient_args.gni
+echo "" >> build/config/gclient_args.gni
+echo 'checkout_android = true' >> build/config/gclient_args.gni
+echo 'checkout_android_native_support = true' >> build/config/gclient_args.gni
 
 # Накатываем патчи Eidolon
 echo "Applying Eidolon Patches..."
