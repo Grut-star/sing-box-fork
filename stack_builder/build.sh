@@ -44,11 +44,13 @@ flags="$flags"'
   fatal_linker_warnings=false
   treat_warnings_as_errors=false
 
+  is_cronet_build=true
+
   use_udev=false
   use_aura=false
   use_ozone=false
   use_gio=false
-  use_platform_icu_alternatives=true
+  use_platform_icu_alternatives=false
   use_glib=false
   is_perfetto_embedder=true
 
@@ -85,9 +87,7 @@ case "$EXTRA_FLAGS" in
 *target_os=\"android\"*)
   flags="$flags"'
     is_desktop_android=true
-    default_min_sdk_version=27
-    '
-  #is_high_end_android=true
+    default_min_sdk_version=27'
   # is_high_end_android ломает сборку 32-битных архитектур в Chromium v152+
   if echo "$EXTRA_FLAGS" | grep -q 'target_cpu="x64"\|target_cpu="arm64"'; then
     flags="$flags"'
@@ -101,17 +101,17 @@ if [ "$target_os" = "linux" -a "$target_cpu" = "x64" ]; then
     use_cfi_icall=false'
 fi
 
-# ФЕЙКУЕМ gclient_args
+# ФЕЙКУЕМ gclient_args (отключаем checkout_android, чтобы GN не искал Java SDK/AIDL для //content)
 mkdir -p build/config
-echo "" >> build/config/gclient_args.gni
-echo 'checkout_android = true' >> build/config/gclient_args.gni
-echo 'checkout_android_native_support = true' >> build/config/gclient_args.gni
+echo "" > build/config/gclient_args.gni
+echo 'checkout_android = false' >> build/config/gclient_args.gni
+echo 'checkout_android_native_support = false' >> build/config/gclient_args.gni
 
 # Накатываем патчи Eidolon
 echo "Applying Eidolon Patches..."
 python3 patch_chromium_v152.py || true
 
-# СОЗДАЕМ ИЗОЛИРОВАННЫЙ ТАРГЕТ ДЛЯ EIDOLON (Фикс для Mac и чистоты сборки)
+# СОЗДАЕМ ИЗОЛИРОВАННЫЙ ТАРГЕТ ДЛЯ EIDOLON
 mkdir -p net/eidolon
 cp eidolon_bridge.cc net/eidolon/
 cp eidolon_bridge.h net/eidolon/
@@ -129,14 +129,19 @@ shared_library("libeidolon") {
 }
 EOF
 
-# Хак для Linux x64: отключение инструмента, который ломается при is_cronet_build=true
-sed -i 's|data_deps += \[ "//tools/perf/clear_system_cache" \]|# data_deps removed|g' BUILD.gn || true
+# Кроссплатформенный хак для отключения инструмента, конфликтующего с Cronet
+if [ "$(uname)" = "Darwin" ]; then
+  sed -i '' 's|data_deps += \[ "//tools/perf/clear_system_cache" \]|# data_deps removed|g' BUILD.gn || true
+else
+  sed -i 's|data_deps += \[ "//tools/perf/clear_system_cache" \]|# data_deps removed|g' BUILD.gn || true
+fi
 
 rm -rf "./$out"
 mkdir -p out
 
 export DEPOT_TOOLS_WIN_TOOLCHAIN=0
 
+echo "Running GN..."
 ./gn/out/gn gen "$out" --args="$flags $EXTRA_FLAGS"
 
 if [ "$host_os" = linux ]; then
