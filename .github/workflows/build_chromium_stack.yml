@@ -1,266 +1,405 @@
-name: Build Eidolon Stack (Android ARM64)
-
+name: Build Eidolon Stack
 on:
+  push:
+    branches: [master]
+    paths-ignore: [README.md]
   release:
     types: [published]
   workflow_dispatch:
-    inputs:
-      chromium_version:
-        description: 'Hardcode Chromium Version (leave empty to auto-fetch latest Stable)'
-        required: false
-        type: string
+
+defaults:
+  run:
+    shell: bash
+    working-directory: src
+
+env:
+  CACHE_EPOCH: 1
+  CCACHE_MAXSIZE: 200M
+  CCACHE_MAXFILES: 0
+  SCCACHE_CACHE_SIZE: 200M
 
 jobs:
-  build:
+  prepare:
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: .
+    outputs:
+      chromium_version: ${{ steps.get_version.outputs.VERSION }}
+    steps:
+      - name: Fetch Latest Chromium Version
+        id: get_version
+        run: |
+          VERSION=$(curl -s "https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Android" | jq -r '.[0].version')
+          echo "Target Chromium Version: $VERSION"
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+  cache-toolchains-posix:
+    needs: prepare
     runs-on: ubuntu-22.04
     env:
-      CACHE_EPOCH: 1
+      CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
     steps:
-      # 1. Автоматическое определение версии Chromium
-      - name: Resolve Chromium Version
-        id: version
+      - uses: actions/checkout@v4
+      - name: Setup workspace
+        working-directory: .
         run: |
-          if [ -n "${{ github.event.inputs.chromium_version }}" ]; then
-            VERSION="${{ github.event.inputs.chromium_version }}"
-          else
-            echo "Fetching latest stable Android release from ChromiumDash..."
-            VERSION=$(curl -s "https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Android" | jq -r '.[0].version')
-          fi
-          echo "Target Chromium Version: $VERSION"
-          echo "CHROMIUM_VERSION=$VERSION" >> $GITHUB_ENV
+          mkdir -p src
+          cp -R stack_builder/* src/
+          echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
+      - name: Cache toolchains (Linux, OpenWrt, Android)
+        uses: actions/cache@v4
+        with:
+          path: |
+            src/third_party/llvm-build/Release+Asserts/
+            src/gn/
+            src/qemu-user*.deb
+          key: toolchains-posix-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+      - name: Cache Android NDK (Android)
+        uses: actions/cache@v4
+        with:
+          path: src/third_party/android_toolchain/ndk/
+          key: android-ndk-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+      - id: ccache-timestamp
+        run: echo "CCACHE_TIMESTAMP=$(date +%s)" >>$GITHUB_OUTPUT
+      - name: Host tool ccache
+        uses: actions/cache@v4
+        with:
+          path: src/.host_tool_cache
+          key: ccache-posix-${{ hashFiles('CHROMIUM_VERSION') }}-${{ steps.ccache-timestamp.outputs.CCACHE_TIMESTAMP }}
+          restore-keys: ccache-posix-${{ hashFiles('CHROMIUM_VERSION') }}-
+      - name: Install APT packages
+        run: |
+          sudo apt update
+          sudo apt install ninja-build pkg-config ccache
+      - run: EXTRA_FLAGS='target_os="android" target_cpu="x64"' ./get-clang.sh
 
-      # 2. Освобождение места (ОЧЕНЬ ВАЖНО, Chromium весит >30GB)
+  cache-toolchains-win:
+    needs: prepare
+    runs-on: windows-2022
+    env:
+      CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup workspace
+        working-directory: .
+        run: |
+          mkdir -p src
+          cp -R stack_builder/* src/
+          echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
+      - name: Cache toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            src/third_party/llvm-build/Release+Asserts/
+            src/gn/
+            ~/.cargo/bin/
+            ~/bin/ninja.exe
+          key: toolchains-win-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+      - run: EXTRA_FLAGS='target_cpu="x64"' ./get-clang.sh
+      - run: EXTRA_FLAGS='target_cpu="x86"' ./get-clang.sh
+      - run: |
+          if [ ! -f ~/bin/ninja.exe ]; then
+            curl -LO https://github.com/ninja-build/ninja/releases/download/v1.10.2/ninja-win.zip
+            unzip ninja-win.zip -d ~/bin
+          fi
+
+  cache-toolchains-mac-x64:
+    needs: prepare
+    runs-on: macos-15-intel
+    env:
+      CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup workspace
+        working-directory: .
+        run: |
+          mkdir -p src
+          cp -R stack_builder/* src/
+          echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
+      - uses: actions/cache@v4
+        with:
+          path: |
+            src/third_party/llvm-build/Release+Asserts/
+            src/gn/
+          key: toolchains-mac-x64-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+      - run: EXTRA_FLAGS='target_cpu="x64"' ./get-clang.sh
+
+  cache-toolchains-mac-arm64:
+    needs: prepare
+    runs-on: macos-15
+    env:
+      CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup workspace
+        working-directory: .
+        run: |
+          mkdir -p src
+          cp -R stack_builder/* src/
+          echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
+      - uses: actions/cache@v4
+        with:
+          path: |
+            src/third_party/llvm-build/Release+Asserts/
+            src/gn/
+          key: toolchains-mac-arm64-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+      - run: EXTRA_FLAGS='target_cpu="arm64"' ./get-clang.sh
+
+  linux:
+    needs: [prepare, cache-toolchains-posix]
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, x86, arm64, arm]
+    env:
+      CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
+      EXTRA_FLAGS: 'target_cpu="${{ matrix.arch }}"'
+      BUNDLE: eidolon-${{ github.event.release.tag_name || 'dev' }}-${{ github.job }}-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup workspace
+        working-directory: .
+        run: |
+          mkdir -p src
+          cp -R stack_builder/* src/
+          echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
       - name: Free Disk Space
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: true
-          android: false
+          android: true
           dotnet: true
           haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      # Добавляем установку правильной версии JDK (как в naiveproxy)
-      - name: Setup Java 21
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '21'
-
-      # 3. Установка системных пакетов
-      - name: Install Dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y ninja-build pkg-config ccache curl unzip jq python3 libudev-dev
-      # 4. Настройка Ccache
-      - id: ccache-timestamp
-        run: echo "TIMESTAMP=$(date +%s)" >> $GITHUB_OUTPUT
-
-      - name: Cache ccache
+      - name: Cache toolchains
         uses: actions/cache@v4
         with:
-          path: ~/.cache/ccache
-          key: ccache-android-arm64-${{ env.CHROMIUM_VERSION }}-${{ steps.ccache-timestamp.outputs.TIMESTAMP }}
-          restore-keys: ccache-android-arm64-${{ env.CHROMIUM_VERSION }}-
-
-      # 5. Загрузка исходников Chromium (БЕЗ УДАЛЕНИЯ ПАПОК, чтобы не ломать BUILD.gn)
-      - name: Download and Extract Chromium
-        run: |
-          mkdir src && cd src
-          echo "Downloading and extracting Chromium $CHROMIUM_VERSION..."
-          # Распаковываем всё. Исключать папки на лету нельзя - GN упадет из-за отсутствующих файлов в deps.
-          curl -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-$CHROMIUM_VERSION.tar.xz" | tar -xJ --strip-components=1
-
-      # 6. Установка Toolchains (Clang, GN, NDK, Libunwind)
-      - name: Fetch Toolchains (Clang, GN, NDK)
-        working-directory: src
-        run: |
-          # --- CLANG ---
-          mkdir -p third_party/llvm-build/Release+Asserts
-          CLANG_REVISION=$(python3 -c 'import sys; sys.path.append("tools/clang/scripts"); import update; print(update.PACKAGE_VERSION)')
-          echo $CLANG_REVISION > third_party/llvm-build/Release+Asserts/cr_build_revision
-          curl -L "https://commondatastorage.googleapis.com/chromium-browser-clang/Linux_x64/clang-$CLANG_REVISION.tar.xz" | tar xJf - -C third_party/llvm-build/Release+Asserts
-
-          # --- GN ---
-          GN_VERSION=$(grep "'gn_version':" DEPS | head -n 1 | cut -d"'" -f4)
-          mkdir -p gn/out
-          curl -L "https://chrome-infra-packages.appspot.com/dl/gn/gn/linux-amd64/+/$GN_VERSION" -o gn.zip
-          unzip -q gn.zip -d gn/out
-          rm gn.zip
-
-          # --- ANDROID NDK ---
-          NDK_VER="r24"
-          curl -L -O https://dl.google.com/android/repository/android-ndk-$NDK_VER-linux.zip
-          unzip -q android-ndk-$NDK_VER-linux.zip
-          mkdir -p third_party/android_toolchain/ndk
-          
-          cd android-ndk-$NDK_VER
-          cp -r --parents sources/android/cpufeatures ../third_party/android_toolchain/ndk
-          cp -r --parents toolchains/llvm/prebuilt ../third_party/android_toolchain/ndk
-          cd ..
-          
-          cd third_party/android_toolchain/ndk
-          find toolchains -type f -regextype egrep \! -regex \
-            '.*(lib(atomic|gcc|gcc_real|compiler_rt-extras|android_support|unwind).a|crt.*o|lib(android|c|dl|log|m).so|usr/local.*|usr/include.*)' -delete
-          
-          sed -i 's/AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1UL /AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1ULL /' toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/android/hardware_buffer.h
-          
-          echo "Moving compiler-rt libraries to sysroot for Chromium Clang..."
-          mkdir -p toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/27/
-          
-          # Находим libatomic.a (и libgcc.a) в NDK и копируем их туда, где линкер их 100% найдет
-          find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -name "*.a" | grep aarch64 | xargs -I {} cp {} toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/27/
-          
-          cd ../../../
-          rm -rf android-ndk-$NDK_VER android-ndk-$NDK_VER-linux.zip
-          
-          # --- ANDROID SDK (Фикс для JNI генератора) ---
-          echo "Setting up Android SDK mock..."
-          # Chromium для генерации JNI заголовков требует android.jar из API 37.0.
-          # Чтобы не качать тяжелый SDK, берем системный из образа GitHub Actions 
-          # и кладем по ожидаемому пути (для базовых классов вроде UUID подойдет любой современный API)
-          mkdir -p third_party/android_sdk/public/platforms/android-37.0
-          
-          # Ищем последний установленный API в раннере (обычно это 34 или 35)
-          LATEST_API=$(ls -1 $ANDROID_HOME/platforms | grep 'android-[0-9]' | sort -V | tail -n 1)
-          echo "Using $LATEST_API as a fallback for android-37.0..."
-          
-          # Копируем jar файл, чтобы обмануть Ninja и дать JNI-генератору нужные базовые классы
-          cp $ANDROID_HOME/platforms/$LATEST_API/android.jar third_party/android_sdk/public/platforms/android-37.0/
-
-          # --- LIBUNWINDSTACK (Отсутствует в Desktop-архиве Chromium) ---
-          echo "Fetching libunwindstack..."
-          # Вытаскиваем точный хэш из DEPS для совместимости
-          UNWIND_HASH=$(grep -A 3 "'src/third_party/libunwindstack':" DEPS | grep 'url' | grep -oE '[a-f0-9]{40}')
-          if [ -z "$UNWIND_HASH" ]; then UNWIND_HASH="main"; fi
-          echo "Target libunwindstack hash: $UNWIND_HASH"
-          
-          # --- JDK (Фикс для JNI генератора) ---
-          echo "Setting up JDK mock..."
-          mkdir -p third_party/jdk
-          
-          # Очищаем директорию на случай, если она пришла с тарболом исходников
-          rm -rf third_party/jdk/current
-          
-          # Жестко копируем JDK внутрь дерева исходников вместо симлинка
-          cp -R "$JAVA_HOME" third_party/jdk/current
-          
-          mkdir -p third_party/libunwindstack
-          cd third_party/libunwindstack
-          git init
-          git remote add origin https://chromium.googlesource.com/chromium/src/third_party/libunwindstack.git
-          git fetch --depth 1 origin $UNWIND_HASH
-          git checkout FETCH_HEAD
-          cd ../..
-
-      # 7. Накатываем патчи Eidolon и монтируем Bridge
-      - name: Apply Eidolon Patches
-        working-directory: src
-        run: |
-          # Вызываем твой патчер из корня репозитория
-          python3 ../stack_builder/patch_chromium_v152.py
-          
-          # Копируем C++ мосты в net/socket
-          cp ../stack_builder/eidolon_bridge.cc net/socket/
-          cp ../stack_builder/eidolon_bridge.h net/socket/
-          
-          # Создаем таргет сборки для нашей разделяемой библиотеки
-          cat << 'EOF' >> net/BUILD.gn
-          
-          shared_library("libeidolon") {
-            sources = [ "socket/eidolon_bridge.cc" ]
-            deps = [
-              "//net:net",
-              "//base:base",
-              "//url:url",
-              "//crypto:crypto",
-              "//third_party/boringssl:boringssl",
-            ]
-          }
-          EOF
-
-      # 8. Генерация GN (С отключенным official_build для обхода PGO)
-      - name: Generate GN Args
-        working-directory: src
-        run: |
-          mkdir -p out/Release
-          
-          # ФЕЙКУЕМ gclient_args, чтобы GN не ругался на отсутствие gclient
-          echo "" >> build/config/gclient_args.gni
-          echo 'checkout_android = true' >> build/config/gclient_args.gni
-          echo 'checkout_android_native_support = true' >> build/config/gclient_args.gni
-          
-          # Отключаем is_official_build, чтобы не возиться с PGO профилями.
-          # is_debug=false и symbol_level=0 дадут достаточно оптимизированную сборку.
-          ./gn/out/gn gen out/Release --args='
-            target_os="android"
-            target_cpu="arm64"
-            is_desktop_android=true
-            default_min_sdk_version=27
-            is_high_end_android=true
-            is_debug=false
-            is_official_build=false
-            is_component_build=false
-            is_cronet_build=true
-            symbol_level=0
-            blink_symbol_level=0
-            v8_symbol_level=0
-            exclude_unwind_tables=true
-            enable_resource_allowlist_generation=false
-            fatal_linker_warnings=false
-            treat_warnings_as_errors=false
-            use_sysroot=false
-            cc_wrapper="ccache"
-            use_udev=false
-            use_aura=false
-            use_ozone=false
-            use_gio=false
-            use_platform_icu_alternatives=true
-            use_glib=false
-            is_perfetto_embedder=false
-            enable_websockets=false
-            use_kerberos=false
-            disable_file_support=true
-            enable_mdns=false
-            enable_reporting=false
-            enable_device_bound_sessions=false
-            enable_disk_cache_sql_backend=false
-            use_nss_certs=false
-            enable_backup_ref_ptr_support=false
-            enable_dangling_raw_ptr_checks=false
-            use_clang_modules=false
-          '
-
-      # 9. Сборка (СЕКРЕТНЫЙ ИНГРЕДИЕНТ: Сначала хост-тулзы, потом Android)
-      - name: Compile library
-        working-directory: src
-        run: |
-          export CCACHE_SLOPPINESS=time_macros
-          export CCACHE_BASEDIR="$PWD"
-          export CCACHE_CPP2=yes
-          
-          ccache -z
-          
-          # 1. Находим и собираем генераторы (протобуфы, JNI, V8) под Linux x64
-          echo "Building host tools..."
-          HOST_TARGETS=$(grep -o ' | .*' out/Release/toolchain.ninja | grep -o ' clang_x64/[^ ]*' | sort -u || true)
-          if [ ! -z "$HOST_TARGETS" ]; then
-            ninja -C out/Release $HOST_TARGETS
-          fi
-          
-          # 2. Собираем нашу библиотеку под Android ARM64
-          echo "Building libeidolon for Android..."
-          ninja -C out/Release net:libeidolon
-          
-          ccache -s
-
-      # 10. Сохранение артефакта
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+          path: |
+            src/third_party/llvm-build/Release+Asserts/
+            src/gn/
+            src/qemu-user*.deb
+          key: toolchains-posix-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+      - name: Download Chromium
+        run: curl -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-${{ env.CHROMIUM_VERSION }}.tar.xz" | tar -xJ --strip-components=1
+      - name: Cache sysroot
+        uses: actions/cache@v4
         with:
-          name: libeidolon_${{ env.CHROMIUM_VERSION }}_arm64
-          path: src/out/Release/libeidolon.so
+          path: |
+            src/out/sysroot-build/bullseye/bullseye_*
+            src/out/sysroot-build/trixie/trixie_*
+            src/out/sysroot-build/sid/sid_*
+          key: sysroot-linux-${{ matrix.arch }}-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+      - name: Install APT packages
+        run: |
+          sudo apt update
+          sudo apt install ninja-build pkg-config ccache bubblewrap
+      - run: ./get-clang.sh
+      - run: ccache -z || true
+      - run: ./build.sh
+      - name: Pack artifacts
+        run: |
+          mkdir ${{ env.BUNDLE }}
+          cp out/Release/*eidolon* eidolon_bridge.h ${{ env.BUNDLE }}/
+          tar cJf ${{ env.BUNDLE }}.tar.xz ${{ env.BUNDLE }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BUNDLE }}.tar.xz
+          path: src/${{ env.BUNDLE }}.tar.xz
+
+  android:
+    needs: [prepare, cache-toolchains-posix]
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            abi: x86_64
+          - arch: x86
+            abi: x86
+          - arch: arm64
+            abi: arm64-v8a
+          - arch: arm
+            abi: armeabi-v7a
+    env:
+      CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
+      EXTRA_FLAGS: 'target_cpu="${{ matrix.arch }}" target_os="android"'
+      BUNDLE: eidolon-${{ github.event.release.tag_name || 'dev' }}-android-${{ matrix.abi }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup workspace
+        working-directory: .
+        run: |
+          mkdir -p src
+          cp -R stack_builder/* src/
+          echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: 21
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          dotnet: true
+          haskell: true
+      - name: Cache toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            src/third_party/llvm-build/Release+Asserts/
+            src/gn/
+          key: toolchains-posix-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+      - name: Cache Android NDK
+        uses: actions/cache@v4
+        with:
+          path: src/third_party/android_toolchain/ndk/
+          key: android-ndk-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+      - name: Download Chromium
+        run: curl -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-${{ env.CHROMIUM_VERSION }}.tar.xz" | tar -xJ --strip-components=1
+      - name: Install APT packages
+        run: |
+          sudo apt update
+          sudo apt install ninja-build pkg-config ccache
+      - run: ./get-clang.sh
+      - run: ./build.sh
+      - name: Pack artifacts
+        run: |
+          mkdir ${{ env.BUNDLE }}
+          cp out/Release/*eidolon* eidolon_bridge.h ${{ env.BUNDLE }}/
+          tar cJf ${{ env.BUNDLE }}.tar.xz ${{ env.BUNDLE }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BUNDLE }}.tar.xz
+          path: src/${{ env.BUNDLE }}.tar.xz
+
+  win:
+    needs: [prepare, cache-toolchains-win]
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, x86, arm64]
+    env:
+      CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
+      EXTRA_FLAGS: 'target_cpu="${{ matrix.arch }}"'
+      BUNDLE: eidolon-${{ github.event.release.tag_name || 'dev' }}-${{ github.job }}-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup workspace
+        working-directory: .
+        run: |
+          mkdir -p src
+          cp -R stack_builder/* src/
+          echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
+      - name: Cache toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            src/third_party/llvm-build/Release+Asserts/
+            src/gn/
+            ~/.cargo/bin/
+            ~/bin/ninja.exe
+          key: toolchains-win-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+      - name: Download Chromium
+        run: |
+          curl.exe -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-${{ env.CHROMIUM_VERSION }}.tar.xz" -o chromium.tar.xz
+          tar -xJ -f chromium.tar.xz --strip-components=1
+          rm chromium.tar.xz
+      - run: ./get-clang.sh
+      - run: ~/.cargo/bin/sccache -z || true
+      - run: ./build.sh
+      - name: Pack artifacts
+        run: |
+          mkdir ${{ env.BUNDLE }}
+          cp out/Release/*eidolon* eidolon_bridge.h ${{ env.BUNDLE }}/
+          7z a ${{ env.BUNDLE }}.zip ${{ env.BUNDLE }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BUNDLE }}.zip
+          path: src/${{ env.BUNDLE }}.zip
+
+  mac-x64:
+    needs: [prepare, cache-toolchains-mac-x64]
+    runs-on: macos-15-intel
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64]
+    env:
+      CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
+      EXTRA_FLAGS: 'target_cpu="${{ matrix.arch }}"'
+      BUNDLE: eidolon-${{ github.event.release.tag_name || 'dev' }}-${{ github.job }}-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup workspace
+        working-directory: .
+        run: |
+          mkdir -p src
+          cp -R stack_builder/* src/
+          echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
+      - name: Cache toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            src/third_party/llvm-build/Release+Asserts/
+            src/gn/
+          key: toolchains-mac-x64-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+      - name: Download Chromium
+        run: curl -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-${{ env.CHROMIUM_VERSION }}.tar.xz" | tar -xJ --strip-components=1
+      - run: brew install ninja ccache
+      - run: pip install setuptools || true
+      - run: ./get-clang.sh
+      - run: ./build.sh
+      - name: Pack artifacts
+        run: |
+          mkdir ${{ env.BUNDLE }}
+          cp out/Release/*eidolon* eidolon_bridge.h ${{ env.BUNDLE }}/
+          tar cJf ${{ env.BUNDLE }}.tar.xz ${{ env.BUNDLE }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BUNDLE }}.tar.xz
+          path: src/${{ env.BUNDLE }}.tar.xz
+
+  mac-arm64:
+    needs: [prepare, cache-toolchains-mac-arm64]
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64]
+    env:
+      CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
+      EXTRA_FLAGS: 'target_cpu="${{ matrix.arch }}"'
+      BUNDLE: eidolon-${{ github.event.release.tag_name || 'dev' }}-${{ github.job }}-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup workspace
+        working-directory: .
+        run: |
+          mkdir -p src
+          cp -R stack_builder/* src/
+          echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
+      - name: Cache toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            src/third_party/llvm-build/Release+Asserts/
+            src/gn/
+          key: toolchains-mac-arm64-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+      - name: Download Chromium
+        run: curl -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-${{ env.CHROMIUM_VERSION }}.tar.xz" | tar -xJ --strip-components=1
+      - run: brew install ninja ccache
+      - run: pip install setuptools || true
+      - run: ./get-clang.sh
+      - run: ./build.sh
+      - name: Pack artifacts
+        run: |
+          mkdir ${{ env.BUNDLE }}
+          cp out/Release/*eidolon* eidolon_bridge.h ${{ env.BUNDLE }}/
+          tar cJf ${{ env.BUNDLE }}.tar.xz ${{ env.BUNDLE }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BUNDLE }}.tar.xz
+          path: src/${{ env.BUNDLE }}.tar.xz
