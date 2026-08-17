@@ -44,8 +44,6 @@ flags="$flags"'
   fatal_linker_warnings=false
   treat_warnings_as_errors=false
 
-  is_cronet_build=true
-
   use_udev=false
   use_aura=false
   use_ozone=false
@@ -54,7 +52,6 @@ flags="$flags"'
   use_glib=false
   is_perfetto_embedder=true
 
-  disable_file_support=true
   enable_websockets=false
   use_kerberos=false
   disable_zstd_filter=false
@@ -89,7 +86,13 @@ case "$EXTRA_FLAGS" in
   flags="$flags"'
     is_desktop_android=true
     default_min_sdk_version=27
+    '
+  #is_high_end_android=true
+  # is_high_end_android ломает сборку 32-битных архитектур в Chromium v152+
+  if echo "$EXTRA_FLAGS" | grep -q 'target_cpu="x64"\|target_cpu="arm64"'; then
+    flags="$flags"'
     is_high_end_android=true'
+  fi
   ;;
 esac
 
@@ -104,18 +107,18 @@ echo "" >> build/config/gclient_args.gni
 echo 'checkout_android = true' >> build/config/gclient_args.gni
 echo 'checkout_android_native_support = true' >> build/config/gclient_args.gni
 
-# Накатываем патчи Eidolon (файлы теперь лежат в этой же директории src/)
+# Накатываем патчи Eidolon
 echo "Applying Eidolon Patches..."
 python3 patch_chromium_v152.py || true
-cp eidolon_bridge.cc net/socket/
-cp eidolon_bridge.h net/socket/
 
-# Добавляем GN-таргет
-if ! grep -q 'shared_library("libeidolon")' net/BUILD.gn; then
-cat << 'EOF' >> net/BUILD.gn
+# СОЗДАЕМ ИЗОЛИРОВАННЫЙ ТАРГЕТ ДЛЯ EIDOLON (Фикс для Mac и чистоты сборки)
+mkdir -p net/eidolon
+cp eidolon_bridge.cc net/eidolon/
+cp eidolon_bridge.h net/eidolon/
 
+cat << 'EOF' > net/eidolon/BUILD.gn
 shared_library("libeidolon") {
-  sources = [ "socket/eidolon_bridge.cc" ]
+  sources = [ "eidolon_bridge.cc" ]
   deps = [
     "//net:net",
     "//base:base",
@@ -125,7 +128,9 @@ shared_library("libeidolon") {
   ]
 }
 EOF
-fi
+
+# Хак для Linux x64: отключение инструмента, который ломается при is_cronet_build=true
+sed -i 's|data_deps += \[ "//tools/perf/clear_system_cache" \]|# data_deps removed|g' BUILD.gn || true
 
 rm -rf "./$out"
 mkdir -p out
@@ -143,4 +148,4 @@ if [ "$host_os" = linux ]; then
 fi
 
 echo "Building libeidolon..."
-ninja -C "$out" net:libeidolon
+ninja -C "$out" net/eidolon:libeidolon

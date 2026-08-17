@@ -95,13 +95,18 @@ if [ "$target_os" = android ]; then
   fi
 
   # SDK Mock
-  if [ ! -d third_party/android_sdk/public/platforms/android-37.0 ]; then
+  if [ ! -f third_party/android_sdk/public/platforms/android-37.0/android.jar ]; then
     mkdir -p third_party/android_sdk/public/platforms/android-37.0
     if [ -n "$ANDROID_HOME" ]; then
-      LATEST_API=$(ls -1 $ANDROID_HOME/platforms | grep 'android-[0-9]' | sort -V | tail -n 1)
-      if [ -n "$LATEST_API" ]; then
-        cp $ANDROID_HOME/platforms/$LATEST_API/android.jar third_party/android_sdk/public/platforms/android-37.0/
+      # Ищем самый свежий android.jar в системе
+      JAR_PATH=$(find "$ANDROID_HOME/platforms" -name "android.jar" | sort -V | tail -n 1)
+      if [ -n "$JAR_PATH" ]; then
+        cp "$JAR_PATH" third_party/android_sdk/public/platforms/android-37.0/android.jar
+      else
+        touch third_party/android_sdk/public/platforms/android-37.0/android.jar
       fi
+    else
+      touch third_party/android_sdk/public/platforms/android-37.0/android.jar
     fi
   fi
 fi

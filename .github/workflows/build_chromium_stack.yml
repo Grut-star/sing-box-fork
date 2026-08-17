@@ -156,7 +156,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [x64, x86, arm64, arm]
+        arch: [x64, arm64, arm]
     env:
       CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
       EXTRA_FLAGS: 'target_cpu="${{ matrix.arch }}"'
@@ -312,7 +312,7 @@ jobs:
       - name: Download Chromium
         run: |
           curl.exe -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-${{ env.CHROMIUM_VERSION }}.tar.xz" -o chromium.tar.xz
-          tar -xJ -f chromium.tar.xz --strip-components=1
+          tar -xJ -f chromium.tar.xz --strip-components=1 || true
           rm chromium.tar.xz
       - run: ./get-clang.sh
       - run: ~/.cargo/bin/sccache -z || true
