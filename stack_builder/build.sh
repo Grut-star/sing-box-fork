@@ -37,13 +37,12 @@ if [ "$CCACHE" ]; then
     cc_wrapper=\"$CCACHE\""
 fi
 
-# ОСНОВНЫЕ ФЛАГИ
+# Основные безопасные флаги
 flags="$flags"'
   is_clang=true
   use_sysroot=false
   fatal_linker_warnings=false
   treat_warnings_as_errors=false
-  is_cronet_build=true
   use_udev=false
   use_aura=false
   use_ozone=false
@@ -52,7 +51,6 @@ flags="$flags"'
   is_perfetto_embedder=true
   enable_websockets=false
   use_kerberos=false
-  disable_zstd_filter=false
   enable_mdns=false
   enable_reporting=false
   include_transport_security_state_preload_list=false
@@ -65,12 +63,30 @@ flags="$flags"'
   is_component_build=false
 '
 
-# РАЗДЕЛЯЕМ ICU ДЛЯ ANDROID И DESKTOP
-if [ "$target_os" = "android" ]; then
+# ПРАВИЛЬНОЕ ОПРЕДЕЛЕНИЕ ANDROID И ИЗОЛЯЦИЯ ФЛАГОВ CRONET/ICU
+IS_ANDROID=false
+case "$EXTRA_FLAGS" in
+  *target_os=\"android\"*) IS_ANDROID=true ;;
+esac
+if [ "$target_os" = "android" ]; then IS_ANDROID=true; fi
+
+if [ "$IS_ANDROID" = "true" ]; then
+  echo "=> Configuring for Android (Cronet mode)"
   flags="$flags"'
-    use_platform_icu_alternatives=true'
+    is_cronet_build=true
+    use_platform_icu_alternatives=true
+    is_desktop_android=true
+    default_min_sdk_version=27'
+
+  # is_high_end_android ломает сборку 32-битных архитектур в Chromium v152+
+  if echo "$EXTRA_FLAGS" | grep -q 'target_cpu="x64"\|target_cpu="arm64"'; then
+    flags="$flags"'
+    is_high_end_android=true'
+  fi
 else
+  echo "=> Configuring for Desktop (Native mode)"
   flags="$flags"'
+    is_cronet_build=false
     use_platform_icu_alternatives=false'
 fi
 
@@ -85,25 +101,12 @@ if [ "$host_os" = "mac" ]; then
     enable_dsyms=false'
 fi
 
-case "$EXTRA_FLAGS" in
-*target_os=\"android\"*)
-  flags="$flags"'
-    is_desktop_android=true
-    default_min_sdk_version=27'
-  # is_high_end_android ломает сборку 32-битных архитектур в Chromium v152+
-  if echo "$EXTRA_FLAGS" | grep -q 'target_cpu="x64"\|target_cpu="arm64"'; then
-    flags="$flags"'
-    is_high_end_android=true'
-  fi
-  ;;
-esac
-
 if [ "$target_os" = "linux" -a "$target_cpu" = "x64" ]; then
   flags="$flags"'
     use_cfi_icall=false'
 fi
 
-# ФЕЙКУЕМ gclient_args
+# ФЕЙКУЕМ gclient_args (Нужно для GN-разрешения JNI зависимостей на Android)
 mkdir -p build/config
 echo "" >> build/config/gclient_args.gni
 echo 'checkout_android = true' >> build/config/gclient_args.gni
@@ -133,13 +136,6 @@ EOF
 
 # ПРИВЯЗЫВАЕМ ТАРГЕТ К КОРНЮ, ЧТОБЫ GN ЕГО УВИДЕЛ
 echo 'group("eidolon") { deps = [ "//net/eidolon:libeidolon" ] }' >> BUILD.gn
-
-# Кроссплатформенный хак для отключения инструмента, конфликтующего с Cronet
-if [ "$(uname)" = "Darwin" ]; then
-  sed -i '' 's|data_deps += \[ "//tools/perf/clear_system_cache" \]|# data_deps removed|g' BUILD.gn || true
-else
-  sed -i 's|data_deps += \[ "//tools/perf/clear_system_cache" \]|# data_deps removed|g' BUILD.gn || true
-fi
 
 rm -rf "./$out"
 mkdir -p out
