@@ -108,6 +108,13 @@ jobs:
             '.*(lib(atomic|gcc|gcc_real|compiler_rt-extras|android_support|unwind).a|crt.*o|lib(android|c|dl|log|m).so|usr/local.*|usr/include.*)' -delete
           
           sed -i 's/AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1UL /AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1ULL /' toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/android/hardware_buffer.h
+          
+          echo "Moving compiler-rt libraries to sysroot for Chromium Clang..."
+          mkdir -p toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/27/
+          
+          # Находим libatomic.a (и libgcc.a) в NDK и копируем их туда, где линкер их 100% найдет
+          find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -name "*.a" | grep aarch64 | xargs -I {} cp {} toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/27/
+          
           cd ../../../
           rm -rf android-ndk-$NDK_VER android-ndk-$NDK_VER-linux.zip
           
