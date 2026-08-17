@@ -37,23 +37,19 @@ if [ "$CCACHE" ]; then
     cc_wrapper=\"$CCACHE\""
 fi
 
+# ОСНОВНЫЕ ФЛАГИ
 flags="$flags"'
   is_clang=true
   use_sysroot=false
-
   fatal_linker_warnings=false
   treat_warnings_as_errors=false
-
   is_cronet_build=true
-
   use_udev=false
   use_aura=false
   use_ozone=false
   use_gio=false
-  use_platform_icu_alternatives=false
   use_glib=false
   is_perfetto_embedder=true
-
   enable_websockets=false
   use_kerberos=false
   disable_zstd_filter=false
@@ -62,15 +58,21 @@ flags="$flags"'
   include_transport_security_state_preload_list=false
   enable_device_bound_sessions=false
   enable_disk_cache_sql_backend=false
-
   use_nss_certs=false
-
   enable_backup_ref_ptr_support=false
   enable_dangling_raw_ptr_checks=false
-
   use_clang_modules=false
   is_component_build=false
 '
+
+# РАЗДЕЛЯЕМ ICU ДЛЯ ANDROID И DESKTOP
+if [ "$target_os" = "android" ]; then
+  flags="$flags"'
+    use_platform_icu_alternatives=true'
+else
+  flags="$flags"'
+    use_platform_icu_alternatives=false'
+fi
 
 if [ "$WITH_SYSROOT" ]; then
   flags="$flags
@@ -101,7 +103,7 @@ if [ "$target_os" = "linux" -a "$target_cpu" = "x64" ]; then
     use_cfi_icall=false'
 fi
 
-# ФЕЙКУЕМ gclient_args (отключаем checkout_android, чтобы GN не искал Java SDK/AIDL для //content)
+# ФЕЙКУЕМ gclient_args
 mkdir -p build/config
 echo "" >> build/config/gclient_args.gni
 echo 'checkout_android = true' >> build/config/gclient_args.gni
@@ -129,6 +131,9 @@ shared_library("libeidolon") {
 }
 EOF
 
+# ПРИВЯЗЫВАЕМ ТАРГЕТ К КОРНЮ, ЧТОБЫ GN ЕГО УВИДЕЛ
+echo 'group("eidolon") { deps = [ "//net/eidolon:libeidolon" ] }' >> BUILD.gn
+
 # Кроссплатформенный хак для отключения инструмента, конфликтующего с Cronet
 if [ "$(uname)" = "Darwin" ]; then
   sed -i '' 's|data_deps += \[ "//tools/perf/clear_system_cache" \]|# data_deps removed|g' BUILD.gn || true
@@ -153,4 +158,4 @@ if [ "$host_os" = linux ]; then
 fi
 
 echo "Building libeidolon..."
-ninja -C "$out" net/eidolon:libeidolon
+ninja -C "$out" eidolon
