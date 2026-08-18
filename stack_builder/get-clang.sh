@@ -91,7 +91,7 @@ if [ "$target_os" = android ]; then
     echo "Injecting System JDK..."
     rm -rf third_party/jdk/current
     mkdir -p third_party/jdk
-    cp -R "$JAVA_HOME" third_party/jdk/current
+    cp -aL "$JAVA_HOME"/. third_party/jdk/current/ || true
   fi
 
   # SDK Mock

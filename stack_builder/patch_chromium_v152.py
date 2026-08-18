@@ -93,12 +93,12 @@ def main():
     )
 
     # 7. Mac OS 15 SDK fix: удаляем хардкод отсутствующих файлов Apple
-        apply_patch(
-            'build/modules/BUILD.gn',
-            r'\s*"\$mac_sdk_path/usr/include/DarwinFoundation[1-3]\.modulemap",',
-            r'',
-            replace_all=True
-        )
+    apply_patch(
+        'build/modules/BUILD.gn',
+        r'\s*"\$mac_sdk_path/usr/include/DarwinFoundation[1-3]\.modulemap",',
+        r'',
+        replace_all=True
+    )
 
 if __name__ == '__main__':
     main()

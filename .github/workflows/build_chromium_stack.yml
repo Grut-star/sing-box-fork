@@ -77,7 +77,7 @@ jobs:
       - name: Install APT packages
         run: |
           sudo apt update
-          sudo apt install ninja-build pkg-config ccache
+          sudo apt install -y ninja-build pkg-config ccache bubblewrap libxkbcommon-dev libgtk-3-dev libglib2.0-dev libgbm-dev libpci-dev libnss3-dev
       - run: EXTRA_FLAGS='target_os="android" target_cpu="x64"' ./get-clang.sh
 
   cache-toolchains-win:

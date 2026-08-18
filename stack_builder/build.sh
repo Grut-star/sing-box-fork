@@ -63,6 +63,7 @@ flags="$flags"'
   enable_dangling_raw_ptr_checks=false
   use_clang_modules=false
   is_component_build=false
+  enable_rust=false
 '
 
 # ПРАВИЛЬНОЕ ОПРЕДЕЛЕНИЕ ANDROID И ИЗОЛЯЦИЯ ФЛАГОВ CRONET/ICU
