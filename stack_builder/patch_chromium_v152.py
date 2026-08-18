@@ -20,8 +20,11 @@ def apply_patch(filepath, pattern, replacement, flags=0, replace_all=False):
     new_content, count = re.subn(pattern, replacement, content, count=count_to_replace, flags=flags)
 
     if count == 0:
-        print(f"[!] Failed to find pattern in: {filepath}")
-        sys.exit(1)
+        #print(f"[!] Failed to find pattern in: {filepath}")
+        #sys.exit(1)
+        # ВМЕСТО sys.exit(1) ПРОСТО ВЫХОДИМ ИЗ ФУНКЦИИ
+        print(f"[!] Warning: Failed to find pattern in {filepath}. Skipping.")
+        return
 
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write(new_content)

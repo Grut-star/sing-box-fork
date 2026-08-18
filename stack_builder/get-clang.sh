@@ -41,6 +41,13 @@ if [ ! -d third_party/llvm-build/Release+Asserts/bin ]; then
   curl -L "$clang_url" | tar xJf - -C third_party/llvm-build/Release+Asserts
 fi
 
+# Скачиваем предкомпилированный Rust и bindgen (решает проблемы с GN)
+echo "Fetching Rust toolchain..."
+if [ -f tools/rust/update_rust.py ]; then
+  $PYTHON tools/rust/update_rust.py
+fi
+# ----------------------------
+
 # sccache
 if [ "$host_os" = win -a ! -f ~/.cargo/bin/sccache.exe ]; then
   sccache_url="https://github.com/mozilla/sccache/releases/download/0.2.12/sccache-0.2.12-x86_64-pc-windows-msvc.tar.gz"
