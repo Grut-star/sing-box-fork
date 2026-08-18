@@ -103,5 +103,13 @@ def main():
         replace_all=True
     )
 
+    # 8. Mac OS 15 SDK (XCode 16) fix for posix_spawn
+    apply_patch(
+        'base/process/launch_mac.cc',
+        r'posix_spawn_file_actions_addchdir\(',
+        r'posix_spawn_file_actions_addchdir_np(',
+        replace_all=True
+    )
+
 if __name__ == '__main__':
     main()

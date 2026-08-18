@@ -88,10 +88,21 @@ if [ "$target_os" = android ]; then
 
   # JDK Mock
   if [ -n "$JAVA_HOME" ]; then
-    echo "Injecting System JDK via symlink..."
+    echo "Injecting System JDK via hard copy..."
     rm -rf third_party/jdk/current
-    mkdir -p third_party/jdk
-    ln -s "$JAVA_HOME" third_party/jdk/current
+    mkdir -p third_party/jdk/current/bin
+
+    # Копируем бинарники с принудительным разрешением симлинков (-L)
+    for tool in java javac javap jar; do
+      TOOL_PATH=$(which $tool || true)
+      if [ -n "$TOOL_PATH" ]; then
+        cp -L "$TOOL_PATH" "third_party/jdk/current/bin/$tool"
+      fi
+    done
+
+    # Линкуем библиотеки
+    ln -sfn "$JAVA_HOME/lib" third_party/jdk/current/lib || true
+    ln -sfn "$JAVA_HOME/include" third_party/jdk/current/include || true
   fi
 
   # SDK Mock

@@ -160,10 +160,12 @@ export DEPOT_TOOLS_WIN_TOOLCHAIN=0
 # Восстановление утилиты форматирования для Windows-окружения
 if [ "$host_os" = "win" ]; then
   if [ ! -f buildtools/win-format/clang-format.exe ]; then
-    echo "Fetching clang-format for Windows..."
+    echo "Copying clang-format for Windows from LLVM toolchain..."
     mkdir -p buildtools/win-format
-    FORMAT_SHA=$(cat buildtools/win-format/clang-format.exe.sha1)
-    curl -L "https://storage.googleapis.com/chromium-clang-format/$FORMAT_SHA" -o buildtools/win-format/clang-format.exe
+    # Берем готовый бинарник, который Chromium уже скачал для компилятора
+    if [ -f third_party/llvm-build/Release+Asserts/bin/clang-format.exe ]; then
+      cp third_party/llvm-build/Release+Asserts/bin/clang-format.exe buildtools/win-format/clang-format.exe
+    fi
   fi
 fi
 
