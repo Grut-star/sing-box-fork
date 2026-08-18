@@ -87,11 +87,11 @@ if [ "$target_os" = android ]; then
   fi
 
   # JDK Mock
-  if [ ! -d third_party/jdk/current ]; then
+  if [ -n "$JAVA_HOME" ]; then
+    echo "Injecting System JDK..."
+    rm -rf third_party/jdk/current
     mkdir -p third_party/jdk
-    if [ -n "$JAVA_HOME" ]; then
-      cp -R "$JAVA_HOME" third_party/jdk/current
-    fi
+    cp -R "$JAVA_HOME" third_party/jdk/current
   fi
 
   # SDK Mock

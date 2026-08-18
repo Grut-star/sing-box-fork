@@ -38,17 +38,18 @@ if [ "$CCACHE" ]; then
 fi
 
 # Основные безопасные флаги
+#  use_udev=false
+#  use_aura=false
+#  use_ozone=false
+#  use_gio=false
+#  use_glib=false
+#   use_cups=false
+
 flags="$flags"'
   is_clang=true
   use_sysroot=false
   fatal_linker_warnings=false
   treat_warnings_as_errors=false
-  use_udev=false
-  use_aura=false
-  use_ozone=false
-  use_gio=false
-  use_glib=false
-  use_cups=false
   is_perfetto_embedder=true
   enable_websockets=false
   use_kerberos=false
@@ -88,7 +89,8 @@ else
   echo "=> Configuring for Desktop (Native mode)"
   flags="$flags"'
     is_cronet_build=false
-    use_platform_icu_alternatives=false'
+    use_platform_icu_alternatives=false
+    use_cups=false'
 fi
 
 if [ "$WITH_SYSROOT" ]; then

@@ -41,6 +41,11 @@ jobs:
       CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
     steps:
       - uses: actions/checkout@v4
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: 21
       - name: Setup workspace
         working-directory: .
         run: |
