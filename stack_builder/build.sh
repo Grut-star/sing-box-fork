@@ -157,6 +157,16 @@ mkdir -p out
 
 export DEPOT_TOOLS_WIN_TOOLCHAIN=0
 
+# Восстановление утилиты форматирования для Windows-окружения
+if [ "$host_os" = "win" ]; then
+  if [ ! -f buildtools/win-format/clang-format.exe ]; then
+    echo "Fetching clang-format for Windows..."
+    mkdir -p buildtools/win-format
+    FORMAT_SHA=$(cat buildtools/win-format/clang-format.exe.sha1)
+    curl -L "https://storage.googleapis.com/chromium-clang-format/$FORMAT_SHA" -o buildtools/win-format/clang-format.exe
+  fi
+fi
+
 echo "Running GN..."
 ./gn/out/gn gen "$out" --args="$flags $EXTRA_FLAGS"
 
@@ -170,3 +180,12 @@ fi
 
 echo "Building libeidolon..."
 ninja -C "$out" eidolon
+
+echo "Stripping binaries..."
+if [ "$host_os" = "linux" ]; then
+  strip "$out"/libeidolon.so || true
+elif [ "$host_os" = "mac" ]; then
+  strip -x "$out"/libeidolon.dylib "$out"/libeidolon.so 2>/dev/null || true
+elif [ "$host_os" = "win" ]; then
+  echo "Stripping on Windows is handled by linking flags."
+fi

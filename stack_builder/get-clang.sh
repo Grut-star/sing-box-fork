@@ -21,25 +21,8 @@ if [ ! -f tools/clang/scripts/update.py ]; then
 fi
 
 # Clang
-case "$host_os" in
-  linux) WITH_CLANG=Linux_x64;;
-  win) WITH_CLANG=Win;;
-  mac) WITH_CLANG=Mac;;
-esac
-if [ "$host_os" = mac -a "$host_cpu" = arm64 ]; then
-  WITH_CLANG=Mac_arm64
-fi
-mkdir -p third_party/llvm-build/Release+Asserts
-cd tools/clang/scripts
-CLANG_REVISION=$($PYTHON -c 'import update; print(update.PACKAGE_VERSION)')
-cd -
-echo $CLANG_REVISION >third_party/llvm-build/Release+Asserts/cr_build_revision
-if [ ! -d third_party/llvm-build/Release+Asserts/bin ]; then
-  mkdir -p third_party/llvm-build/Release+Asserts
-  clang_path="clang-$CLANG_REVISION.tar.xz"
-  clang_url="https://commondatastorage.googleapis.com/chromium-browser-clang/$WITH_CLANG/$clang_path"
-  curl -L "$clang_url" | tar xJf - -C third_party/llvm-build/Release+Asserts
-fi
+echo "Fetching Clang toolchain..."
+$PYTHON tools/clang/scripts/update.py
 
 # Скачиваем предкомпилированный Rust и bindgen (решает проблемы с GN)
 echo "Fetching Rust toolchain..."
@@ -105,10 +88,10 @@ if [ "$target_os" = android ]; then
 
   # JDK Mock
   if [ -n "$JAVA_HOME" ]; then
-    echo "Injecting System JDK..."
+    echo "Injecting System JDK via symlink..."
     rm -rf third_party/jdk/current
-    mkdir -p third_party/jdk/current
-    cp -RL "$JAVA_HOME"/* third_party/jdk/current/ || true
+    mkdir -p third_party/jdk
+    ln -s "$JAVA_HOME" third_party/jdk/current
   fi
 
   # SDK Mock
