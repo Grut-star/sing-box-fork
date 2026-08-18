@@ -24,6 +24,25 @@ fi
 echo "Fetching Clang toolchain..."
 $PYTHON tools/clang/scripts/update.py
 
+# Копируем clang-format для Windows из свежескачанного LLVM
+if [ "$host_os" = "win" ]; then
+  echo "Copying clang-format for Windows..."
+  mkdir -p buildtools/win-format
+  cp third_party/llvm-build/Release+Asserts/bin/clang-format.exe buildtools/win-format/clang-format.exe || true
+fi
+
+# Подменяем недостающие утилиты LLVM системными аналогами на Mac
+if [ "$host_os" = "mac" ]; then
+  echo "Symlinking system tools for macOS..."
+  mkdir -p third_party/llvm-build/Release+Asserts/bin
+  if [ ! -f third_party/llvm-build/Release+Asserts/bin/llvm-otool ]; then
+    ln -sf /usr/bin/otool third_party/llvm-build/Release+Asserts/bin/llvm-otool
+  fi
+  if [ ! -f third_party/llvm-build/Release+Asserts/bin/llvm-install-name-tool ]; then
+    ln -sf /usr/bin/install-name-tool third_party/llvm-build/Release+Asserts/bin/llvm-install-name-tool
+  fi
+fi
+
 # Скачиваем предкомпилированный Rust и bindgen (решает проблемы с GN)
 echo "Fetching Rust toolchain..."
 if [ -f tools/rust/update_rust.py ]; then
@@ -36,16 +55,6 @@ if [ "$host_os" = win -a ! -f ~/.cargo/bin/sccache.exe ]; then
   sccache_url="https://github.com/mozilla/sccache/releases/download/0.2.12/sccache-0.2.12-x86_64-pc-windows-msvc.tar.gz"
   mkdir -p ~/.cargo/bin
   curl -L "$sccache_url" | tar xzf - --strip=1 -C ~/.cargo/bin
-fi
-
-# Windows Clang-Format Fetch
-if [ "$host_os" = win -a ! -f buildtools/win-format/clang-format.exe ]; then
-  echo "Fetching clang-format for Windows..."
-  mkdir -p buildtools/win-format
-  if [ -f buildtools/win-format/clang-format.exe.sha1 ]; then
-    FORMAT_SHA=$(cat buildtools/win-format/clang-format.exe.sha1)
-    curl -L "https://storage.googleapis.com/chromium-clang-format/$FORMAT_SHA" -o buildtools/win-format/clang-format.exe
-  fi
 fi
 
 # GN
@@ -88,21 +97,11 @@ if [ "$target_os" = android ]; then
 
   # JDK Mock
   if [ -n "$JAVA_HOME" ]; then
-    echo "Injecting System JDK via hard copy..."
+    echo "Injecting System JDK..."
     rm -rf third_party/jdk/current
-    mkdir -p third_party/jdk/current/bin
-
-    # Копируем бинарники с принудительным разрешением симлинков (-L)
-    for tool in java javac javap jar; do
-      TOOL_PATH=$(which $tool || true)
-      if [ -n "$TOOL_PATH" ]; then
-        cp -L "$TOOL_PATH" "third_party/jdk/current/bin/$tool"
-      fi
-    done
-
-    # Линкуем библиотеки
-    ln -sfn "$JAVA_HOME/lib" third_party/jdk/current/lib || true
-    ln -sfn "$JAVA_HOME/include" third_party/jdk/current/include || true
+    mkdir -p third_party/jdk
+    # Копируем всю директорию целиком, чтобы не ломать внутренние связи библиотек (libjli.so)
+    cp -R "$JAVA_HOME" third_party/jdk/current
   fi
 
   # SDK Mock

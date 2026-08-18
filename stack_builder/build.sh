@@ -157,18 +157,6 @@ mkdir -p out
 
 export DEPOT_TOOLS_WIN_TOOLCHAIN=0
 
-# Восстановление утилиты форматирования для Windows-окружения
-if [ "$host_os" = "win" ]; then
-  if [ ! -f buildtools/win-format/clang-format.exe ]; then
-    echo "Copying clang-format for Windows from LLVM toolchain..."
-    mkdir -p buildtools/win-format
-    # Берем готовый бинарник, который Chromium уже скачал для компилятора
-    if [ -f third_party/llvm-build/Release+Asserts/bin/clang-format.exe ]; then
-      cp third_party/llvm-build/Release+Asserts/bin/clang-format.exe buildtools/win-format/clang-format.exe
-    fi
-  fi
-fi
-
 echo "Running GN..."
 ./gn/out/gn gen "$out" --args="$flags $EXTRA_FLAGS"
 
