@@ -44,10 +44,11 @@ fi
 #  use_gio=false
 #  use_glib=false
 #   use_cups=false
+#  use_sysroot=false
+#  use_nss_certs=false
 
 flags="$flags"'
   is_clang=true
-  use_sysroot=false
   fatal_linker_warnings=false
   treat_warnings_as_errors=false
   is_perfetto_embedder=true
@@ -58,7 +59,6 @@ flags="$flags"'
   include_transport_security_state_preload_list=false
   enable_device_bound_sessions=false
   enable_disk_cache_sql_backend=false
-  use_nss_certs=false
   enable_backup_ref_ptr_support=false
   enable_dangling_raw_ptr_checks=false
   use_clang_modules=false
@@ -78,6 +78,7 @@ if [ "$IS_ANDROID" = "true" ]; then
     is_cronet_build=true
     use_platform_icu_alternatives=true
     is_desktop_android=true
+    use_nss_certs=false
     default_min_sdk_version=27'
 
   # is_high_end_android ломает сборку 32-битных архитектур в Chromium v152+
@@ -95,7 +96,11 @@ fi
 
 if [ "$WITH_SYSROOT" ]; then
   flags="$flags
+    use_sysroot=true
     target_sysroot=\"//$WITH_SYSROOT\""
+else
+  flags="$flags
+    use_sysroot=false"
 fi
 
 if [ "$host_os" = "mac" ]; then
@@ -119,6 +124,12 @@ echo 'checkout_android_native_support = true' >> build/config/gclient_args.gni
 # Накатываем патчи Eidolon
 echo "Applying Eidolon Patches..."
 python3 patch_chromium_v152.py || true
+
+if [ "$host_os" = mac ]; then
+  echo "Applying macOS SDK modulemap fix..."
+  # Удаляем любые строки, где упоминается DarwinFoundation 1, 2 или 3
+  sed -i '' -E '/DarwinFoundation[1-3]\.modulemap/d' build/modules/BUILD.gn || true
+fi
 
 # СОЗДАЕМ ИЗОЛИРОВАННЫЙ ТАРГЕТ ДЛЯ EIDOLON
 mkdir -p net/eidolon

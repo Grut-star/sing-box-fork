@@ -55,6 +55,16 @@ if [ "$host_os" = win -a ! -f ~/.cargo/bin/sccache.exe ]; then
   curl -L "$sccache_url" | tar xzf - --strip=1 -C ~/.cargo/bin
 fi
 
+# Windows Clang-Format Fetch
+if [ "$host_os" = win -a ! -f buildtools/win-format/clang-format.exe ]; then
+  echo "Fetching clang-format for Windows..."
+  mkdir -p buildtools/win-format
+  if [ -f buildtools/win-format/clang-format.exe.sha1 ]; then
+    FORMAT_SHA=$(cat buildtools/win-format/clang-format.exe.sha1)
+    curl -L "https://storage.googleapis.com/chromium-clang-format/$FORMAT_SHA" -o buildtools/win-format/clang-format.exe
+  fi
+fi
+
 # GN
 case "$host_os" in
   linux) WITH_GN=linux-amd64;;
@@ -97,8 +107,8 @@ if [ "$target_os" = android ]; then
   if [ -n "$JAVA_HOME" ]; then
     echo "Injecting System JDK..."
     rm -rf third_party/jdk/current
-    mkdir -p third_party/jdk
-    cp -aL "$JAVA_HOME"/. third_party/jdk/current/ || true
+    mkdir -p third_party/jdk/current
+    cp -RL "$JAVA_HOME"/* third_party/jdk/current/ || true
   fi
 
   # SDK Mock
