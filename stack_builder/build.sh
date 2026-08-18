@@ -48,6 +48,7 @@ flags="$flags"'
   use_ozone=false
   use_gio=false
   use_glib=false
+  use_cups=false
   is_perfetto_embedder=true
   enable_websockets=false
   use_kerberos=false
@@ -97,6 +98,7 @@ fi
 
 if [ "$host_os" = "mac" ]; then
   flags="$flags"'
+    use_system_xcode=true
     mac_allow_system_xcode_for_official_builds_for_testing=true
     enable_dsyms=false'
 fi
