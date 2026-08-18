@@ -11,7 +11,7 @@ if [ "$OPENWRT_FLAGS" ]; then
   ./get-openwrt.sh
 fi
 
-# Загружаем DEPS и update.py напрямую, если их нет (нужно для Cache-джобов без полного исходника)
+# Загружаем DEPS и update.py напрямую, если их нет
 if [ ! -f DEPS ]; then
   curl -s "https://raw.githubusercontent.com/chromium/chromium/${CHROMIUM_VERSION}/DEPS" -o DEPS
 fi
@@ -24,26 +24,38 @@ fi
 echo "Fetching Clang toolchain..."
 $PYTHON tools/clang/scripts/update.py
 
-# Копируем clang-format для Windows из свежескачанного LLVM
+# Копируем clang-format для Windows (используем системный из runner'а или качаем резервный)
 if [ "$host_os" = "win" ]; then
-  echo "Copying clang-format for Windows..."
+  echo "Setting up clang-format for Windows..."
   mkdir -p buildtools/win-format
-  cp third_party/llvm-build/Release+Asserts/bin/clang-format.exe buildtools/win-format/clang-format.exe || true
+  SYS_FORMAT=$(which clang-format || true)
+  if [ -n "$SYS_FORMAT" ] && [ -f "$SYS_FORMAT" ]; then
+    cp "$SYS_FORMAT" buildtools/win-format/clang-format.exe
+  else
+    # Надежный fallback - загрузка готового стабильного бинарника
+    curl -sL "https://github.com/angular/clang-format/raw/master/bin/win32/clang-format.exe" -o buildtools/win-format/clang-format.exe
+  fi
 fi
 
-# Подменяем недостающие утилиты LLVM системными аналогами на Mac
+# Подменяем недостающие утилиты LLVM bash-обертками на Mac
 if [ "$host_os" = "mac" ]; then
-  echo "Symlinking system tools for macOS..."
+  echo "Creating wrapper scripts for macOS system tools..."
   mkdir -p third_party/llvm-build/Release+Asserts/bin
-  if [ ! -f third_party/llvm-build/Release+Asserts/bin/llvm-otool ]; then
-    ln -sf /usr/bin/otool third_party/llvm-build/Release+Asserts/bin/llvm-otool
-  fi
-  if [ ! -f third_party/llvm-build/Release+Asserts/bin/llvm-install-name-tool ]; then
-    ln -sf /usr/bin/install-name-tool third_party/llvm-build/Release+Asserts/bin/llvm-install-name-tool
-  fi
+
+  cat << 'EOF' > third_party/llvm-build/Release+Asserts/bin/llvm-otool
+#!/bin/sh
+exec /usr/bin/otool "$@"
+EOF
+  chmod +x third_party/llvm-build/Release+Asserts/bin/llvm-otool
+
+  cat << 'EOF' > third_party/llvm-build/Release+Asserts/bin/llvm-install-name-tool
+#!/bin/sh
+exec /usr/bin/install-name-tool "$@"
+EOF
+  chmod +x third_party/llvm-build/Release+Asserts/bin/llvm-install-name-tool
 fi
 
-# Скачиваем предкомпилированный Rust и bindgen (решает проблемы с GN)
+# Скачиваем предкомпилированный Rust
 echo "Fetching Rust toolchain..."
 if [ -f tools/rust/update_rust.py ]; then
   $PYTHON tools/rust/update_rust.py
@@ -74,7 +86,7 @@ if [ ! -f gn/out/gn ]; then
   rm gn.zip
 fi
 
-# Android NDK / SDK / JDK / libunwindstack (Специфика Eidolon / Chromium Android)
+# Android NDK / SDK / JDK
 if [ "$target_os" = android ]; then
   if [ ! -d third_party/android_toolchain/ndk ]; then
     android_ndk_version=r24
@@ -95,20 +107,25 @@ if [ "$target_os" = android ]; then
     rm -rf android-ndk-$android_ndk_version android-ndk-$android_ndk_version-linux.zip
   fi
 
-  # JDK Mock
-  if [ -n "$JAVA_HOME" ]; then
-    echo "Injecting System JDK..."
-    rm -rf third_party/jdk/current
-    mkdir -p third_party/jdk
-    # Копируем всю директорию целиком, чтобы не ломать внутренние связи библиотек (libjli.so)
-    cp -R "$JAVA_HOME" third_party/jdk/current
-  fi
+  # JDK Mock (Умные bash-обертки)
+  echo "Injecting System JDK via wrapper scripts..."
+  rm -rf third_party/jdk/current
+  mkdir -p third_party/jdk/current/bin
+  for tool in java javac javap jar; do
+    TOOL_PATH=$(which $tool || true)
+    if [ -n "$TOOL_PATH" ]; then
+      cat << EOF > "third_party/jdk/current/bin/$tool"
+#!/bin/sh
+exec "$TOOL_PATH" "\$@"
+EOF
+      chmod +x "third_party/jdk/current/bin/$tool"
+    fi
+  done
 
   # SDK Mock
   if [ ! -f third_party/android_sdk/public/platforms/android-37.0/android.jar ]; then
     mkdir -p third_party/android_sdk/public/platforms/android-37.0
     if [ -n "$ANDROID_HOME" ]; then
-      # Ищем самый свежий android.jar в системе
       JAR_PATH=$(find "$ANDROID_HOME/platforms" -name "android.jar" | sort -V | tail -n 1)
       if [ -n "$JAR_PATH" ]; then
         cp "$JAR_PATH" third_party/android_sdk/public/platforms/android-37.0/android.jar
@@ -121,7 +138,7 @@ if [ "$target_os" = android ]; then
   fi
 fi
 
-# libunwindstack fetch (Если его нет в исходниках)
+# libunwindstack fetch
 if [ ! -d third_party/libunwindstack/.git ]; then
   UNWIND_HASH=$(grep -A 3 "'src/third_party/libunwindstack':" DEPS | grep 'url' | grep -oE '[a-f0-9]{40}' || echo "main")
   mkdir -p third_party/libunwindstack
