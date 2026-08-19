@@ -103,18 +103,24 @@ EOF
     fi
   done
 
-  # Возвращаем рабочий поиск android.jar (с настоящими классами внутри)
+  # SDK Mock (Надежное обеспечение настоящего android.jar)
   if [ ! -f third_party/android_sdk/public/platforms/android-37.0/android.jar ]; then
+    echo "Setting up Android SDK mock..."
     mkdir -p third_party/android_sdk/public/platforms/android-37.0
-    if [ -n "$ANDROID_HOME" ]; then
-      JAR_PATH=$(find "$ANDROID_HOME/platforms" -name "android.jar" | sort -V | tail -n 1)
-      if [ -n "$JAR_PATH" ]; then
-        cp "$JAR_PATH" third_party/android_sdk/public/platforms/android-37.0/android.jar
-      else
-        echo "Error: android.jar not found in ANDROID_HOME!"
+
+    # 1. Пытаемся взять из системы (Github Actions)
+    if [ -n "$ANDROID_HOME" ] && [ -d "$ANDROID_HOME/platforms" ]; then
+      LATEST_API=$(ls -1 "$ANDROID_HOME/platforms" 2>/dev/null | grep -E '^android-[0-9]+$' | sort -V | tail -n 1)
+      if [ -n "$LATEST_API" ]; then
+        echo "Copying $LATEST_API android.jar from system..."
+        cp "$ANDROID_HOME/platforms/$LATEST_API/android.jar" third_party/android_sdk/public/platforms/android-37.0/android.jar || true
       fi
-    else
-      echo "Error: ANDROID_HOME not set!"
+    fi
+
+    # 2. Если не вышло (или собираем вне раннера) - качаем реальный API 28 из зеркала
+    if [ ! -f third_party/android_sdk/public/platforms/android-37.0/android.jar ]; then
+      echo "System android.jar not found! Downloading fallback..."
+      curl -L -o third_party/android_sdk/public/platforms/android-37.0/android.jar "https://github.com/Sable/android-platforms/raw/master/android-28/android.jar"
     fi
   fi
 fi
