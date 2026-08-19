@@ -172,10 +172,20 @@ echo "Building libeidolon..."
 ninja -C "$out" eidolon
 
 echo "Stripping binaries..."
-if [ "$host_os" = "linux" ]; then
-  strip "$out"/libeidolon.so || true
-elif [ "$host_os" = "mac" ]; then
-  strip -x "$out"/libeidolon.dylib "$out"/libeidolon.so 2>/dev/null || true
-elif [ "$host_os" = "win" ]; then
-  echo "Stripping on Windows is handled by linking flags."
+STRIP_TOOL="third_party/llvm-build/Release+Asserts/bin/llvm-strip"
+if [ "$host_os" = "win" ]; then
+  STRIP_TOOL="${STRIP_TOOL}.exe"
+fi
+
+if [ -x "$STRIP_TOOL" ]; then
+  echo "Using llvm-strip..."
+  if [ "$host_os" = "win" ]; then
+    "$STRIP_TOOL" --strip-unneeded "$out"/*eidolon*.dll 2>/dev/null || true
+  elif [ "$host_os" = "mac" ]; then
+    "$STRIP_TOOL" -x "$out"/libeidolon.dylib "$out"/libeidolon.so 2>/dev/null || true
+  else
+    "$STRIP_TOOL" --strip-unneeded "$out"/libeidolon.so 2>/dev/null || true
+  fi
+else
+  echo "llvm-strip not found, skipping."
 fi

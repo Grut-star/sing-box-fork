@@ -24,35 +24,26 @@ fi
 echo "Fetching Clang toolchain..."
 $PYTHON tools/clang/scripts/update.py
 
-# Копируем clang-format для Windows (используем системный из runner'а или качаем резервный)
+# Копируем clang-format для Windows из свежескачанного LLVM
 if [ "$host_os" = "win" ]; then
-  echo "Setting up clang-format for Windows..."
+  echo "Copying clang-format for Windows..."
   mkdir -p buildtools/win-format
-  SYS_FORMAT=$(which clang-format || true)
-  if [ -n "$SYS_FORMAT" ] && [ -f "$SYS_FORMAT" ]; then
-    cp "$SYS_FORMAT" buildtools/win-format/clang-format.exe
-  else
-    # Надежный fallback - загрузка готового стабильного бинарника
-    curl -sL "https://github.com/angular/clang-format/raw/master/bin/win32/clang-format.exe" -o buildtools/win-format/clang-format.exe
-  fi
+  cp third_party/llvm-build/Release+Asserts/bin/clang-format.exe buildtools/win-format/clang-format.exe || true
 fi
 
-# Подменяем недостающие утилиты LLVM bash-обертками на Mac
+# Подменяем ВСЕ недостающие утилиты LLVM системными аналогами на Mac
 if [ "$host_os" = "mac" ]; then
-  echo "Creating wrapper scripts for macOS system tools..."
+  echo "Symlinking system tools for macOS..."
   mkdir -p third_party/llvm-build/Release+Asserts/bin
-
-  cat << 'EOF' > third_party/llvm-build/Release+Asserts/bin/llvm-otool
+  for tool in otool install-name-tool nm strip; do
+    if [ ! -f "third_party/llvm-build/Release+Asserts/bin/llvm-$tool" ]; then
+      cat << EOF > "third_party/llvm-build/Release+Asserts/bin/llvm-$tool"
 #!/bin/sh
-exec /usr/bin/otool "$@"
+exec /usr/bin/$tool "\$@"
 EOF
-  chmod +x third_party/llvm-build/Release+Asserts/bin/llvm-otool
-
-  cat << 'EOF' > third_party/llvm-build/Release+Asserts/bin/llvm-install-name-tool
-#!/bin/sh
-exec /usr/bin/install-name-tool "$@"
-EOF
-  chmod +x third_party/llvm-build/Release+Asserts/bin/llvm-install-name-tool
+      chmod +x "third_party/llvm-build/Release+Asserts/bin/llvm-$tool"
+    fi
+  done
 fi
 
 # Скачиваем предкомпилированный Rust
@@ -107,7 +98,7 @@ if [ "$target_os" = android ]; then
     rm -rf android-ndk-$android_ndk_version android-ndk-$android_ndk_version-linux.zip
   fi
 
-  # JDK Mock (Умные bash-обертки)
+  # JDK Mock (Умные bash-обертки - РЕШАЕТ ПРОБЛЕМУ javap И путей)
   echo "Injecting System JDK via wrapper scripts..."
   rm -rf third_party/jdk/current
   mkdir -p third_party/jdk/current/bin
@@ -122,18 +113,14 @@ EOF
     fi
   done
 
-  # SDK Mock
+  # SDK Mock (Создание ВАЛИДНОГО пустого zip архива - РЕШАЕТ ПРОБЛЕМУ zip file is empty)
   if [ ! -f third_party/android_sdk/public/platforms/android-37.0/android.jar ]; then
     mkdir -p third_party/android_sdk/public/platforms/android-37.0
-    if [ -n "$ANDROID_HOME" ]; then
-      JAR_PATH=$(find "$ANDROID_HOME/platforms" -name "android.jar" | sort -V | tail -n 1)
-      if [ -n "$JAR_PATH" ]; then
-        cp "$JAR_PATH" third_party/android_sdk/public/platforms/android-37.0/android.jar
-      else
-        touch third_party/android_sdk/public/platforms/android-37.0/android.jar
-      fi
+    if [ -n "$ANDROID_HOME" ] && JAR_PATH=$(find "$ANDROID_HOME/platforms" -name "android.jar" | sort -V | tail -n 1) && [ -n "$JAR_PATH" ]; then
+      cp "$JAR_PATH" third_party/android_sdk/public/platforms/android-37.0/android.jar
     else
-      touch third_party/android_sdk/public/platforms/android-37.0/android.jar
+      echo "Creating an empty valid ZIP for android.jar..."
+      $PYTHON -c "import zipfile; zipfile.ZipFile('third_party/android_sdk/public/platforms/android-37.0/android.jar', 'w').close()"
     fi
   fi
 fi
