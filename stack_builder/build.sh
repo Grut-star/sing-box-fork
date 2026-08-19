@@ -37,17 +37,17 @@ if [ "$CCACHE" ]; then
     cc_wrapper=\"$CCACHE\""
 fi
 
-# Основные безопасные флаги
-#  use_udev=false
-#  use_aura=false
-#  use_ozone=false
-#  use_gio=false
-#  use_glib=false
-#   use_cups=false
-#  use_sysroot=false
-#  use_nss_certs=false
-
+# Раскомментированные безопасные флаги (отсекают десктопный UI из графа GN)
 flags="$flags"'
+  use_udev=false
+  use_aura=false
+  use_ozone=false
+  use_gio=false
+  use_glib=false
+  use_cups=false
+  use_dbus=false
+  use_alsa=false
+  use_pulseaudio=false
   is_clang=true
   fatal_linker_warnings=false
   treat_warnings_as_errors=false
@@ -81,7 +81,6 @@ if [ "$IS_ANDROID" = "true" ]; then
     use_nss_certs=false
     default_min_sdk_version=27'
 
-  # is_high_end_android ломает сборку 32-битных архитектур в Chromium v152+
   if echo "$EXTRA_FLAGS" | grep -q 'target_cpu="x64"\|target_cpu="arm64"'; then
     flags="$flags"'
     is_high_end_android=true'
@@ -90,8 +89,7 @@ else
   echo "=> Configuring for Desktop (Native mode)"
   flags="$flags"'
     is_cronet_build=false
-    use_platform_icu_alternatives=false
-    use_cups=false'
+    use_platform_icu_alternatives=false'
 fi
 
 if [ "$WITH_SYSROOT" ]; then
@@ -115,7 +113,7 @@ if [ "$target_os" = "linux" -a "$target_cpu" = "x64" ]; then
     use_cfi_icall=false'
 fi
 
-# ФЕЙКУЕМ gclient_args (Нужно для GN-разрешения JNI зависимостей на Android)
+# ФЕЙКУЕМ gclient_args
 mkdir -p build/config
 echo "" >> build/config/gclient_args.gni
 echo 'checkout_android = true' >> build/config/gclient_args.gni
@@ -127,8 +125,13 @@ python3 patch_chromium_v152.py || true
 
 if [ "$host_os" = mac ]; then
   echo "Applying macOS SDK modulemap fix..."
-  # Удаляем любые строки, где упоминается DarwinFoundation 1, 2 или 3
   sed -i '' -E '/DarwinFoundation[1-3]\.modulemap/d' build/modules/BUILD.gn || true
+fi
+
+# GN Fix: Заглушка для отсутствующего таргета histograms_xml в свежих версиях Chromium
+mkdir -p tools/metrics
+if [ -f tools/metrics/BUILD.gn ]; then
+  echo 'group("histograms_xml") {}' >> tools/metrics/BUILD.gn
 fi
 
 # СОЗДАЕМ ИЗОЛИРОВАННЫЙ ТАРГЕТ ДЛЯ EIDOLON
@@ -156,6 +159,17 @@ rm -rf "./$out"
 mkdir -p out
 
 export DEPOT_TOOLS_WIN_TOOLCHAIN=0
+
+# Восстановление утилиты форматирования для Windows-окружения
+if [ "$host_os" = "win" ]; then
+  if [ ! -f buildtools/win-format/clang-format.exe ]; then
+    echo "Fetching clang-format for Windows..."
+    mkdir -p buildtools/win-format
+    if [ -f third_party/llvm-build/Release+Asserts/bin/clang-format.exe ]; then
+      cp third_party/llvm-build/Release+Asserts/bin/clang-format.exe buildtools/win-format/clang-format.exe || true
+    fi
+  fi
+fi
 
 echo "Running GN..."
 ./gn/out/gn gen "$out" --args="$flags $EXTRA_FLAGS"
