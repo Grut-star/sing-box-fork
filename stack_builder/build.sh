@@ -15,7 +15,6 @@ flags="
 
 . ./get-sysroot.sh
 
-# ccache
 case "$host_os" in
   linux|mac)
     if which ccache >/dev/null 2>&1; then
@@ -37,17 +36,8 @@ if [ "$CCACHE" ]; then
     cc_wrapper=\"$CCACHE\""
 fi
 
-# Раскомментированные безопасные флаги (отсекают десктопный UI из графа GN)
+# Возвращены дефолтные флаги (без use_aura=false и use_gio=false, чтобы не ломать десктоп)
 flags="$flags"'
-  use_udev=false
-  use_aura=false
-  use_ozone=false
-  use_gio=false
-  use_glib=false
-  use_cups=false
-  use_dbus=false
-  use_alsa=false
-  use_pulseaudio=false
   is_clang=true
   fatal_linker_warnings=false
   treat_warnings_as_errors=false
@@ -65,7 +55,6 @@ flags="$flags"'
   is_component_build=false
 '
 
-# ПРАВИЛЬНОЕ ОПРЕДЕЛЕНИЕ ANDROID И ИЗОЛЯЦИЯ ФЛАГОВ CRONET/ICU
 IS_ANDROID=false
 case "$EXTRA_FLAGS" in
   *target_os=\"android\"*) IS_ANDROID=true ;;
@@ -113,13 +102,11 @@ if [ "$target_os" = "linux" -a "$target_cpu" = "x64" ]; then
     use_cfi_icall=false'
 fi
 
-# ФЕЙКУЕМ gclient_args
 mkdir -p build/config
 echo "" >> build/config/gclient_args.gni
 echo 'checkout_android = true' >> build/config/gclient_args.gni
 echo 'checkout_android_native_support = true' >> build/config/gclient_args.gni
 
-# Накатываем патчи Eidolon
 echo "Applying Eidolon Patches..."
 python3 patch_chromium_v152.py || true
 
@@ -128,13 +115,14 @@ if [ "$host_os" = mac ]; then
   sed -i '' -E '/DarwinFoundation[1-3]\.modulemap/d' build/modules/BUILD.gn || true
 fi
 
-# GN Fix: Заглушка для отсутствующего таргета histograms_xml в свежих версиях Chromium
+# GN Fix: Заглушка для отсутствующего таргета histograms_xml (Лечит Windows и Mac)
 mkdir -p tools/metrics
-if [ -f tools/metrics/BUILD.gn ]; then
+if [ ! -f tools/metrics/BUILD.gn ]; then
+  echo 'group("histograms_xml") {}' > tools/metrics/BUILD.gn
+else
   echo 'group("histograms_xml") {}' >> tools/metrics/BUILD.gn
 fi
 
-# СОЗДАЕМ ИЗОЛИРОВАННЫЙ ТАРГЕТ ДЛЯ EIDOLON
 mkdir -p net/eidolon
 cp eidolon_bridge.cc net/eidolon/
 cp eidolon_bridge.h net/eidolon/
@@ -152,7 +140,6 @@ shared_library("libeidolon") {
 }
 EOF
 
-# ПРИВЯЗЫВАЕМ ТАРГЕТ К КОРНЮ, ЧТОБЫ GN ЕГО УВИДЕЛ
 echo 'group("eidolon") { deps = [ "//net/eidolon:libeidolon" ] }' >> BUILD.gn
 
 rm -rf "./$out"
@@ -160,7 +147,6 @@ mkdir -p out
 
 export DEPOT_TOOLS_WIN_TOOLCHAIN=0
 
-# Восстановление утилиты форматирования для Windows-окружения
 if [ "$host_os" = "win" ]; then
   if [ ! -f buildtools/win-format/clang-format.exe ]; then
     echo "Fetching clang-format for Windows..."

@@ -11,7 +11,6 @@ if [ "$OPENWRT_FLAGS" ]; then
   ./get-openwrt.sh
 fi
 
-# Загружаем DEPS и update.py напрямую, если их нет
 if [ ! -f DEPS ]; then
   curl -s "https://raw.githubusercontent.com/chromium/chromium/${CHROMIUM_VERSION}/DEPS" -o DEPS
 fi
@@ -20,18 +19,15 @@ if [ ! -f tools/clang/scripts/update.py ]; then
   curl -s "https://raw.githubusercontent.com/chromium/chromium/${CHROMIUM_VERSION}/tools/clang/scripts/update.py" -o tools/clang/scripts/update.py
 fi
 
-# Clang
 echo "Fetching Clang toolchain..."
 $PYTHON tools/clang/scripts/update.py
 
-# Копируем clang-format для Windows из свежескачанного LLVM
 if [ "$host_os" = "win" ]; then
   echo "Copying clang-format for Windows..."
   mkdir -p buildtools/win-format
   cp third_party/llvm-build/Release+Asserts/bin/clang-format.exe buildtools/win-format/clang-format.exe || true
 fi
 
-# Подменяем ВСЕ недостающие утилиты LLVM системными аналогами на Mac
 if [ "$host_os" = "mac" ]; then
   echo "Symlinking system tools for macOS..."
   mkdir -p third_party/llvm-build/Release+Asserts/bin
@@ -46,21 +42,17 @@ EOF
   done
 fi
 
-# Скачиваем предкомпилированный Rust
 echo "Fetching Rust toolchain..."
 if [ -f tools/rust/update_rust.py ]; then
   $PYTHON tools/rust/update_rust.py
 fi
-# ----------------------------
 
-# sccache
 if [ "$host_os" = win -a ! -f ~/.cargo/bin/sccache.exe ]; then
   sccache_url="https://github.com/mozilla/sccache/releases/download/0.2.12/sccache-0.2.12-x86_64-pc-windows-msvc.tar.gz"
   mkdir -p ~/.cargo/bin
   curl -L "$sccache_url" | tar xzf - --strip=1 -C ~/.cargo/bin
 fi
 
-# GN
 case "$host_os" in
   linux) WITH_GN=linux-amd64;;
   win) WITH_GN=windows-amd64;;
@@ -77,7 +69,6 @@ if [ ! -f gn/out/gn ]; then
   rm gn.zip
 fi
 
-# Android NDK / SDK / JDK
 if [ "$target_os" = android ]; then
   if [ ! -d third_party/android_toolchain/ndk ]; then
     android_ndk_version=r24
@@ -98,7 +89,6 @@ if [ "$target_os" = android ]; then
     rm -rf android-ndk-$android_ndk_version android-ndk-$android_ndk_version-linux.zip
   fi
 
-  # JDK Mock (Умные bash-обертки - РЕШАЕТ ПРОБЛЕМУ javap И путей)
   echo "Injecting System JDK via wrapper scripts..."
   rm -rf third_party/jdk/current
   mkdir -p third_party/jdk/current/bin
@@ -113,19 +103,22 @@ EOF
     fi
   done
 
-  # SDK Mock (Создание ВАЛИДНОГО пустого zip архива - РЕШАЕТ ПРОБЛЕМУ zip file is empty)
+  # Возвращаем рабочий поиск android.jar (с настоящими классами внутри)
   if [ ! -f third_party/android_sdk/public/platforms/android-37.0/android.jar ]; then
     mkdir -p third_party/android_sdk/public/platforms/android-37.0
-    if [ -n "$ANDROID_HOME" ] && JAR_PATH=$(find "$ANDROID_HOME/platforms" -name "android.jar" | sort -V | tail -n 1) && [ -n "$JAR_PATH" ]; then
-      cp "$JAR_PATH" third_party/android_sdk/public/platforms/android-37.0/android.jar
+    if [ -n "$ANDROID_HOME" ]; then
+      JAR_PATH=$(find "$ANDROID_HOME/platforms" -name "android.jar" | sort -V | tail -n 1)
+      if [ -n "$JAR_PATH" ]; then
+        cp "$JAR_PATH" third_party/android_sdk/public/platforms/android-37.0/android.jar
+      else
+        echo "Error: android.jar not found in ANDROID_HOME!"
+      fi
     else
-      echo "Creating an empty valid ZIP for android.jar..."
-      $PYTHON -c "import zipfile; zipfile.ZipFile('third_party/android_sdk/public/platforms/android-37.0/android.jar', 'w').close()"
+      echo "Error: ANDROID_HOME not set!"
     fi
   fi
 fi
 
-# libunwindstack fetch
 if [ ! -d third_party/libunwindstack/.git ]; then
   UNWIND_HASH=$(grep -A 3 "'src/third_party/libunwindstack':" DEPS | grep 'url' | grep -oE '[a-f0-9]{40}' || echo "main")
   mkdir -p third_party/libunwindstack
