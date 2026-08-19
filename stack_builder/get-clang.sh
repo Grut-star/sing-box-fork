@@ -83,8 +83,18 @@ if [ "$target_os" = android ]; then
     find toolchains -type f -regextype egrep \! -regex \
       '.*(lib(atomic|gcc|gcc_real|compiler_rt-extras|android_support|unwind).a|crt.*o|lib(android|c|dl|log|m).so|usr/local.*|usr/include.*)' -delete
     sed -i 's/AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1UL /AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1ULL /' toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/android/hardware_buffer.h
-    mkdir -p toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/27/
-    find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -name "*.a" | grep aarch64 | xargs -I {} cp {} toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/27/
+
+    # Универсальное копирование библиотек компилятора для ВСЕХ архитектур Android
+    for triple in aarch64-linux-android arm-linux-androideabi x86_64-linux-android i686-linux-android; do
+      mkdir -p "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27/"
+      case "$triple" in
+        aarch64*) clang_arch="aarch64" ;;
+        arm*) clang_arch="arm-android" ;;
+        x86_64*) clang_arch="x86_64" ;;
+        i686*) clang_arch="i686-android" ;;
+      esac
+      find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -name "*.a" | grep "$clang_arch" | xargs -I {} cp {} "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27/" || true
+    done
     cd -
     rm -rf android-ndk-$android_ndk_version android-ndk-$android_ndk_version-linux.zip
   fi
