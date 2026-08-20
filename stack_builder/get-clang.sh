@@ -80,47 +80,22 @@ if [ "$target_os" = android ]; then
     cp -r --parents toolchains/llvm/prebuilt ../third_party/android_toolchain/ndk
     cd ..
     cd third_party/android_toolchain/ndk
-
-    # Удаляем лишние библиотеки, оставляя только нужные
     find toolchains -type f -regextype egrep \! -regex \
       '.*(lib(atomic|gcc|gcc_real|compiler_rt-extras|android_support|unwind).a|crt.*o|lib(android|c|dl|log|m).so|usr/local.*|usr/include.*)' -delete
-
     sed -i 's/AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1UL /AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1ULL /' toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/android/hardware_buffer.h
 
-    # --- БРОНЕБОЙНЫЙ ФИКС ДЛЯ LIBATOMIC ---
-    # Мы находим все libatomic.a, libgcc.a и libunwind.a в скачанном NDK
-    # и рассовываем их во все возможные папки, куда линкер может заглянуть
-    echo "Distributing missing libraries (-latomic) to sysroot..."
-    for arch in aarch64 arm i686 x86_64; do
-      # 1. Находим исходные файлы в NDK для конкретной архитектуры
-      ATOMIC_SRC=$(find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -name "libatomic.a" | grep "$arch" | head -n 1 || true)
-      UNWIND_SRC=$(find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -name "libunwind.a" | grep "$arch" | head -n 1 || true)
-
-      # Если исходник не найден в clang/, ищем везде
-      if [ -z "$ATOMIC_SRC" ]; then ATOMIC_SRC=$(find toolchains/llvm/prebuilt/linux-x86_64 -name "libatomic.a" | grep "$arch" | head -n 1 || true); fi
-      if [ -z "$UNWIND_SRC" ]; then UNWIND_SRC=$(find toolchains/llvm/prebuilt/linux-x86_64 -name "libunwind.a" | grep "$arch" | head -n 1 || true); fi
-
-      # 2. Определяем целевые пути sysroot (triple)
-      case "$arch" in
-        aarch64) triple="aarch64-linux-android" ;;
-        arm)     triple="arm-linux-androideabi" ;;
-        i686)    triple="i686-linux-android" ;;
-        x86_64)  triple="x86_64-linux-android" ;;
-      esac
-
-      # 3. Копируем во все потенциальные пути линкера
-      for dest_dir in \
-        "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27" \
-        "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple" \
-        "toolchains/llvm/prebuilt/linux-x86_64/lib/gcc/$triple/4.9.x"
-      do
-        mkdir -p "$dest_dir"
-        if [ -n "$ATOMIC_SRC" ]; then cp "$ATOMIC_SRC" "$dest_dir/libatomic.a" 2>/dev/null || true; fi
-        if [ -n "$UNWIND_SRC" ]; then cp "$UNWIND_SRC" "$dest_dir/libunwind.a" 2>/dev/null || true; fi
-        # Библиотека libgcc.a часто является просто ссылкой на libunwind в современном NDK
-        if [ -n "$UNWIND_SRC" ]; then cp "$UNWIND_SRC" "$dest_dir/libgcc.a" 2>/dev/null || true; fi
-      done
+    # --- ПРОСТОЙ И ЖЕЛЕЗОБЕТОННЫЙ ПЕРЕНОС БИБЛИОТЕК ---
+    # 1. Системные либы (включая libatomic.a) из корня переносим в папку 27
+    for triple in aarch64-linux-android arm-linux-androideabi x86_64-linux-android i686-linux-android; do
+      mkdir -p "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27"
+      cp "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/"*.a "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27/" 2>/dev/null || true
     done
+
+    # 2. Рантаймы Clang (раскладываем строго по архитектурам)
+    find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -name "*.a" | grep aarch64 | xargs -I {} cp {} toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/27/ 2>/dev/null || true
+    find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -name "*.a" | grep -v aarch64 | grep arm | xargs -I {} cp {} toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/arm-linux-androideabi/27/ 2>/dev/null || true
+    find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -name "*.a" | grep x86_64 | xargs -I {} cp {} toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/x86_64-linux-android/27/ 2>/dev/null || true
+    find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -name "*.a" | grep i686 | xargs -I {} cp {} toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/i686-linux-android/27/ 2>/dev/null || true
     # --- КОНЕЦ ФИКСА ---
 
     cd -
