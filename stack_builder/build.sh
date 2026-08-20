@@ -109,6 +109,11 @@ echo 'checkout_android_native_support = true' >> build/config/gclient_args.gni
 echo "Applying Eidolon Patches..."
 python3 patch_chromium_v152.py || true
 
+# --- НАСТОЯЩИЙ ФИКС ДЛЯ -latomic ---
+# Заменяем несуществующий "atomic" на стандартный "c" (libc) в конфигах Chromium
+echo "Patching out obsolete -latomic dependency..."
+find build/config -type f -name "BUILD.gn" -exec sed -i 's/"atomic"/"c"/g' {} + || true
+
 if [ "$host_os" = mac ]; then
   echo "Applying macOS SDK modulemap fix..."
   sed -i '' -E '/DarwinFoundation[1-3]\.modulemap/d' build/modules/BUILD.gn || true
@@ -145,7 +150,6 @@ mkdir -p out
 
 export DEPOT_TOOLS_WIN_TOOLCHAIN=0
 
-# ФИКС: Возвращена загрузка clang-format для Windows, так как в LLVM архиве его нет
 if [ "$host_os" = "win" ]; then
   if [ ! -f buildtools/win-format/clang-format.exe ]; then
     echo "Fetching clang-format for Windows..."
