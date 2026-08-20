@@ -176,68 +176,68 @@ jobs:
           key: toolchains-mac-arm64-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
       - run: EXTRA_FLAGS='target_cpu="arm64"' ./get-clang.sh
 
-  linux:
-    needs: [prepare, cache-toolchains-posix]
-    if: needs.prepare.outputs.should_build == 'true'
-    runs-on: ubuntu-22.04
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [x64, arm64, arm]
-    env:
-      CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
-      EXTRA_FLAGS: 'target_cpu="${{ matrix.arch }}"'
-      BUNDLE: eidolon-${{ github.event.release.tag_name || 'dev' }}-${{ github.job }}-${{ matrix.arch }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup workspace
-        working-directory: .
-        run: |
-          mkdir -p src
-          cp -R stack_builder/* src/
-          chmod +x src/*.sh
-          echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
-      - name: Free Disk Space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-      - name: Cache toolchains
-        uses: actions/cache@v4
-        with:
-          path: |
-            src/third_party/llvm-build/Release+Asserts/
-            src/gn/
-            src/qemu-user*.deb
-          key: toolchains-posix-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
-      - name: Download Chromium
-        run: curl -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-${{ env.CHROMIUM_VERSION }}.tar.xz" | tar -xJ --strip-components=1
-      - name: Cache sysroot
-        uses: actions/cache@v4
-        with:
-          path: |
-            src/out/sysroot-build/bullseye/bullseye_*
-            src/out/sysroot-build/trixie/trixie_*
-            src/out/sysroot-build/sid/sid_*
-          key: sysroot-linux-${{ matrix.arch }}-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
-      - name: Install APT packages
-        run: |
-          sudo apt update
-          sudo apt install ninja-build pkg-config ccache bubblewrap
-      - run: ./get-clang.sh
-      - run: ccache -z || true
-      - run: ./build.sh
-      - name: Pack artifacts
-        run: |
-          mkdir ${{ env.BUNDLE }}
-          cp out/Release/*eidolon* eidolon_bridge.h ${{ env.BUNDLE }}/
-          tar cJf ${{ env.BUNDLE }}.tar.xz ${{ env.BUNDLE }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.BUNDLE }}.tar.xz
-          path: src/${{ env.BUNDLE }}.tar.xz
+#  linux:
+#    needs: [prepare, cache-toolchains-posix]
+#    if: needs.prepare.outputs.should_build == 'true'
+#    runs-on: ubuntu-22.04
+#    strategy:
+#      fail-fast: false
+#      matrix:
+#        arch: [x64, arm64, arm]
+#    env:
+#      CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
+#      EXTRA_FLAGS: 'target_cpu="${{ matrix.arch }}"'
+#      BUNDLE: eidolon-${{ github.event.release.tag_name || 'dev' }}-${{ github.job }}-${{ matrix.arch }}
+#    steps:
+#      - uses: actions/checkout@v4
+#      - name: Setup workspace
+#        working-directory: .
+#        run: |
+#          mkdir -p src
+#          cp -R stack_builder/* src/
+#          chmod +x src/*.sh
+#          echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
+#      - name: Free Disk Space
+#        uses: jlumbroso/free-disk-space@main
+#        with:
+#          tool-cache: true
+#          android: true
+#          dotnet: true
+#          haskell: true
+#      - name: Cache toolchains
+#        uses: actions/cache@v4
+#        with:
+#          path: |
+#            src/third_party/llvm-build/Release+Asserts/
+#            src/gn/
+#            src/qemu-user*.deb
+#          key: toolchains-posix-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+#      - name: Download Chromium
+#        run: curl -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-${{ env.CHROMIUM_VERSION }}.tar.xz" | tar -xJ --strip-components=1
+#      - name: Cache sysroot
+#        uses: actions/cache@v4
+#        with:
+#          path: |
+#            src/out/sysroot-build/bullseye/bullseye_*
+#            src/out/sysroot-build/trixie/trixie_*
+#            src/out/sysroot-build/sid/sid_*
+#          key: sysroot-linux-${{ matrix.arch }}-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+#      - name: Install APT packages
+#        run: |
+#          sudo apt update
+#          sudo apt install ninja-build pkg-config ccache bubblewrap
+#      - run: ./get-clang.sh
+#      - run: ccache -z || true
+#      - run: ./build.sh
+#      - name: Pack artifacts
+#        run: |
+#          mkdir ${{ env.BUNDLE }}
+#          cp out/Release/*eidolon* eidolon_bridge.h ${{ env.BUNDLE }}/
+#          tar cJf ${{ env.BUNDLE }}.tar.xz ${{ env.BUNDLE }}
+#      - uses: actions/upload-artifact@v4
+#        with:
+#          name: ${{ env.BUNDLE }}.tar.xz
+#          path: src/${{ env.BUNDLE }}.tar.xz
 
   android:
     needs: [prepare, cache-toolchains-posix]
@@ -308,141 +308,143 @@ jobs:
           name: ${{ env.BUNDLE }}.tar.xz
           path: src/${{ env.BUNDLE }}.tar.xz
 
-  win:
-    needs: [prepare, cache-toolchains-win]
-    if: needs.prepare.outputs.should_build == 'true'
-    runs-on: windows-2022
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [x64, x86, arm64]
-    env:
-      CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
-      EXTRA_FLAGS: 'target_cpu="${{ matrix.arch }}"'
-      BUNDLE: eidolon-${{ github.event.release.tag_name || 'dev' }}-${{ github.job }}-${{ matrix.arch }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup workspace
-        working-directory: .
-        run: |
-          mkdir -p src
-          cp -R stack_builder/* src/
-          chmod +x src/*.sh
-          echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
-      - name: Cache toolchains
-        uses: actions/cache@v4
-        with:
-          path: |
-            src/third_party/llvm-build/Release+Asserts/
-            src/gn/
-            ~/.cargo/bin/
-            ~/bin/ninja.exe
-          key: toolchains-win-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
-      - name: Download Chromium
-        run: |
-          curl.exe -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-${{ env.CHROMIUM_VERSION }}.tar.xz" -o chromium.tar.xz
-          tar -xJ -f chromium.tar.xz --strip-components=1 || true
-          rm chromium.tar.xz
-      - run: ./get-clang.sh
-      - run: ~/.cargo/bin/sccache -z || true
-      - run: ./build.sh
-      - name: Pack artifacts
-        run: |
-          mkdir ${{ env.BUNDLE }}
-          cp out/Release/*eidolon* eidolon_bridge.h ${{ env.BUNDLE }}/
-          7z a ${{ env.BUNDLE }}.zip ${{ env.BUNDLE }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.BUNDLE }}.zip
-          path: src/${{ env.BUNDLE }}.zip
+#  win:
+#    needs: [prepare, cache-toolchains-win]
+#    if: needs.prepare.outputs.should_build == 'true'
+#    runs-on: windows-2022
+#    strategy:
+#      fail-fast: false
+#      matrix:
+#        arch: [x64, x86, arm64]
+#    env:
+#      CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
+#      EXTRA_FLAGS: 'target_cpu="${{ matrix.arch }}"'
+#      BUNDLE: eidolon-${{ github.event.release.tag_name || 'dev' }}-${{ github.job }}-${{ matrix.arch }}
+#    steps:
+#      - uses: actions/checkout@v4
+#      - name: Setup workspace
+#        working-directory: .
+#        run: |
+#          mkdir -p src
+#          cp -R stack_builder/* src/
+#          chmod +x src/*.sh
+#          echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
+#      - name: Cache toolchains
+#        uses: actions/cache@v4
+#        with:
+#          path: |
+#            src/third_party/llvm-build/Release+Asserts/
+#            src/gn/
+#            ~/.cargo/bin/
+#            ~/bin/ninja.exe
+#          key: toolchains-win-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+#      - name: Download Chromium
+#        run: |
+#          curl.exe -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-${{ env.CHROMIUM_VERSION }}.tar.xz" -o chromium.tar.xz
+#          tar -xJ -f chromium.tar.xz --strip-components=1 || true
+#          rm chromium.tar.xz
+#      - run: ./get-clang.sh
+#      - run: ~/.cargo/bin/sccache -z || true
+#      - run: ./build.sh
+#      - name: Pack artifacts
+#        run: |
+#          mkdir ${{ env.BUNDLE }}
+#          cp out/Release/*eidolon* eidolon_bridge.h ${{ env.BUNDLE }}/
+#          7z a ${{ env.BUNDLE }}.zip ${{ env.BUNDLE }}
+#      - uses: actions/upload-artifact@v4
+#        with:
+#          name: ${{ env.BUNDLE }}.zip
+#          path: src/${{ env.BUNDLE }}.zip
 
-  mac-x64:
-    needs: [prepare, cache-toolchains-mac-x64]
-    if: needs.prepare.outputs.should_build == 'true'
-    runs-on: macos-15-intel
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [x64]
-    env:
-      CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
-      EXTRA_FLAGS: 'target_cpu="${{ matrix.arch }}"'
-      BUNDLE: eidolon-${{ github.event.release.tag_name || 'dev' }}-${{ github.job }}-${{ matrix.arch }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup workspace
-        working-directory: .
-        run: |
-          mkdir -p src
-          cp -R stack_builder/* src/
-          chmod +x src/*.sh
-          echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
-      - name: Cache toolchains
-        uses: actions/cache@v4
-        with:
-          path: |
-            src/third_party/llvm-build/Release+Asserts/
-            src/gn/
-          key: toolchains-mac-x64-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
-      - name: Download Chromium
-        run: curl -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-${{ env.CHROMIUM_VERSION }}.tar.xz" | tar -xJ --strip-components=1
-      - run: brew install ninja ccache
-      - run: pip install setuptools || true
-      - run: ./get-clang.sh
-      - run: ./build.sh
-      - name: Pack artifacts
-        run: |
-          mkdir ${{ env.BUNDLE }}
-          cp out/Release/*eidolon* eidolon_bridge.h ${{ env.BUNDLE }}/
-          tar cJf ${{ env.BUNDLE }}.tar.xz ${{ env.BUNDLE }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.BUNDLE }}.tar.xz
-          path: src/${{ env.BUNDLE }}.tar.xz
+#  mac-x64:
+#    needs: [prepare, cache-toolchains-mac-x64]
+#    if: needs.prepare.outputs.should_build == 'true'
+#    runs-on: macos-15-intel
+#    strategy:
+#      fail-fast: false
+#      matrix:
+#        arch: [x64]
+#    env:
+#      CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
+#      EXTRA_FLAGS: 'target_cpu="${{ matrix.arch }}"'
+#      BUNDLE: eidolon-${{ github.event.release.tag_name || 'dev' }}-${{ github.job }}-${{ matrix.arch }}
+#    steps:
+#      - uses: actions/checkout@v4
+#      - name: Setup workspace
+#        working-directory: .
+#        run: |
+#          mkdir -p src
+#          cp -R stack_builder/* src/
+#          chmod +x src/*.sh
+#          echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
+#      - name: Cache toolchains
+#        uses: actions/cache@v4
+#        with:
+#          path: |
+#            src/third_party/llvm-build/Release+Asserts/
+#            src/gn/
+#          key: toolchains-mac-x64-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+#      - name: Download Chromium
+#        run: curl -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-${{ env.CHROMIUM_VERSION }}.tar.xz" | tar -xJ --strip-components=1
+#      - run: brew install ninja ccache
+#      - run: pip install setuptools || true
+#      - run: ./get-clang.sh
+#      - run: ./build.sh
+#      - name: Pack artifacts
+#        run: |
+#          mkdir ${{ env.BUNDLE }}
+#          cp out/Release/*eidolon* eidolon_bridge.h ${{ env.BUNDLE }}/
+#          tar cJf ${{ env.BUNDLE }}.tar.xz ${{ env.BUNDLE }}
+#      - uses: actions/upload-artifact@v4
+#        with:
+#          name: ${{ env.BUNDLE }}.tar.xz
+#          path: src/${{ env.BUNDLE }}.tar.xz
 
-  mac-arm64:
-    needs: [prepare, cache-toolchains-mac-arm64]
-    if: needs.prepare.outputs.should_build == 'true'
-    runs-on: macos-15
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [arm64]
-    env:
-      CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
-      EXTRA_FLAGS: 'target_cpu="${{ matrix.arch }}"'
-      BUNDLE: eidolon-${{ github.event.release.tag_name || 'dev' }}-${{ github.job }}-${{ matrix.arch }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup workspace
-        working-directory: .
-        run: |
-          mkdir -p src
-          cp -R stack_builder/* src/
-          chmod +x src/*.sh
-          echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
-      - name: Cache toolchains
-        uses: actions/cache@v4
-        with:
-          path: |
-            src/third_party/llvm-build/Release+Asserts/
-            src/gn/
-          key: toolchains-mac-arm64-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
-      - name: Download Chromium
-        run: curl -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-${{ env.CHROMIUM_VERSION }}.tar.xz" | tar -xJ --strip-components=1
-      - run: brew install ninja ccache
-      - run: pip install setuptools || true
-      - run: ./get-clang.sh
-      - run: ./build.sh
-      - name: Pack artifacts
-        run: |
-          mkdir ${{ env.BUNDLE }}
-          cp out/Release/*eidolon* eidolon_bridge.h ${{ env.BUNDLE }}/
-          tar cJf ${{ env.BUNDLE }}.tar.xz ${{ env.BUNDLE }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.BUNDLE }}.tar.xz
-          path: src/${{ env.BUNDLE }}.tar.xz
+#  mac-arm64:
+#    needs: [prepare, cache-toolchains-mac-arm64]
+#    if: needs.prepare.outputs.should_build == 'true'
+#    runs-on: macos-15
+#    strategy:
+#      fail-fast: false
+#      matrix:
+#        arch: [arm64]
+#    env:
+#      CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
+#      EXTRA_FLAGS: 'target_cpu="${{ matrix.arch }}"'
+#      BUNDLE: eidolon-${{ github.event.release.tag_name || 'dev' }}-${{ github.job }}-${{ matrix.arch }}
+#    steps:
+#      - uses: actions/checkout@v4
+#      - name: Setup workspace
+#        working-directory: .
+#        run: |
+#          mkdir -p src
+#          cp -R stack_builder/* src/
+#          chmod +x src/*.sh
+#          echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
+#      - name: Cache toolchains
+#        uses: actions/cache@v4
+#        with:
+#          path: |
+#            src/third_party/llvm-build/Release+Asserts/
+#            src/gn/
+#          key: toolchains-mac-arm64-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+#      - name: Download Chromium
+#        run: curl -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-${{ env.CHROMIUM_VERSION }}.tar.xz" | tar -xJ --strip-components=1
+#      - run: brew install ninja ccache
+#      - run: pip install setuptools || true
+#      - run: ./get-clang.sh
+#      - run: ./build.sh
+#      - name: Pack artifacts
+#        run: |
+#          mkdir ${{ env.BUNDLE }}
+#          cp out/Release/*eidolon* eidolon_bridge.h ${{ env.BUNDLE }}/
+#          tar cJf ${{ env.BUNDLE }}.tar.xz ${{ env.BUNDLE }}
+#      - uses: actions/upload-artifact@v4
+#        with:
+#          name: ${{ env.BUNDLE }}.tar.xz
+#          path: src/${{ env.BUNDLE }}.tar.xz
+
+
 #  publish_and_cleanup:
 #    needs: [ prepare, linux, android, win, mac-x64, mac-arm64 ]
 #    if: needs.prepare.outputs.should_build == 'true'
