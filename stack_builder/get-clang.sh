@@ -84,19 +84,18 @@ if [ "$target_os" = android ]; then
       '.*(lib(atomic|gcc|gcc_real|compiler_rt-extras|android_support|unwind).a|crt.*o|lib(android|c|dl|log|m).so|usr/local.*|usr/include.*)' -delete
     sed -i 's/AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1UL /AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1ULL /' toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/android/hardware_buffer.h
 
-    # --- ПРОСТОЙ И ЖЕЛЕЗОБЕТОННЫЙ ПЕРЕНОС БИБЛИОТЕК ---
-    # 1. Системные либы (включая libatomic.a) из корня переносим в папку 27
-    for triple in aarch64-linux-android arm-linux-androideabi x86_64-linux-android i686-linux-android; do
+    # ИДЕАЛЬНО ТОЧНЫЙ ПЕРЕНОС БИБЛИОТЕК (БЕЗ ОШИБОК GREP)
+    for pair in "aarch64:aarch64-linux-android" "arm:arm-linux-androideabi" "x86_64:x86_64-linux-android" "i386:i686-linux-android"; do
+      src_arch="${pair%%:*}"
+      triple="${pair##*:}"
       mkdir -p "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27"
-      cp "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/"*.a "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27/" 2>/dev/null || true
-    done
 
-    # 2. Рантаймы Clang (раскладываем строго по архитектурам)
-    find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -name "*.a" | grep aarch64 | xargs -I {} cp {} toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/27/ 2>/dev/null || true
-    find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -name "*.a" | grep -v aarch64 | grep arm | xargs -I {} cp {} toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/arm-linux-androideabi/27/ 2>/dev/null || true
-    find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -name "*.a" | grep x86_64 | xargs -I {} cp {} toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/x86_64-linux-android/27/ 2>/dev/null || true
-    find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -name "*.a" | grep i686 | xargs -I {} cp {} toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/i686-linux-android/27/ 2>/dev/null || true
-    # --- КОНЕЦ ФИКСА ---
+      # 1. Копируем из корня sysroot
+      cp toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/*.a "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27/" 2>/dev/null || true
+
+      # 2. Копируем из компилятора Clang, используя точные пути, чтобы arm не путался с aarch64, а i686 находил i386
+      find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -path "*/$src_arch/*.a" -exec cp {} "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27/" \; 2>/dev/null || true
+    done
 
     cd -
     rm -rf android-ndk-$android_ndk_version android-ndk-$android_ndk_version-linux.zip
