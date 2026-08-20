@@ -109,13 +109,7 @@ echo 'checkout_android_native_support = true' >> build/config/gclient_args.gni
 echo "Applying Eidolon Patches..."
 python3 patch_chromium_v152.py || true
 
-# --- НАСТОЯЩИЙ ФИКС ДЛЯ -latomic ---
-# Заменяем несуществующий "atomic" на стандартный "c" (libc) в конфигах Chromium
-echo "Patching out obsolete -latomic dependency..."
-find build/config -type f -name "BUILD.gn" -exec sed -i 's/"atomic"/"c"/g' {} + || true
-
 if [ "$host_os" = mac ]; then
-  echo "Applying macOS SDK modulemap fix..."
   sed -i '' -E '/DarwinFoundation[1-3]\.modulemap/d' build/modules/BUILD.gn || true
 fi
 
@@ -152,7 +146,6 @@ export DEPOT_TOOLS_WIN_TOOLCHAIN=0
 
 if [ "$host_os" = "win" ]; then
   if [ ! -f buildtools/win-format/clang-format.exe ]; then
-    echo "Fetching clang-format for Windows..."
     mkdir -p buildtools/win-format
     if [ -f third_party/llvm-build/Release+Asserts/bin/clang-format.exe ]; then
       cp third_party/llvm-build/Release+Asserts/bin/clang-format.exe buildtools/win-format/clang-format.exe || true
@@ -162,19 +155,32 @@ if [ "$host_os" = "win" ]; then
   fi
 fi
 
+echo "=== DIAGNOSTICS: WHO IS REQUIRING ATOMIC IN GN? ==="
+grep -rn '"atomic"' build/config/ || true
+echo "==================================================="
+
 echo "Running GN..."
 ./gn/out/gn gen "$out" --args="$flags $EXTRA_FLAGS"
+
+echo "=== DIAGNOSTICS: CHECKING NINJA FILES FOR -latomic ==="
+grep -rn "latomic" "$out"/ || true
+echo "======================================================"
 
 if [ "$host_os" = linux ]; then
   clang_x64_targets=$(grep -o ' | .*' $out/toolchain.ninja | grep -o ' clang_x64/[^ ]*' | sort -u || true)
   if [ "$clang_x64_targets" ]; then
-    echo "Building host tools..."
     CCACHE_DIR=$PWD/.host_tool_cache ninja -C "$out" $clang_x64_targets
   fi
 fi
 
-echo "Building libeidolon..."
-ninja -C "$out" eidolon
+echo "Building libeidolon (VERBOSE)..."
+if ! ninja -v -C "$out" eidolon; then
+  echo "=== DIAGNOSTICS: LINKER FAILED! DUMPING SYSROOT CONTENTS ==="
+  ls -laR third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/ || true
+  ls -laR third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/linux-x86_64/lib64/clang/ || true
+  echo "============================================================"
+  exit 1
+fi
 
 echo "Stripping binaries..."
 STRIP_TOOL="third_party/llvm-build/Release+Asserts/bin/llvm-strip"

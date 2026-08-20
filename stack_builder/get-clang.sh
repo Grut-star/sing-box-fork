@@ -79,7 +79,13 @@ if [ "$target_os" = android ]; then
     cp -r --parents sources/android/cpufeatures ../third_party/android_toolchain/ndk
     cp -r --parents toolchains/llvm/prebuilt ../third_party/android_toolchain/ndk
     cd ..
+
     cd third_party/android_toolchain/ndk
+
+    echo "=== DIAGNOSTICS: SEARCHING FOR ANY atomic IN NDK BEFORE PRUNING ==="
+    find toolchains -name "*atomic*.a" || true
+    echo "==================================================================="
+
     find toolchains -type f -regextype egrep \! -regex \
       '.*(lib(atomic|gcc|gcc_real|compiler_rt-extras|android_support|unwind).a|crt.*o|lib(android|c|dl|log|m).so|usr/local.*|usr/include.*)' -delete
     sed -i 's/AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1UL /AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1ULL /' toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/android/hardware_buffer.h
@@ -107,12 +113,10 @@ EOF
     if [ -n "$ANDROID_HOME" ] && [ -d "$ANDROID_HOME/platforms" ]; then
       LATEST_API=$(ls -1 "$ANDROID_HOME/platforms" 2>/dev/null | grep -E '^android-[0-9]+$' | sort -V | tail -n 1)
       if [ -n "$LATEST_API" ]; then
-        echo "Copying $LATEST_API android.jar from system..."
         cp "$ANDROID_HOME/platforms/$LATEST_API/android.jar" third_party/android_sdk/public/platforms/android-37.0/android.jar || true
       fi
     fi
     if [ ! -f third_party/android_sdk/public/platforms/android-37.0/android.jar ]; then
-      echo "System android.jar not found! Downloading fallback..."
       curl -L -o third_party/android_sdk/public/platforms/android-37.0/android.jar "https://github.com/Sable/android-platforms/raw/master/android-28/android.jar"
     fi
   fi
