@@ -84,17 +84,16 @@ if [ "$target_os" = android ]; then
       '.*(lib(atomic|gcc|gcc_real|compiler_rt-extras|android_support|unwind).a|crt.*o|lib(android|c|dl|log|m).so|usr/local.*|usr/include.*)' -delete
     sed -i 's/AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1UL /AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1ULL /' toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/android/hardware_buffer.h
 
-    # Универсальное копирование библиотек компилятора для ВСЕХ архитектур Android
+    # ФИКС: Явное копирование libatomic.a для всех 4-х архитектур Android
     for triple in aarch64-linux-android arm-linux-androideabi x86_64-linux-android i686-linux-android; do
-      mkdir -p "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27/"
-      case "$triple" in
-        aarch64*) clang_arch="aarch64" ;;
-        arm*) clang_arch="arm-android" ;;
-        x86_64*) clang_arch="x86_64" ;;
-        i686*) clang_arch="i686-android" ;;
-      esac
-      find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -name "*.a" | grep "$clang_arch" | xargs -I {} cp {} "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27/" || true
+      mkdir -p "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27"
+      for lib in libatomic.a libgcc.a libunwind.a; do
+        cp "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/$lib" "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27/" 2>/dev/null || true
+      done
+      arch_prefix=$(echo $triple | cut -d- -f1)
+      find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -name "*.a" | grep "$arch_prefix" | xargs -I {} cp {} "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27/" 2>/dev/null || true
     done
+
     cd -
     rm -rf android-ndk-$android_ndk_version android-ndk-$android_ndk_version-linux.zip
   fi
@@ -113,12 +112,9 @@ EOF
     fi
   done
 
-  # SDK Mock (Надежное обеспечение настоящего android.jar)
   if [ ! -f third_party/android_sdk/public/platforms/android-37.0/android.jar ]; then
     echo "Setting up Android SDK mock..."
     mkdir -p third_party/android_sdk/public/platforms/android-37.0
-
-    # 1. Пытаемся взять из системы (Github Actions)
     if [ -n "$ANDROID_HOME" ] && [ -d "$ANDROID_HOME/platforms" ]; then
       LATEST_API=$(ls -1 "$ANDROID_HOME/platforms" 2>/dev/null | grep -E '^android-[0-9]+$' | sort -V | tail -n 1)
       if [ -n "$LATEST_API" ]; then
@@ -126,8 +122,6 @@ EOF
         cp "$ANDROID_HOME/platforms/$LATEST_API/android.jar" third_party/android_sdk/public/platforms/android-37.0/android.jar || true
       fi
     fi
-
-    # 2. Если не вышло (или собираем вне раннера) - качаем реальный API 28 из зеркала
     if [ ! -f third_party/android_sdk/public/platforms/android-37.0/android.jar ]; then
       echo "System android.jar not found! Downloading fallback..."
       curl -L -o third_party/android_sdk/public/platforms/android-37.0/android.jar "https://github.com/Sable/android-platforms/raw/master/android-28/android.jar"

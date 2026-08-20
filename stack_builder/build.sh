@@ -36,7 +36,6 @@ if [ "$CCACHE" ]; then
     cc_wrapper=\"$CCACHE\""
 fi
 
-# Возвращены дефолтные флаги (без use_aura=false и use_gio=false, чтобы не ломать десктоп)
 flags="$flags"'
   is_clang=true
   fatal_linker_warnings=false
@@ -115,7 +114,6 @@ if [ "$host_os" = mac ]; then
   sed -i '' -E '/DarwinFoundation[1-3]\.modulemap/d' build/modules/BUILD.gn || true
 fi
 
-# GN Fix: Заглушка для отсутствующего таргета histograms_xml (Лечит Windows и Mac)
 mkdir -p tools/metrics
 if [ ! -f tools/metrics/BUILD.gn ]; then
   echo 'group("histograms_xml") {}' > tools/metrics/BUILD.gn
@@ -147,12 +145,15 @@ mkdir -p out
 
 export DEPOT_TOOLS_WIN_TOOLCHAIN=0
 
+# ФИКС: Возвращена загрузка clang-format для Windows, так как в LLVM архиве его нет
 if [ "$host_os" = "win" ]; then
   if [ ! -f buildtools/win-format/clang-format.exe ]; then
     echo "Fetching clang-format for Windows..."
     mkdir -p buildtools/win-format
     if [ -f third_party/llvm-build/Release+Asserts/bin/clang-format.exe ]; then
       cp third_party/llvm-build/Release+Asserts/bin/clang-format.exe buildtools/win-format/clang-format.exe || true
+    else
+      curl -sL "https://github.com/angular/clang-format/raw/master/bin/win32/clang-format.exe" -o buildtools/win-format/clang-format.exe
     fi
   fi
 fi
