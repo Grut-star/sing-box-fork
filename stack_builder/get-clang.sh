@@ -84,17 +84,12 @@ if [ "$target_os" = android ]; then
       '.*(lib(atomic|gcc|gcc_real|compiler_rt-extras|android_support|unwind).a|crt.*o|lib(android|c|dl|log|m).so|usr/local.*|usr/include.*)' -delete
     sed -i 's/AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1UL /AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1ULL /' toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/android/hardware_buffer.h
 
-    # ИДЕАЛЬНО ТОЧНЫЙ ПЕРЕНОС БИБЛИОТЕК (БЕЗ ОШИБОК GREP)
-    for pair in "aarch64:aarch64-linux-android" "arm:arm-linux-androideabi" "x86_64:x86_64-linux-android" "i386:i686-linux-android"; do
-      src_arch="${pair%%:*}"
-      triple="${pair##*:}"
+    # ФИКС: Создаем пустые файлы libatomic.a для всех архитектур
+    # Линкер увидит файл, удовлетворит флаг -latomic и пойдет дальше!
+    for triple in aarch64-linux-android arm-linux-androideabi x86_64-linux-android i686-linux-android; do
       mkdir -p "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27"
-
-      # 1. Копируем из корня sysroot
-      cp toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/*.a "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27/" 2>/dev/null || true
-
-      # 2. Копируем из компилятора Clang, используя точные пути, чтобы arm не путался с aarch64, а i686 находил i386
-      find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -path "*/$src_arch/*.a" -exec cp {} "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27/" \; 2>/dev/null || true
+      touch "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27/libatomic.a"
+      touch "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/libatomic.a"
     done
 
     cd -
