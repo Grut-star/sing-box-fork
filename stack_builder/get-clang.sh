@@ -84,12 +84,27 @@ if [ "$target_os" = android ]; then
       '.*(lib(atomic|gcc|gcc_real|compiler_rt-extras|android_support|unwind).a|crt.*o|lib(android|c|dl|log|m).so|usr/local.*|usr/include.*)' -delete
     sed -i 's/AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1UL /AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1ULL /' toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/android/hardware_buffer.h
 
-    # ФИКС: Создаем пустые файлы libatomic.a для всех архитектур
-    # Линкер увидит файл, удовлетворит флаг -latomic и пойдет дальше!
+    # Распределяем Clang builtins по правильным папкам для каждой архитектуры
+    mkdir -p toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/27
+    find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -name "*.a" | grep aarch64 | xargs -I {} cp {} toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/27/ || true
+
+    mkdir -p toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/arm-linux-androideabi/27
+    find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -name "*.a" | grep -v aarch64 | grep arm | xargs -I {} cp {} toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/arm-linux-androideabi/27/ || true
+
+    mkdir -p toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/x86_64-linux-android/27
+    find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -name "*.a" | grep x86_64 | xargs -I {} cp {} toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/x86_64-linux-android/27/ || true
+
+    mkdir -p toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/i686-linux-android/27
+    find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -name "*.a" | grep -E 'i386|i686' | xargs -I {} cp {} toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/i686-linux-android/27/ || true
+
+    # ФИКС: Клонируем builtins как libatomic.a
+    # Это 100% валидный архив с нужными символами, который удовлетворит линкер
     for triple in aarch64-linux-android arm-linux-androideabi x86_64-linux-android i686-linux-android; do
-      mkdir -p "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27"
-      touch "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27/libatomic.a"
-      touch "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/libatomic.a"
+      BUILTIN_LIB=$(ls toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27/libclang_rt.builtins*.a 2>/dev/null | head -n 1 || true)
+      if [ -n "$BUILTIN_LIB" ]; then
+        cp "$BUILTIN_LIB" "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27/libatomic.a"
+        cp "$BUILTIN_LIB" "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/libatomic.a"
+      fi
     done
 
     cd -
