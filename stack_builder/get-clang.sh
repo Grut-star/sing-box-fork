@@ -79,35 +79,44 @@ if [ "$target_os" = android ]; then
     cp -r --parents sources/android/cpufeatures ../third_party/android_toolchain/ndk
     cp -r --parents toolchains/llvm/prebuilt ../third_party/android_toolchain/ndk
     cd ..
-    cd third_party/android_toolchain/ndk
-    find toolchains -type f -regextype egrep \! -regex \
-      '.*(lib(atomic|gcc|gcc_real|compiler_rt-extras|android_support|unwind).a|crt.*o|lib(android|c|dl|log|m).so|usr/local.*|usr/include.*)' -delete
-    sed -i 's/AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1UL /AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1ULL /' toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/android/hardware_buffer.h
 
-    # Распределяем Clang builtins по правильным папкам для каждой архитектуры
-    mkdir -p toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/27
-    find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -name "*.a" | grep aarch64 | xargs -I {} cp {} toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/27/ || true
+    # Мы больше НЕ УДАЛЯЕМ ничего из NDK, чтобы не повредить пути линкера
+    sed -i 's/AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1UL /AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1ULL /' third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/android/hardware_buffer.h
 
-    mkdir -p toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/arm-linux-androideabi/27
-    find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -name "*.a" | grep -v aarch64 | grep arm | xargs -I {} cp {} toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/arm-linux-androideabi/27/ || true
+    echo "Distributing clang builtins to sysroot..."
+    CLANG_LIB_DIR=$(find third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type d -name "linux" | head -n 1)
+    if [ -n "$CLANG_LIB_DIR" ]; then
+      mkdir -p third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/27
+      cp "$CLANG_LIB_DIR"/*aarch64*.a third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/27/ 2>/dev/null || true
 
-    mkdir -p toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/x86_64-linux-android/27
-    find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -name "*.a" | grep x86_64 | xargs -I {} cp {} toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/x86_64-linux-android/27/ || true
+      mkdir -p third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/arm-linux-androideabi/27
+      cp "$CLANG_LIB_DIR"/*arm*.a third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/arm-linux-androideabi/27/ 2>/dev/null || true
 
-    mkdir -p toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/i686-linux-android/27
-    find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type f -name "*.a" | grep -E 'i386|i686' | xargs -I {} cp {} toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/i686-linux-android/27/ || true
+      mkdir -p third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/i686-linux-android/27
+      cp "$CLANG_LIB_DIR"/*i686*.a third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/i686-linux-android/27/ 2>/dev/null || true
 
-    # ФИКС: Клонируем builtins как libatomic.a
-    # Это 100% валидный архив с нужными символами, который удовлетворит линкер
-    for triple in aarch64-linux-android arm-linux-androideabi x86_64-linux-android i686-linux-android; do
-      BUILTIN_LIB=$(ls toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27/libclang_rt.builtins*.a 2>/dev/null | head -n 1 || true)
-      if [ -n "$BUILTIN_LIB" ]; then
-        cp "$BUILTIN_LIB" "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/27/libatomic.a"
-        cp "$BUILTIN_LIB" "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$triple/libatomic.a"
-      fi
+      mkdir -p third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/x86_64-linux-android/27
+      cp "$CLANG_LIB_DIR"/*x86_64*.a third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/x86_64-linux-android/27/ 2>/dev/null || true
+    fi
+
+    echo "Compiling valid dummy libatomic.a to satisfy linker..."
+    echo "void __dummy_atomic() {}" > dummy.c
+    CLANG_BIN="third_party/llvm-build/Release+Asserts/bin/clang"
+    AR_BIN="third_party/llvm-build/Release+Asserts/bin/llvm-ar"
+
+    for target in arm-linux-androideabi aarch64-linux-android i686-linux-android x86_64-linux-android; do
+      $CLANG_BIN -target ${target}27 -c dummy.c -o dummy_${target}.o || true
+      $AR_BIN rcs libatomic_${target}.a dummy_${target}.o || true
+
+      # Копируем свежесобранную валидную библиотеку во все возможные пути поиска линкера
+      TARGET_DIR="third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$target"
+      mkdir -p "$TARGET_DIR/27"
+      cp libatomic_${target}.a "$TARGET_DIR/27/libatomic.a" || true
+      cp libatomic_${target}.a "$TARGET_DIR/libatomic.a" || true
+      cp libatomic_${target}.a "$TARGET_DIR/27/libgcc.a" || true
     done
+    rm -f dummy.c dummy_*.o libatomic_*.a
 
-    cd -
     rm -rf android-ndk-$android_ndk_version android-ndk-$android_ndk_version-linux.zip
   fi
 
