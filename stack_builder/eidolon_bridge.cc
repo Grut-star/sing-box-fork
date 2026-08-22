@@ -6,18 +6,85 @@
 #include "net/base/io_buffer.h"
 #include "third_party/boringssl/src/include/openssl/ssl.h"
 
-// Добавленные заголовочные файлы для исправления ошибок компиляции
+// Заголовочные файлы для Chromium IO и QUIC
 #include "base/functional/callback_helpers.h"
+#include "base/functional/bind.h"
+#include "base/threading/thread.h"
+#include "base/task/single_thread_task_runner.h"
+#include "base/run_loop.h"
+#include "base/synchronization/waitable_event.h"
+
 #include "net/base/network_handle.h"
 #include "net/traffic_annotation/network_traffic_annotation_test_helper.h"
+#include "net/quic/quic_context.h"
+#include "net/quic/quic_chromium_client_session.h"
+#include "net/quic/quic_chromium_client_stream.h"
+#include "net/quic/quic_session_pool.h"
+#include "net/url_request/url_request_context_builder.h"
+#include "net/url_request/url_request_context.h"
+#include "net/http/http_network_session.h"
+#include "net/base/host_port_pair.h"
 
 #include "eidolon_bridge.h"
 
 extern "C" {
 
-struct EidolonSession {
-    std::unique_ptr<net::StreamSocket> socket;
+// 1. Глобальный IO-поток Chromium.
+static base::Thread* g_io_thread = nullptr;
+
+void EnsureChromiumIOThread() {
+    if (!g_io_thread) {
+        g_io_thread = new base::Thread("EidolonIOThread");
+        base::Thread::Options options;
+        options.message_pump_type = base::MessagePumpType::IO;
+        g_io_thread->StartWithOptions(std::move(options));
+    }
+}
+
+// 2. Вспомогательный класс-синхронизатор
+class SyncWaiter {
+public:
+    SyncWaiter() : event_(base::WaitableEvent::ResetPolicy::MANUAL,
+                          base::WaitableEvent::InitialState::NOT_SIGNALED) {}
+
+    base::OnceCallback<void(int)> callback() {
+        return base::BindOnce(&SyncWaiter::OnComplete, base::Unretained(this));
+    }
+
+    int WaitForResult(int rv) {
+        if (rv == net::ERR_IO_PENDING) {
+            event_.Wait();
+            return result_;
+        }
+        return rv;
+    }
+
+private:
+    void OnComplete(int result) {
+        result_ = result;
+        event_.Signal();
+    }
+
+    base::WaitableEvent event_;
+    int result_ = 0;
 };
+
+// 3. Единая структура сессии
+struct EidolonSession {
+    std::unique_ptr<net::StreamSocket> tcp_socket;
+
+    std::unique_ptr<net::URLRequestContext> url_context;
+    std::unique_ptr<net::QuicChromiumClientSession::Handle> quic_session_handle;
+    std::unique_ptr<net::QuicChromiumClientStream::Handle> quic_stream_handle;
+
+    bool is_quic() const {
+        return quic_stream_handle != nullptr;
+    }
+};
+
+// -------------------------------------------------------------------------
+// ИНИЦИАЛИЗАЦИЯ TCP
+// -------------------------------------------------------------------------
 
 EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* token) {
     auto session = std::make_unique<EidolonSession>();
@@ -26,40 +93,129 @@ EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* t
     if (!ip.AssignFromIPLiteral(host)) return nullptr;
     net::AddressList addr_list(net::IPEndPoint(ip, port));
 
-    // Исправлен вызов конструктора TCPClientSocket (добавлен 6-й аргумент kInvalidNetworkHandle)
     auto tcp_socket = std::make_unique<net::TCPClientSocket>(
-            addr_list,
-            nullptr,
-            nullptr,
-            nullptr,
-            net::NetLogSource(),
-            net::handles::kInvalidNetworkHandle);
+            addr_list, nullptr, nullptr, nullptr, net::NetLogSource(), net::handles::kInvalidNetworkHandle);
 
     if (tcp_socket->Connect(base::DoNothing()) != net::OK) return nullptr;
 
     net::SSLConfig ssl_config;
-    // Активируем наши хуки из патча
     ssl_config.eidolon_active = true;
     std::copy(token, token + 32, ssl_config.eidolon_token.begin());
 
     net::SSLClientContext ssl_context(nullptr, nullptr, nullptr, nullptr, nullptr);
 
-    session->socket = std::make_unique<net::SSLClientSocketImpl>(
+    session->tcp_socket = std::make_unique<net::SSLClientSocketImpl>(
             &ssl_context, std::move(tcp_socket), net::HostPortPair(host, port), ssl_config);
 
-    if (session->socket->Connect(base::DoNothing()) != net::OK) return nullptr;
+    if (session->tcp_socket->Connect(base::DoNothing()) != net::OK) return nullptr;
 
     return session.release();
 }
 
+// -------------------------------------------------------------------------
+// ИНИЦИАЛИЗАЦИЯ QUIC
+// -------------------------------------------------------------------------
+
+EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* token, size_t token_len) {
+    EnsureChromiumIOThread();
+
+    auto session = std::make_unique<EidolonSession>();
+    std::string target_host(host);
+
+    // Подготовка синхронизатора для Go-потока
+    base::WaitableEvent connect_event(base::WaitableEvent::ResetPolicy::MANUAL,
+                                      base::WaitableEvent::InitialState::NOT_SIGNALED);
+
+    g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
+            EidolonSession* sess, std::string host_str, uint16_t port_num, base::WaitableEvent* event) {
+
+        net::URLRequestContextBuilder builder;
+        builder.DisableHttpCache();
+
+        auto quic_context = std::make_unique<net::QuicContext>();
+        quic_context->params()->supported_versions = net::DefaultSupportedQuicVersions();
+
+        builder.SetSpdyAndQuicEnabled(false, true);
+        builder.set_quic_context(std::move(quic_context));
+        sess->url_context = builder.Build();
+
+        net::HttpNetworkSession* http_session = sess->url_context->http_transaction_factory()->GetSession();
+        net::QuicSessionPool* quic_pool = http_session->quic_session_pool();
+
+        net::HostPortPair host_port(host_str, port_num);
+        url::SchemeHostPort scheme_host_port("https", host_str, port_num);
+
+        net::QuicSessionKey session_key(
+                host_port, net::PRIVACY_MODE_DISABLED, net::ProxyChain::Direct(),
+                net::SessionUsage::kDestination, net::SocketTag(),
+                net::NetworkAnonymizationKey(), net::SecureDnsPolicy::kAllow, false);
+
+        // Запрашиваем сессию асинхронно
+        net::NetErrorDetails error_details;
+        auto session_attempt = quic_pool->CreateSessionAttempt(
+                nullptr, session_key, scheme_host_port, net::DEFAULT_PRIORITY,
+                0 /* cert_verify_flags */, net::NetLogWithSource());
+
+        // Используем внутренний коллбек Chromium для ожидания
+        int rv = session_attempt->Start(base::BindOnce([](
+                EidolonSession* inner_sess, net::QuicSessionPool::SessionAttempt* attempt, base::WaitableEvent* inner_event, int result) {
+
+            if (result == net::OK) {
+                inner_sess->quic_session_handle = attempt->CreateHandle();
+                if (inner_sess->quic_session_handle && inner_sess->quic_session_handle->IsConnected()) {
+                    // Создаем двунаправленный стрим
+                    inner_sess->quic_session_handle->RequestStream(
+                            true, // requires_confirmation
+                            base::BindOnce([](EidolonSession* s, base::WaitableEvent* ev, int stream_result) {
+                                if (stream_result == net::OK) {
+                                    s->quic_stream_handle = s->quic_session_handle->ReleaseStream();
+                                }
+                                ev->Signal();
+                            }, inner_sess, inner_event),
+                            TRAFFIC_ANNOTATION_FOR_TESTS);
+                    return; // Ждем коллбека RequestStream
+                }
+            }
+            inner_event->Signal(); // Сигнал при ошибке
+        }, sess, session_attempt.get(), event));
+
+        if (rv != net::ERR_IO_PENDING) {
+            event->Signal(); // Завершилось синхронно (маловероятно, но возможно)
+        }
+
+    }, session.get(), target_host, port, &connect_event));
+
+    connect_event.Wait();
+
+    // Защита: Если стрим не удалось создать, возвращаем null
+    if (!session->is_quic()) {
+        return nullptr;
+    }
+
+    return session.release();
+}
+
+// -------------------------------------------------------------------------
+// I/O ОПЕРАЦИИ И КРИПТОГРАФИЯ
+// -------------------------------------------------------------------------
+
 int eidolon_export_key(EidolonHandle handle, uint8_t* out_key, size_t key_len) {
     if (!handle || key_len != 32) return -1;
     auto* session = static_cast<EidolonSession*>(handle);
-    auto* ssl_socket = static_cast<net::SSLClientSocketImpl*>(session->socket.get());
 
-    if (!ssl_socket->GetSSL()) return -1;
+    // Экспорт ключа для QUIC
+    if (session->is_quic()) {
+        bool success = session->quic_session_handle->ExportKeyingMaterial(
+                "eidolon-traffic-key", "", out_key, key_len);
+        return success ? 0 : -1;
+    }
 
-    int res = SSL_export_keying_material(ssl_socket->GetSSL(), out_key, key_len, "eidolon-traffic-key", 19, nullptr, 0, 0);
+    // Экспорт ключа для TCP
+    auto* ssl_socket = static_cast<net::SSLClientSocketImpl*>(session->tcp_socket.get());
+    if (!ssl_socket || !ssl_socket->GetSSL()) return -1;
+
+    int res = SSL_export_keying_material(
+            ssl_socket->GetSSL(), out_key, key_len, "eidolon-traffic-key", 19, nullptr, 0, 0);
     return res == 1 ? 0 : -1;
 }
 
@@ -67,7 +223,17 @@ int eidolon_read(EidolonHandle handle, uint8_t* buffer, size_t buffer_len) {
     if (!handle) return -1;
     auto* session = static_cast<EidolonSession*>(handle);
     auto io_buffer = base::MakeRefCounted<net::IOBufferWithSize>(buffer_len);
-    int rv = session->socket->Read(io_buffer.get(), buffer_len, base::DoNothing());
+
+    SyncWaiter waiter;
+    int rv;
+
+    if (session->is_quic()) {
+        rv = session->quic_stream_handle->ReadBody(io_buffer.get(), buffer_len, waiter.callback());
+    } else {
+        rv = session->tcp_socket->Read(io_buffer.get(), buffer_len, waiter.callback());
+    }
+
+    rv = waiter.WaitForResult(rv);
     if (rv > 0) memcpy(buffer, io_buffer->data(), rv);
     return rv;
 }
@@ -75,29 +241,36 @@ int eidolon_read(EidolonHandle handle, uint8_t* buffer, size_t buffer_len) {
 int eidolon_write(EidolonHandle handle, const uint8_t* buffer, size_t buffer_len) {
     if (!handle) return -1;
     auto* session = static_cast<EidolonSession*>(handle);
-    auto io_buffer = base::MakeRefCounted<net::IOBufferWithSize>(buffer_len);
-    memcpy(io_buffer->data(), buffer, buffer_len);
 
-    // Исправлена аннотация трафика на TRAFFIC_ANNOTATION_FOR_TESTS
-    return session->socket->Write(
-            io_buffer.get(),
-            buffer_len,
-            base::DoNothing(),
-            TRAFFIC_ANNOTATION_FOR_TESTS
-    );
+    SyncWaiter waiter;
+    int rv;
+
+    if (session->is_quic()) {
+        std::string_view data(reinterpret_cast<const char*>(buffer), buffer_len);
+        // Chromium QUIC WriteStreamData может завершиться мгновенно, если есть окно контроля потока
+        rv = session->quic_stream_handle->WriteStreamData(data, false, waiter.callback());
+    } else {
+        auto io_buffer = base::MakeRefCounted<net::IOBufferWithSize>(buffer_len);
+        memcpy(io_buffer->data(), buffer, buffer_len);
+
+        rv = session->tcp_socket->Write(
+                io_buffer.get(), buffer_len, waiter.callback(), TRAFFIC_ANNOTATION_FOR_TESTS);
+    }
+
+    return waiter.WaitForResult(rv);
 }
 
 void eidolon_close(EidolonHandle handle) {
     if (handle) {
         auto* session = static_cast<EidolonSession*>(handle);
-        session->socket->Disconnect();
+        if (session->is_quic()) {
+            session->quic_stream_handle.reset();
+            session->quic_session_handle.reset();
+        } else if (session->tcp_socket) {
+            session->tcp_socket->Disconnect();
+        }
         delete session;
     }
-}
-
-// Заглушка для QUIC (реализуется через URLRequestContextBuilder)
-EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* token) {
-    return nullptr; // TODO: Дополним QUIC-мост на следующем шаге
 }
 
 } // extern "C"

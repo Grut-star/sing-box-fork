@@ -111,5 +111,18 @@ def main():
         replace_all=True
     )
 
+    # 9. QUIC: Экспорт ключей (RFC 5705) для AEAD
+    apply_patch(
+        'net/quic/quic_chromium_client_session.h',
+        r'(quic::ParsedQuicVersion GetQuicVersion\(\) const;)',
+        r'\1\n\n    // EIDOLON: Expose TLS Exporter for QUIC\n'
+        r'    bool ExportKeyingMaterial(std::string_view label, std::string_view context, uint8_t* result, size_t result_len) const {\n'
+        r'      if (session_ && session_->GetCryptoStream()) {\n'
+        r'        return session_->GetCryptoStream()->ExportKeyingMaterial(label, context, result, result_len);\n'
+        r'      }\n'
+        r'      return false;\n'
+        r'    }\n'
+    )
+
 if __name__ == '__main__':
     main()
