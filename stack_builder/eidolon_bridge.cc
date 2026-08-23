@@ -14,6 +14,7 @@
 #include "base/run_loop.h"
 #include "base/synchronization/waitable_event.h"
 #include "base/time/time.h"
+#include "base/containers/span.h"
 
 #include "net/base/network_handle.h"
 #include "net/traffic_annotation/network_traffic_annotation_test_helper.h"
@@ -21,14 +22,14 @@
 #include "net/quic/quic_chromium_client_session.h"
 #include "net/quic/quic_chromium_client_stream.h"
 #include "net/quic/quic_session_pool.h"
-#include "net/quic/quic_session_attempt.h" // Добавлено для v152
-#include "net/quic/quic_endpoint.h"        // Добавлено для v152
+#include "net/quic/quic_session_attempt.h"
+#include "net/quic/quic_endpoint.h"
 #include "net/url_request/url_request_context_builder.h"
 #include "net/url_request/url_request_context.h"
 #include "net/http/http_network_session.h"
-#include "net/http/http_transaction_factory.h" // Добавлено для v152
+#include "net/http/http_transaction_factory.h"
 #include "net/base/host_port_pair.h"
-#include "net/spdy/multiplexed_session_creation_initiator.h" // Добавлено для v152
+#include "net/spdy/multiplexed_session_creation_initiator.h"
 
 #include "eidolon_bridge.h"
 
@@ -105,7 +106,11 @@ EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* t
 
     net::SSLConfig ssl_config;
     ssl_config.eidolon_active = true;
-    std::copy(token, token + 32, ssl_config.eidolon_token.begin());
+
+    // Fix: Unsafe pointer arithmetic
+    base::span<const uint8_t> token_span(token, 32);
+    base::span<uint8_t> target_span(ssl_config.eidolon_token);
+    target_span.copy_from(token_span);
 
     net::SSLClientContext ssl_context(nullptr, nullptr, nullptr, nullptr, nullptr);
 
@@ -150,7 +155,14 @@ EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* 
         net::HostPortPair host_port(host_str, port_num);
         url::SchemeHostPort scheme_host_port("https", host_str, port_num);
 
-        // Обновленный конструктор QuicSessionKey для v152
+        // Парсим IP адрес для QuicEndpoint
+        net::IPAddress ip;
+        if (!ip.AssignFromIPLiteral(host_str)) {
+            event->Signal();
+            return;
+        }
+        net::IPEndPoint ip_endpoint(ip, port_num);
+
         net::QuicSessionKey session_key(
                 host_port, net::PRIVACY_MODE_DISABLED, net::ProxyChain::Direct(),
                 net::SessionUsage::kDestination, net::SocketTag(),
@@ -159,24 +171,26 @@ EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* 
                 /*disable_cert_verification_network_fetches=*/false,
                 /*target_network=*/net::handles::kInvalidNetworkHandle);
 
-        // Запрашиваем сессию асинхронно
-        net::NetErrorDetails error_details;
+        // Формируем корректный QuicEndpoint (Без заглушек, с реальным IP и версией)
+        net::QuicEndpoint quic_endpoint(
+                net::DefaultSupportedQuicVersions().front(),
+                ip_endpoint,
+                net::ConnectionEndpointMetadata());
 
-        // Обновленный CreateSessionAttempt для v152
         auto session_attempt = quic_pool->CreateSessionAttempt(
-                nullptr, session_key, net::QuicEndpoint(scheme_host_port),
+                nullptr, session_key, quic_endpoint,
                 0 /* cert_verify_flags */,
                 base::TimeTicks::Now(), base::TimeTicks::Now(),
                 std::nullopt, /*use_dns_aliases=*/false, {},
                 net::MultiplexedSessionCreationInitiator::kUnknown,
                 std::nullopt);
 
-        // Используем внутренний коллбек Chromium для ожидания
         int rv = session_attempt->Start(base::BindOnce([](
-                EidolonSession* inner_sess, net::QuicSessionAttempt* attempt, base::WaitableEvent* inner_event, int result) {
+                EidolonSession* inner_sess, net::QuicSessionAttempt* attempt, url::SchemeHostPort shp, base::WaitableEvent* inner_event, int result) {
 
-            if (result == net::OK) {
-                inner_sess->quic_session_handle = attempt->CreateHandle();
+            // Запрашиваем handle через session()
+            if (result == net::OK && attempt->session()) {
+                inner_sess->quic_session_handle = attempt->session()->CreateHandle(std::move(shp));
                 if (inner_sess->quic_session_handle && inner_sess->quic_session_handle->IsConnected()) {
                     // Создаем двунаправленный стрим
                     inner_sess->quic_session_handle->RequestStream(
@@ -192,7 +206,7 @@ EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* 
                 }
             }
             inner_event->Signal(); // Сигнал при ошибке
-        }, sess, session_attempt.get(), event));
+        }, sess, session_attempt.get(), scheme_host_port, event));
 
         if (rv != net::ERR_IO_PENDING) {
             event->Signal(); // Завершилось синхронно (маловероятно, но возможно)
@@ -249,7 +263,12 @@ int eidolon_read(EidolonHandle handle, uint8_t* buffer, size_t buffer_len) {
     }
 
     rv = waiter.WaitForResult(rv);
-    if (rv > 0) memcpy(buffer, io_buffer->data(), rv);
+    if (rv > 0) {
+        // Fix: Unsafe memcpy
+        base::span<uint8_t>(buffer, rv).copy_from(
+                base::span<const uint8_t>(reinterpret_cast<const uint8_t*>(io_buffer->data()), rv)
+        );
+    }
     return rv;
 }
 
@@ -266,7 +285,10 @@ int eidolon_write(EidolonHandle handle, const uint8_t* buffer, size_t buffer_len
         rv = session->quic_stream_handle->WriteStreamData(data, false, waiter.callback());
     } else {
         auto io_buffer = base::MakeRefCounted<net::IOBufferWithSize>(buffer_len);
-        memcpy(io_buffer->data(), buffer, buffer_len);
+        // Fix: Unsafe memcpy
+        base::span<uint8_t>(reinterpret_cast<uint8_t*>(io_buffer->data()), buffer_len).copy_from(
+                base::span<const uint8_t>(buffer, buffer_len)
+        );
 
         rv = session->tcp_socket->Write(
                 io_buffer.get(), buffer_len, waiter.callback(), TRAFFIC_ANNOTATION_FOR_TESTS);

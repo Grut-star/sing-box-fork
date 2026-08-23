@@ -120,7 +120,7 @@ def main():
         r'      if (session_ && session_->GetMutableCryptoStream()) {\n'
         r'        std::string exported_key;\n'
         r'        if (session_->GetMutableCryptoStream()->ExportKeyingMaterial(label, context, result_len, &exported_key)) {\n'
-        r'          memcpy(result, exported_key.data(), result_len);\n'
+        r'          base::span<uint8_t>(result, result_len).copy_from(base::as_byte_span(exported_key).first(result_len));\n'
         r'          return true;\n'
         r'        }\n'
         r'      }\n'
