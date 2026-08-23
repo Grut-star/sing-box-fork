@@ -7,6 +7,7 @@
 #include "third_party/boringssl/src/include/openssl/ssl.h"
 
 // Заголовочные файлы для Chromium IO и QUIC
+#include "base/compiler_specific.h" // Для UNSAFE_BUFFERS
 #include "base/functional/callback_helpers.h"
 #include "base/functional/bind.h"
 #include "base/threading/thread.h"
@@ -107,8 +108,8 @@ EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* t
     net::SSLConfig ssl_config;
     ssl_config.eidolon_active = true;
 
-    // Fix: Unsafe pointer arithmetic
-    base::span<const uint8_t> token_span(token, 32);
+    // Используем макрос UNSAFE_BUFFERS и литерал 32u (unsigned)
+    UNSAFE_BUFFERS(base::span<const uint8_t> token_span(token, 32u));
     base::span<uint8_t> target_span(ssl_config.eidolon_token);
     target_span.copy_from(token_span);
 
@@ -171,7 +172,7 @@ EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* 
                 /*disable_cert_verification_network_fetches=*/false,
                 /*target_network=*/net::handles::kInvalidNetworkHandle);
 
-        // Формируем корректный QuicEndpoint (Без заглушек, с реальным IP и версией)
+        // Формируем корректный QuicEndpoint
         net::QuicEndpoint quic_endpoint(
                 net::DefaultSupportedQuicVersions().front(),
                 ip_endpoint,
@@ -209,14 +210,13 @@ EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* 
         }, sess, session_attempt.get(), scheme_host_port, event));
 
         if (rv != net::ERR_IO_PENDING) {
-            event->Signal(); // Завершилось синхронно (маловероятно, но возможно)
+            event->Signal(); // Завершилось синхронно
         }
 
     }, session.get(), target_host, port, &connect_event));
 
     connect_event.Wait();
 
-    // Защита: Если стрим не удалось создать, возвращаем null
     if (!session->is_quic()) {
         return nullptr;
     }
@@ -264,9 +264,10 @@ int eidolon_read(EidolonHandle handle, uint8_t* buffer, size_t buffer_len) {
 
     rv = waiter.WaitForResult(rv);
     if (rv > 0) {
-        // Fix: Unsafe memcpy
-        base::span<uint8_t>(buffer, rv).copy_from(
-                base::span<const uint8_t>(reinterpret_cast<const uint8_t*>(io_buffer->data()), rv)
+        // Каст rv к size_t и защита через UNSAFE_BUFFERS
+        size_t bytes_read = static_cast<size_t>(rv);
+        UNSAFE_BUFFERS(base::span<uint8_t>(buffer, bytes_read)).copy_from(
+                UNSAFE_BUFFERS(base::span<const uint8_t>(reinterpret_cast<const uint8_t*>(io_buffer->data()), bytes_read))
         );
     }
     return rv;
@@ -281,13 +282,12 @@ int eidolon_write(EidolonHandle handle, const uint8_t* buffer, size_t buffer_len
 
     if (session->is_quic()) {
         std::string_view data(reinterpret_cast<const char*>(buffer), buffer_len);
-        // Chromium QUIC WriteStreamData может завершиться мгновенно, если есть окно контроля потока
         rv = session->quic_stream_handle->WriteStreamData(data, false, waiter.callback());
     } else {
         auto io_buffer = base::MakeRefCounted<net::IOBufferWithSize>(buffer_len);
-        // Fix: Unsafe memcpy
-        base::span<uint8_t>(reinterpret_cast<uint8_t*>(io_buffer->data()), buffer_len).copy_from(
-                base::span<const uint8_t>(buffer, buffer_len)
+
+        UNSAFE_BUFFERS(base::span<uint8_t>(reinterpret_cast<uint8_t*>(io_buffer->data()), buffer_len)).copy_from(
+                UNSAFE_BUFFERS(base::span<const uint8_t>(buffer, buffer_len))
         );
 
         rv = session->tcp_socket->Write(
