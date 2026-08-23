@@ -13,6 +13,7 @@
 #include "base/task/single_thread_task_runner.h"
 #include "base/run_loop.h"
 #include "base/synchronization/waitable_event.h"
+#include "base/time/time.h"
 
 #include "net/base/network_handle.h"
 #include "net/traffic_annotation/network_traffic_annotation_test_helper.h"
@@ -20,10 +21,14 @@
 #include "net/quic/quic_chromium_client_session.h"
 #include "net/quic/quic_chromium_client_stream.h"
 #include "net/quic/quic_session_pool.h"
+#include "net/quic/quic_session_attempt.h" // Добавлено для v152
+#include "net/quic/quic_endpoint.h"        // Добавлено для v152
 #include "net/url_request/url_request_context_builder.h"
 #include "net/url_request/url_request_context.h"
 #include "net/http/http_network_session.h"
+#include "net/http/http_transaction_factory.h" // Добавлено для v152
 #include "net/base/host_port_pair.h"
+#include "net/spdy/multiplexed_session_creation_initiator.h" // Добавлено для v152
 
 #include "eidolon_bridge.h"
 
@@ -116,7 +121,7 @@ EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* t
 // ИНИЦИАЛИЗАЦИЯ QUIC
 // -------------------------------------------------------------------------
 
-EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* token, size_t token_len) {
+EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* token) {
     EnsureChromiumIOThread();
 
     auto session = std::make_unique<EidolonSession>();
@@ -145,20 +150,30 @@ EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* 
         net::HostPortPair host_port(host_str, port_num);
         url::SchemeHostPort scheme_host_port("https", host_str, port_num);
 
+        // Обновленный конструктор QuicSessionKey для v152
         net::QuicSessionKey session_key(
                 host_port, net::PRIVACY_MODE_DISABLED, net::ProxyChain::Direct(),
                 net::SessionUsage::kDestination, net::SocketTag(),
-                net::NetworkAnonymizationKey(), net::SecureDnsPolicy::kAllow, false);
+                net::NetworkAnonymizationKey(), net::SecureDnsPolicy::kAllow,
+                /*require_dns_https_alpn=*/false,
+                /*disable_cert_verification_network_fetches=*/false,
+                /*target_network=*/net::handles::kInvalidNetworkHandle);
 
         // Запрашиваем сессию асинхронно
         net::NetErrorDetails error_details;
+
+        // Обновленный CreateSessionAttempt для v152
         auto session_attempt = quic_pool->CreateSessionAttempt(
-                nullptr, session_key, scheme_host_port, net::DEFAULT_PRIORITY,
-                0 /* cert_verify_flags */, net::NetLogWithSource());
+                nullptr, session_key, net::QuicEndpoint(scheme_host_port),
+                0 /* cert_verify_flags */,
+                base::TimeTicks::Now(), base::TimeTicks::Now(),
+                std::nullopt, /*use_dns_aliases=*/false, {},
+                net::MultiplexedSessionCreationInitiator::kUnknown,
+                std::nullopt);
 
         // Используем внутренний коллбек Chromium для ожидания
         int rv = session_attempt->Start(base::BindOnce([](
-                EidolonSession* inner_sess, net::QuicSessionPool::SessionAttempt* attempt, base::WaitableEvent* inner_event, int result) {
+                EidolonSession* inner_sess, net::QuicSessionAttempt* attempt, base::WaitableEvent* inner_event, int result) {
 
             if (result == net::OK) {
                 inner_sess->quic_session_handle = attempt->CreateHandle();
