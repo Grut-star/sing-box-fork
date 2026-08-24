@@ -119,11 +119,11 @@ struct EidolonSession {
             int rv = 0;
             if (is_quic_) {
                 std::string_view data_sv(write_buf->data(), bytes_read);
-                rv = quic_stream_handle_->WriteStreamData(
+                rv = quic_stream_handle->WriteStreamData(
                         data_sv, false,
                         base::BindOnce(&EidolonSession::OnSocketWriteComplete, base::Unretained(this)));
             } else {
-                rv = tcp_socket_->Write(
+                rv = tcp_socket->Write(
                         write_buf.get(), bytes_read,
                         base::BindOnce(&EidolonSession::OnSocketWriteComplete, base::Unretained(this)),
                         TRAFFIC_ANNOTATION_FOR_TESTS);
@@ -156,11 +156,11 @@ struct EidolonSession {
 
         int rv = 0;
         if (is_quic_) {
-            rv = quic_stream_handle_->ReadBody(
+            rv = quic_stream_handle->ReadBody(
                     read_buf_.get(), read_buf_->size(),
                     base::BindOnce(&EidolonSession::OnSocketReadComplete, base::Unretained(this)));
         } else {
-            rv = tcp_socket_->Read(
+            rv = tcp_socket->Read(
                     read_buf_.get(), read_buf_->size(),
                     base::BindOnce(&EidolonSession::OnSocketReadComplete, base::Unretained(this)));
         }
@@ -233,12 +233,12 @@ struct EidolonSession {
         }
 
         if (is_quic_) {
-            quic_stream_handle_.reset();
-            quic_session_handle_.reset();
+            quic_stream_handle.reset();
+            quic_session_handle.reset();
         } else {
-            if (tcp_socket_) {
-                tcp_socket_->Disconnect();
-                tcp_socket_.reset();
+            if (tcp_socket) {
+                tcp_socket->Disconnect();
+                tcp_socket.reset();
             }
         }
     }
@@ -250,7 +250,7 @@ struct EidolonSession {
 class TCPDialHelper {
 public:
     static void Start(EidolonSession* sess, const std::string& host, uint16_t port, const std::vector<uint8_t>& token, base::WaitableEvent* event) {
-        auto dialer = new TCPDialHelper(sess, host, port, token, event);
+        auto* dialer = new TCPDialHelper(sess, host, port, token, event);
         dialer->Run();
     }
 
