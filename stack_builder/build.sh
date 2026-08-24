@@ -120,9 +120,15 @@ else
   echo 'group("histograms_xml") {}' >> tools/metrics/BUILD.gn
 fi
 
+# 1. Подготавливаем исходники C++
 mkdir -p net/eidolon
-cp eidolon_bridge.cc net/eidolon/
-cp eidolon_bridge.h net/eidolon/
+cp stack_builder/eidolon_bridge.cc net/eidolon/
+cp stack_builder/eidolon_bridge.h net/eidolon/
+
+# 2. Подготавливаем CGO-мост, который требует eidolon_bridge.cc
+mkdir -p protocol/eidolon
+# Какой правильный путь до bridge.h из репозитория?
+cp protocol/eidolon/bridge.h net/eidolon/
 
 cat << 'EOF' > net/eidolon/BUILD.gn
 shared_library("libeidolon") {
