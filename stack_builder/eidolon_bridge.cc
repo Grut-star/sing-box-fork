@@ -1,4 +1,4 @@
-#include "bridge.h"
+#include "protocol/eidolon/bridge.h"
 
 #include <unistd.h>
 #include <fcntl.h>
