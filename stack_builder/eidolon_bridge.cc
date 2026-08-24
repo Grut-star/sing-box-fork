@@ -10,7 +10,11 @@
 #elif BUILDFLAG(IS_WIN)
 #include <winsock2.h>
 #include <windows.h>
+#include <basetsd.h>
 #include "base/win/object_watcher.h"
+
+typedef SSIZE_T ssize_t;
+
 #endif
 
 #include <vector>
@@ -111,13 +115,15 @@ struct EidolonSession {
         read_buf_ = base::MakeRefCounted<net::IOBufferWithSize>(65536);
     }
 
-    ~EidolonSession() {
 #if BUILDFLAG(IS_WIN)
-        Close(); // Обязательно вызываем для отписки Watcher до разрушения объекта
-#else
+    ~EidolonSession() override {
         Close();
-#endif
     }
+#else
+    ~EidolonSession() {
+        Close();
+    }
+#endif
 
 #if BUILDFLAG(IS_WIN)
     // События от Windows Sockets
