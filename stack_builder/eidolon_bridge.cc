@@ -1,7 +1,18 @@
 #include "bridge.h"
 
+#include "build/build_config.h"
+
+#if BUILDFLAG(IS_POSIX)
 #include <unistd.h>
 #include <fcntl.h>
+#include "base/files/file_descriptor_watcher_posix.h"
+#include "base/posix/eintr_wrapper.h"
+#elif BUILDFLAG(IS_WIN)
+#include <winsock2.h>
+#include <windows.h>
+#include "base/win/object_watcher.h"
+#endif
+
 #include <vector>
 #include <string>
 
@@ -22,8 +33,6 @@
 #include "base/synchronization/waitable_event.h"
 #include "base/time/time.h"
 #include "base/containers/span.h"
-#include "base/files/file_descriptor_watcher_posix.h"
-#include "base/posix/eintr_wrapper.h"
 
 #include "net/base/network_handle.h"
 #include "net/traffic_annotation/network_traffic_annotation_test_helper.h"
@@ -49,7 +58,7 @@ void EnsureChromiumIOThread() {
     if (!g_io_thread) {
         g_io_thread = new base::Thread("EidolonIOThread");
         base::Thread::Options options;
-        options.message_pump_type = base::MessagePumpType::IO; // КРИТИЧНО для FileDescriptorWatcher
+        options.message_pump_type = base::MessagePumpType::IO; // КРИТИЧНО для FileDescriptorWatcher / ObjectWatcher
         g_io_thread->StartWithOptions(std::move(options));
     }
 }
@@ -57,47 +66,96 @@ void EnsureChromiumIOThread() {
 // -------------------------------------------------------------------------
 // АСИНХРОННАЯ СЕССИЯ (DATA PUMP)
 // -------------------------------------------------------------------------
+
+#if BUILDFLAG(IS_WIN)
+struct EidolonSession : public base::win::ObjectWatcher::Delegate {
+#else
 struct EidolonSession {
+#endif
     std::unique_ptr<net::StreamSocket> tcp_socket;
     std::unique_ptr<net::SSLClientContext> ssl_context; // Должен жить вместе с TLS сокетом
     std::unique_ptr<net::URLRequestContext> url_context;
     std::unique_ptr<net::QuicChromiumClientSession::Handle> quic_session_handle;
     std::unique_ptr<net::QuicChromiumClientStream::Handle> quic_stream_handle;
 
-    int data_fd_ = -1;
+    uintptr_t data_fd_ = 0;
     bool is_quic_ = false;
     bool is_closed_ = false;
 
     // Инструменты асинхронного I/O
     scoped_refptr<net::IOBufferWithSize> read_buf_;
+
+#if BUILDFLAG(IS_POSIX)
     std::unique_ptr<base::FileDescriptorWatcher::Controller> fd_read_controller_;
     std::unique_ptr<base::FileDescriptorWatcher::Controller> fd_write_controller_;
+#elif BUILDFLAG(IS_WIN)
+    HANDLE socket_event_ = INVALID_HANDLE_VALUE;
+    base::win::ObjectWatcher socket_watcher_;
+#endif
 
     bool socket_write_pending_ = false;
     bool socket_read_pending_ = false;
     std::vector<std::string> pending_fd_writes_;
 
-    EidolonSession(int fd, bool quic) : data_fd_(fd), is_quic_(quic) {
+    EidolonSession(uintptr_t fd, bool quic) : data_fd_(fd), is_quic_(quic) {
         // Переводим FD от Go в неблокирующий режим (Non-Blocking)
-        int flags = fcntl(data_fd_, F_GETFL, 0);
-        fcntl(data_fd_, F_SETFL, flags | O_NONBLOCK);
+#if BUILDFLAG(IS_POSIX)
+        int flags = fcntl(static_cast<int>(data_fd_), F_GETFL, 0);
+        fcntl(static_cast<int>(data_fd_), F_SETFL, flags | O_NONBLOCK);
+#elif BUILDFLAG(IS_WIN)
+        u_long mode = 1;
+        ioctlsocket(static_cast<SOCKET>(data_fd_), FIONBIO, &mode);
+#endif
 
         // Аллоцируем буфер 64 КБ (достаточно для QUIC Datagram / Jumbo Frames)
         read_buf_ = base::MakeRefCounted<net::IOBufferWithSize>(65536);
     }
 
     ~EidolonSession() {
+#if BUILDFLAG(IS_WIN)
+        Close(); // Обязательно вызываем для отписки Watcher до разрушения объекта
+#else
         Close();
+#endif
     }
+
+#if BUILDFLAG(IS_WIN)
+    // События от Windows Sockets
+    void OnObjectSignaled(HANDLE object) override {
+        if (is_closed_) return;
+
+        if (object == socket_event_) {
+            WSANETWORKEVENTS network_events;
+            if (WSAEnumNetworkEvents(static_cast<SOCKET>(data_fd_), socket_event_, &network_events) == 0) {
+                if (network_events.lNetworkEvents & (FD_READ | FD_CLOSE)) {
+                    OnFdReadable();
+                }
+                if (!is_closed_ && (network_events.lNetworkEvents & FD_WRITE)) {
+                    TryWriteToFd();
+                }
+            }
+            if (!is_closed_) {
+                // Возобновляем слежение
+                socket_watcher_.StartWatchingOnce(socket_event_, this);
+            }
+        }
+    }
+#endif
 
     void StartPump() {
         if (is_closed_) return;
 
+#if BUILDFLAG(IS_POSIX)
         // Начинаем следить за доступностью данных от Go
         fd_read_controller_ = base::FileDescriptorWatcher::WatchReadable(
-                data_fd_,
+                static_cast<int>(data_fd_),
                 base::BindRepeating(&EidolonSession::OnFdReadable, base::Unretained(this))
         );
+#elif BUILDFLAG(IS_WIN)
+        socket_event_ = WSACreateEvent();
+        WSAEventSelect(static_cast<SOCKET>(data_fd_), socket_event_, FD_READ | FD_WRITE | FD_CLOSE);
+        socket_watcher_.StartWatchingOnce(socket_event_, this);
+#endif
 
         // Запускаем первичное чтение из Chromium сокета
         DoSocketRead();
@@ -109,7 +167,15 @@ struct EidolonSession {
         if (is_closed_ || socket_write_pending_) return;
 
         std::vector<uint8_t> temp_buf(65536);
-        ssize_t bytes_read = HANDLE_EINTR(read(data_fd_, temp_buf.data(), temp_buf.size()));
+
+#if BUILDFLAG(IS_POSIX)
+        ssize_t bytes_read = HANDLE_EINTR(read(static_cast<int>(data_fd_), temp_buf.data(), temp_buf.size()));
+        bool is_eagain = (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+#elif BUILDFLAG(IS_WIN)
+        ssize_t bytes_read = recv(static_cast<SOCKET>(data_fd_), reinterpret_cast<char*>(temp_buf.data()), temp_buf.size(), 0);
+        bool is_eagain = (bytes_read == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK);
+        if (bytes_read == SOCKET_ERROR) bytes_read = -1;
+#endif
 
         if (bytes_read > 0) {
             auto write_buf = base::MakeRefCounted<net::StringIOBuffer>(
@@ -132,7 +198,7 @@ struct EidolonSession {
             if (rv != net::ERR_IO_PENDING) {
                 OnSocketWriteComplete(rv);
             }
-        } else if (bytes_read == 0 || (bytes_read < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+        } else if (bytes_read == 0 || (bytes_read < 0 && !is_eagain)) {
             // Сокет со стороны Go был закрыт (EOF) или произошла фатальная ошибка
             Close();
         }
@@ -145,7 +211,7 @@ struct EidolonSession {
         if (rv < 0) {
             Close(); // Ошибка записи в сеть
         }
-        // Если сеть готова, OnFdReadable вызовется автоматически nhờ FileDescriptorWatcher
+        // Если сеть готова, OnFdReadable вызовется автоматически nhờ FileDescriptorWatcher / ObjectWatcher
     }
 
     // --- НАПРАВЛЕНИЕ: Chromium Socket -> Go FD ---
@@ -188,7 +254,15 @@ struct EidolonSession {
 
         while (!pending_fd_writes_.empty()) {
             auto& chunk = pending_fd_writes_.front();
-            ssize_t written = HANDLE_EINTR(write(data_fd_, chunk.data(), chunk.size()));
+
+#if BUILDFLAG(IS_POSIX)
+            ssize_t written = HANDLE_EINTR(write(static_cast<int>(data_fd_), chunk.data(), chunk.size()));
+            bool is_eagain = (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+#elif BUILDFLAG(IS_WIN)
+            ssize_t written = send(static_cast<SOCKET>(data_fd_), chunk.data(), chunk.size(), 0);
+            bool is_eagain = (written == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK);
+            if (written == SOCKET_ERROR) written = -1;
+#endif
 
             if (written > 0) {
                 if (static_cast<size_t>(written) == chunk.size()) {
@@ -197,19 +271,20 @@ struct EidolonSession {
                     chunk = chunk.substr(written);
                     break; // Ядро ОС перегружено, ждем готовности FD
                 }
-            } else if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            } else if (written < 0 && is_eagain) {
                 break; // Ждем доступности буфера FD
             } else {
-                Close(); // Фатальная ошибка Unix Socket
+                Close(); // Фатальная ошибка Local Socket
                 return;
             }
         }
 
+#if BUILDFLAG(IS_POSIX)
         if (!pending_fd_writes_.empty()) {
             // Включаем ожидание доступности записи, если не влезло
             if (!fd_write_controller_) {
                 fd_write_controller_ = base::FileDescriptorWatcher::WatchWritable(
-                        data_fd_,
+                        static_cast<int>(data_fd_),
                         base::BindRepeating(&EidolonSession::TryWriteToFd, base::Unretained(this)));
             }
         } else {
@@ -217,6 +292,12 @@ struct EidolonSession {
             fd_write_controller_.reset();
             DoSocketRead();
         }
+#elif BUILDFLAG(IS_WIN)
+        // Для Windows событие FD_WRITE сработает автоматически (edge-triggered)
+        if (pending_fd_writes_.empty()) {
+            DoSocketRead();
+        }
+#endif
     }
 
     void Close() {
@@ -224,13 +305,24 @@ struct EidolonSession {
         is_closed_ = true;
 
         // Отключаем наблюдателей
+#if BUILDFLAG(IS_POSIX)
         fd_read_controller_.reset();
         fd_write_controller_.reset();
-
-        if (data_fd_ != -1) {
-            close(data_fd_);
-            data_fd_ = -1;
+        if (data_fd_ != 0) {
+            close(static_cast<int>(data_fd_));
+            data_fd_ = 0;
         }
+#elif BUILDFLAG(IS_WIN)
+        socket_watcher_.StopWatching();
+        if (socket_event_ != INVALID_HANDLE_VALUE) {
+            WSACloseEvent(socket_event_);
+            socket_event_ = INVALID_HANDLE_VALUE;
+        }
+        if (data_fd_ != 0) {
+            closesocket(static_cast<SOCKET>(data_fd_));
+            data_fd_ = 0;
+        }
+#endif
 
         if (is_quic_) {
             quic_stream_handle.reset();
@@ -314,7 +406,7 @@ private:
 // C-API (ДЛЯ GOLANG)
 // -------------------------------------------------------------------------
 
-EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* token, size_t token_len, int data_fd) {
+EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd) {
     EnsureChromiumIOThread();
 
     auto session = std::make_unique<EidolonSession>(data_fd, false);
@@ -337,7 +429,7 @@ EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* t
     return session.release();
 }
 
-EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* token, size_t token_len, int data_fd) {
+EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd) {
     EnsureChromiumIOThread();
 
     auto session = std::make_unique<EidolonSession>(data_fd, true);

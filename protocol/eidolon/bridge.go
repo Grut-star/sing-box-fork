@@ -5,13 +5,11 @@ package eidolon
 #cgo LDFLAGS: -L${SRCDIR}/lib -leidolon_net -lstdc++
 #include "bridge.h"
 #include <stdlib.h>
+#include <stdint.h>
 
-// Мы модифицируем сигнатуры C для передачи data_fd.
-// C++ ядро Chromium будет писать расшифрованный трафик напрямую в этот дескриптор,
-// а Go будет читать его асинхронно через net.Conn, минуя CGO.
-//
-// extern EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* token, size_t token_len, int data_fd);
-// extern EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* token, size_t token_len, int data_fd);
+// Модифицированные сигнатуры C для передачи data_fd как uintptr_t (безопасно для Windows SOCKET)
+// extern EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd);
+// extern EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd);
 // extern int eidolon_export_key(EidolonHandle handle, uint8_t* out_key, size_t key_len);
 // extern void eidolon_close(EidolonHandle handle);
 */
@@ -21,14 +19,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
-	"syscall"
 	"time"
 	"unsafe"
 )
 
 // NativeStackConn реализует стандартный интерфейс net.Conn,
-// но физически I/O операции идут через Unix Socketpair напрямую в ядро Chromium.
+// но физически I/O операции идут через платформозависимый пайп напрямую в ядро Chromium.
 type NativeStackConn struct {
 	handle     C.EidolonHandle
 	dataConn   net.Conn
@@ -48,29 +44,10 @@ func DialNativeQUIC(ctx context.Context, host string, port int, token []byte) (*
 
 // Главная фабрика соединений
 func dialNative(ctx context.Context, host string, port int, token []byte, isQUIC bool) (*NativeStackConn, error) {
-	// 1. Создаем анонимную пару связанных сокетов (Socketpair)
-	// Для TCP используем непрерывный поток байтов (SOCK_STREAM).
-	// Для QUIC обязательно нужен SOCK_SEQPACKET для сохранения границ датаграмм.
-	sockType := syscall.SOCK_STREAM
-	if isQUIC {
-		sockType = syscall.SOCK_SEQPACKET
-	}
-
-	fds, err := syscall.Socketpair(syscall.AF_UNIX, sockType, 0)
+	// 1. Создаем платформозависимый канал связи (Socketpair для POSIX, Loopback TCP для Windows)
+	dataConn, cFdPtr, err := createNativePipe(isQUIC)
 	if err != nil {
-		return nil, fmt.Errorf("eidolon bridge: failed to create socketpair: %w", err)
-	}
-
-	// Дескриптор 0 остается в Go, дескриптор 1 уйдет в C++
-	f0 := os.NewFile(uintptr(fds[0]), "eidolon_go")
-	f1 := os.NewFile(uintptr(fds[1]), "eidolon_cpp")
-	defer f1.Close() // В Go мы его закрываем, так как C++ заберет владение своим FD
-
-	// Оборачиваем наш FD в нативный асинхронный net.Conn
-	dataConn, err := net.FileConn(f0)
-	f0.Close() // FileConn делает dup(), оригинал можно закрыть
-	if err != nil {
-		return nil, fmt.Errorf("eidolon bridge: failed to wrap FileConn: %w", err)
+		return nil, fmt.Errorf("eidolon bridge: failed to create native pipe: %w", err)
 	}
 
 	// 2. Готовим аргументы для CGO
@@ -81,7 +58,9 @@ func dialNative(ctx context.Context, host string, port int, token []byte, isQUIC
 	if len(token) > 0 {
 		cToken = (*C.uint8_t)(unsafe.Pointer(&token[0]))
 	}
-	cFd := C.int(fds[1])
+
+	// Приводим дескриптор к безопасному для Windows и POSIX типу uintptr_t
+	cFd := C.uintptr_t(cFdPtr)
 
 	// 3. Выполняем дозвон асинхронно, чтобы уважать context.Context
 	type dialResult struct {
@@ -144,7 +123,7 @@ func (c *NativeStackConn) ExportKeyingMaterial() ([]byte, error) {
 // Реализация интерфейса net.Conn (Data Plane)
 // -------------------------------------------------------------------------
 
-// Read и Write больше не используют CGO. Они работают через асинхронный epoll Go.
+// Read и Write больше не используют CGO. Они работают через асинхронный epoll/IOCP Go.
 func (c *NativeStackConn) Read(b []byte) (n int, err error) {
 	return c.dataConn.Read(b)
 }
