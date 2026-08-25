@@ -510,7 +510,7 @@ EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* 
                                 if (stream_result == net::OK) {
                                     s->quic_stream_handle = s->quic_session_handle->ReleaseStream();
                                     // Формируем легитимные HTTP/3 заголовки для маскировки (Browser Parroting)
-                                    spdy::Http2HeaderBlock headers;
+                                    spdy::HttpHeaderBlock headers;
                                     headers[":method"] = "CONNECT";
                                     headers[":authority"] = shp_inner.host() + ":" + std::to_string(shp_inner.port());
                                     headers[":scheme"] = "https";
