@@ -422,7 +422,8 @@ EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* t
 
     auto session = std::make_unique<EidolonSession>(data_fd, false);
     std::string target_host(host);
-    std::vector<uint8_t> token_vec(UNSAFE_BUFFERS(base::span<const uint8_t>(token, token_len)));
+    auto safe_span = UNSAFE_BUFFERS(base::span<const uint8_t>(token, token_len));
+    std::vector<uint8_t> token_vec(safe_span.begin(), safe_span.end());
 
     base::WaitableEvent connect_event(base::WaitableEvent::ResetPolicy::MANUAL,
                                       base::WaitableEvent::InitialState::NOT_SIGNALED);
