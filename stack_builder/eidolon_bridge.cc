@@ -26,6 +26,11 @@ typedef SSIZE_T ssize_t;
 #include "net/base/address_list.h"
 #include "net/base/ip_endpoint.h"
 #include "net/base/io_buffer.h"
+#include "net/third_party/quiche/src/quiche/spdy/core/http2_header_block.h"
+#include "net/spdy/spdy_http_utils.h"
+#include "net/http/http_util.h"
+#include "components/version_info/version_info.h"
+#include "base/strings/string_number_conversions.h"
 #include "third_party/boringssl/src/include/openssl/ssl.h"
 
 #include "base/compiler_specific.h"
@@ -441,11 +446,15 @@ EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* 
     auto session = std::make_unique<EidolonSession>(data_fd, true);
     std::string target_host(host);
 
+    // 1. Преобразуем сырой токен в вектор для безопасной передачи
+    std::vector<uint8_t> token_vec(token, token + token_len);
+
     base::WaitableEvent connect_event(base::WaitableEvent::ResetPolicy::MANUAL,
                                       base::WaitableEvent::InitialState::NOT_SIGNALED);
 
+    // 2. Передаем std::vector<uint8_t> tok в PostTask
     g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
-            EidolonSession* sess, std::string host_str, uint16_t port_num, base::WaitableEvent* event) {
+            EidolonSession* sess, std::string host_str, uint16_t port_num, std::vector<uint8_t> tok, base::WaitableEvent* event) {
 
         net::URLRequestContextBuilder builder;
         builder.DisableHttpCache();
@@ -487,37 +496,58 @@ EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* 
                 std::nullopt, false, {},
                 net::MultiplexedSessionCreationInitiator::kUnknown, std::nullopt);
 
+        // 3. Пробрасываем std::vector<uint8_t> inner_tok во вложенный коллбэк
         int rv = session_attempt->Start(base::BindOnce([](
-                EidolonSession* inner_sess, net::QuicSessionAttempt* attempt, url::SchemeHostPort shp, base::WaitableEvent* inner_event, int result) {
+                EidolonSession* inner_sess, net::QuicSessionAttempt* attempt, url::SchemeHostPort shp,
+                std::vector<uint8_t> inner_tok, base::WaitableEvent* inner_event, int result) {
 
             if (result == net::OK && attempt->session()) {
                 inner_sess->quic_session_handle = attempt->session()->CreateHandle(std::move(shp));
                 if (inner_sess->quic_session_handle && inner_sess->quic_session_handle->IsConnected()) {
                     inner_sess->quic_session_handle->RequestStream(
                             true,
-                            base::BindOnce([](EidolonSession* s, base::WaitableEvent* ev, int stream_result) {
+                            base::BindOnce([](EidolonSession* s, url::SchemeHostPort shp_inner, std::vector<uint8_t> final_tok, base::WaitableEvent* ev, int stream_result) {
                                 if (stream_result == net::OK) {
                                     s->quic_stream_handle = s->quic_session_handle->ReleaseStream();
-                                    s->StartPump(); // Запускаем помпу после открытия стрима
+                                    // Формируем легитимные HTTP/3 заголовки для маскировки (Browser Parroting)
+                                    spdy::Http2HeaderBlock headers;
+                                    headers[":method"] = "CONNECT";
+                                    headers[":authority"] = shp_inner.host() + ":" + std::to_string(shp_inner.port());
+                                    headers[":scheme"] = "https";
+                                    // Динамический User-Agent от текущей версии движка (например, 152.0.0.0)
+                                    headers["user-agent"] = net::HttpUtil::BuildUserAgentFromProduct(
+                                            version_info::GetProductNameAndVersionForUserAgent());
+                                    // Передаем токен в заголовке, как того требует архитектура
+                                    headers["x-eidolon-token"] = base::HexEncode(final_tok.data(), final_tok.size());
+                                    // Опционально: Паддинг заголовков для сглаживания фингерпринта длин пакетов (как в NaïveProxy)
+                                    headers["padding"] = std::string(32, '0');
+
+                                    // Отправляем заголовки. fin = false, так как дальше пойдет наша полезная нагрузка (помпа)
+                                    // Передаем пустой коллбэк, так как Chromium забуферизует фрейм HEADERS и отправит его в поток
+                                    s->quic_stream_handle->WriteHeaders(std::move(headers), false, net::CompletionOnceCallback());
+
+                                    s->StartPump(); // Запускаем двунаправленную бинарную помпу
                                 } else {
                                     s->Close();
                                 }
                                 ev->Signal();
-                            }, inner_sess, inner_event),
+                                // передаем shp_inner и final_tok
+                            }, inner_sess, shp, inner_tok, inner_event),
                             TRAFFIC_ANNOTATION_FOR_TESTS);
                     return;
                 }
             }
             inner_sess->Close();
             inner_event->Signal();
-        }, sess, session_attempt.get(), scheme_host_port, event));
+            // Передаем tok из внешнего контекста
+        }, sess, session_attempt.get(), scheme_host_port, tok, event));
 
         if (rv != net::ERR_IO_PENDING) {
             sess->Close();
             event->Signal();
         }
-
-    }, session.get(), target_host, port, &connect_event));
+        // Передаем token_vec из главного потока
+    }, session.get(), target_host, port, token_vec, &connect_event));
 
     connect_event.Wait();
 
