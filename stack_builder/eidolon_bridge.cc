@@ -26,7 +26,7 @@ typedef SSIZE_T ssize_t;
 #include "net/base/address_list.h"
 #include "net/base/ip_endpoint.h"
 #include "net/base/io_buffer.h"
-#include "net/third_party/quiche/src/quiche/spdy/core/http2_header_block.h"
+#include "net/third_party/quiche/src/quiche/common/http/http_header_block.h"
 #include "net/spdy/spdy_http_utils.h"
 #include "net/http/http_util.h"
 #include "components/version_info/version_info.h"
