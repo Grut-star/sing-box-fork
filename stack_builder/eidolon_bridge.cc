@@ -422,7 +422,7 @@ EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* t
 
     auto session = std::make_unique<EidolonSession>(data_fd, false);
     std::string target_host(host);
-    std::vector<uint8_t> token_vec(token, token + token_len);
+    std::vector<uint8_t> token_vec(UNSAFE_BUFFERS(base::span<const uint8_t>(token, token_len)));
 
     base::WaitableEvent connect_event(base::WaitableEvent::ResetPolicy::MANUAL,
                                       base::WaitableEvent::InitialState::NOT_SIGNALED);
@@ -510,21 +510,20 @@ EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* 
                                 if (stream_result == net::OK) {
                                     s->quic_stream_handle = s->quic_session_handle->ReleaseStream();
                                     // Формируем легитимные HTTP/3 заголовки для маскировки (Browser Parroting)
-                                    spdy::HttpHeaderBlock headers;
+                                    quiche::HttpHeaderBlock headers;
                                     headers[":method"] = "CONNECT";
                                     headers[":authority"] = shp_inner.host() + ":" + std::to_string(shp_inner.port());
                                     headers[":scheme"] = "https";
                                     // Динамический User-Agent от текущей версии движка (например, 152.0.0.0)
-                                    headers["user-agent"] = net::HttpUtil::BuildUserAgentFromProduct(
-                                            version_info::GetProductNameAndVersionForUserAgent());
+                                    headers["user-agent"] = version_info::GetProductNameAndVersionForUserAgent();
                                     // Передаем токен в заголовке, как того требует архитектура
-                                    headers["x-eidolon-token"] = base::HexEncode(final_tok.data(), final_tok.size());
+                                    headers["x-eidolon-token"] = base::HexEncode(final_tok);//base::HexEncode(final_tok.data(), final_tok.size());
                                     // Опционально: Паддинг заголовков для сглаживания фингерпринта длин пакетов (как в NaïveProxy)
                                     headers["padding"] = std::string(32, '0');
 
                                     // Отправляем заголовки. fin = false, так как дальше пойдет наша полезная нагрузка (помпа)
                                     // Передаем пустой коллбэк, так как Chromium забуферизует фрейм HEADERS и отправит его в поток
-                                    s->quic_stream_handle->WriteHeaders(std::move(headers), false, net::CompletionOnceCallback());
+                                    s->quic_stream_handle->WriteHeaders(std::move(headers), false, nullptr);
 
                                     s->StartPump(); // Запускаем двунаправленную бинарную помпу
                                 } else {
