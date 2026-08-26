@@ -138,6 +138,7 @@ shared_library("libeidolon") {
     "//url:url",
     "//crypto:crypto",
     "//third_party/boringssl:boringssl",
+    "//components/version_info",
   ]
 }
 EOF
