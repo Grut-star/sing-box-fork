@@ -417,7 +417,7 @@ private:
 // C-API (ДЛЯ GOLANG)
 // -------------------------------------------------------------------------
 
-EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd) {
+EIDOLON_EXPORT EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd) {
     EnsureChromiumIOThread();
 
     auto session = std::make_unique<EidolonSession>(data_fd, false);
@@ -441,7 +441,7 @@ EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* t
     return session.release();
 }
 
-EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd) {
+EIDOLON_EXPORT EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd) {
     EnsureChromiumIOThread();
 
     auto session = std::make_unique<EidolonSession>(data_fd, true);
@@ -555,7 +555,7 @@ EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* 
     return session.release();
 }
 
-int eidolon_export_key(EidolonHandle handle, uint8_t* out_key, size_t key_len) {
+EIDOLON_EXPORT int eidolon_export_key(EidolonHandle handle, uint8_t* out_key, size_t key_len) {
     if (!handle || key_len != 32) return -1;
     auto* session = static_cast<EidolonSession*>(handle);
 
@@ -585,7 +585,7 @@ int eidolon_export_key(EidolonHandle handle, uint8_t* out_key, size_t key_len) {
     return result;
 }
 
-void eidolon_close(EidolonHandle handle) {
+EIDOLON_EXPORT void eidolon_close(EidolonHandle handle) {
     if (!handle) return;
     auto* session = static_cast<EidolonSession*>(handle);
 
