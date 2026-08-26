@@ -17,6 +17,10 @@ typedef SSIZE_T ssize_t;
 
 #endif
 
+// --- ДОБАВЛЕННЫЕ ИНКЛУДЫ ДЛЯ ИНИЦИАЛИЗАЦИИ ---
+#include "base/at_exit.h"
+#include "base/task/thread_pool/thread_pool_instance.h"
+
 #include <vector>
 #include <string>
 
@@ -58,38 +62,47 @@ typedef SSIZE_T ssize_t;
 #include "net/base/host_port_pair.h"
 #include "net/spdy/multiplexed_session_creation_initiator.h"
 
-#include "base/at_exit.h"
-#include "base/message_loop/message_pump_type.h"
-#include "base/task/single_thread_task_executor.h"
-#include "base/task/thread_pool/thread_pool_instance.h"
-
-// Держим эти объекты живыми на протяжении всей работы приложения
-static std::unique_ptr<base::AtExitManager> g_exit_manager;
-static std::unique_ptr<base::SingleThreadTaskExecutor> g_io_task_executor;
-
 extern "C" {
 
-    EIDOLON_EXPORT void eidolon_init() {
-        if (!g_exit_manager) {
-            // Менеджер очистки ресурсов (обязателен для Chromium)
-            g_exit_manager = std::make_unique<base::AtExitManager>();
-            // Запуск пула потоков
-            base::ThreadPoolInstance::CreateAndStartWithDefaultParams("Eidolon_ThreadPool");
-            // Главный исполнитель для текущего потока с поддержкой IO (сокеты, FD)
-            g_io_task_executor = std::make_unique<base::SingleThreadTaskExecutor>(base::MessagePumpType::IO);
-        }
-    }
-
-// Глобальный IO-поток Chromium
+// Глобальные объекты жизненного цикла
+static std::unique_ptr<base::AtExitManager> g_exit_manager;
 static base::Thread* g_io_thread = nullptr;
 
-void EnsureChromiumIOThread() {
-    if (!g_io_thread) {
+#if BUILDFLAG(IS_POSIX)
+// КРИТИЧНО: Явный наблюдатель за дескрипторами для POSIX.
+// Без него FileDescriptorWatcher::WatchReadable падает с SIGSEGV.
+static std::unique_ptr<base::FileDescriptorWatcher> g_file_descriptor_watcher;
+#endif
+
+// Единая функция инициализации (вызывается из Go)
+EIDOLON_EXPORT void eidolon_init() {
+    if (!g_exit_manager) {
+        // 1. Инициализация менеджера очистки
+        g_exit_manager = std::make_unique<base::AtExitManager>();
+
+        // 2. Инициализация пула потоков Chromium (необходим для внутренних нужд движка)
+        base::ThreadPoolInstance::CreateAndStartWithDefaultParams("Eidolon_ThreadPool");
+
+        // 3. Создаем наш выделенный IO-поток для работы с сетью
         g_io_thread = new base::Thread("EidolonIOThread");
         base::Thread::Options options;
-        options.message_pump_type = base::MessagePumpType::IO; // КРИТИЧНО для FileDescriptorWatcher / ObjectWatcher
+        options.message_pump_type = base::MessagePumpType::IO;
         g_io_thread->StartWithOptions(std::move(options));
+
+#if BUILDFLAG(IS_POSIX)
+        // 4. ВОТ РЕШЕНИЕ ПРОБЛЕМЫ: явно создаем FileDescriptorWatcher
+        // и указываем ему использовать TaskRunner нашего IO-потока.
+        g_file_descriptor_watcher = std::make_unique<base::FileDescriptorWatcher>(
+            g_io_thread->task_runner()
+        );
+#endif
     }
+}
+
+void EnsureChromiumIOThread() {
+    // Подменяем старый вызов, чтобы гарантировать полную инициализацию
+    // при любых сценариях дозвона
+    eidolon_init();
 }
 
 // -------------------------------------------------------------------------
