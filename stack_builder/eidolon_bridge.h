@@ -11,8 +11,8 @@ extern "C" {
 typedef void* EidolonHandle;
 
 // Инициализация TCP (TLS) и QUIC туннелей
-EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* token);
-EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* token);
+EIDOLON_EXPORT EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd);
+EIDOLON_EXPORT EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd);
 
 // Чтение, запись и закрытие
 int eidolon_read(EidolonHandle handle, uint8_t* buffer, size_t buffer_len);
