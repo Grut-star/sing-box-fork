@@ -61,6 +61,64 @@ typedef SSIZE_T ssize_t;
 #include "net/http/http_transaction_factory.h"
 #include "net/base/host_port_pair.h"
 #include "net/spdy/multiplexed_session_creation_initiator.h"
+#include "net/cert/cert_verifier.h"
+#include "net/cert/cert_verify_result.h"
+#include "net/base/net_errors.h"
+#include "base/memory/scoped_refptr.h"
+#include "net/cert/x509_certificate.h"
+#include "base/functional/bind.h"
+
+class EidolonCertVerifier : public net::CertVerifier {
+public:
+    explicit EidolonCertVerifier(std::unique_ptr<net::CertVerifier> default_verifier)
+            : default_verifier_(std::move(default_verifier)) {}
+
+    int Verify(const RequestParams& params,
+               net::CertVerifyResult* verify_result,
+               net::CompletionOnceCallback callback,
+               std::unique_ptr<Request>* out_req,
+               const net::NetLogWithSource& net_log) override {
+
+        // Создаем обертку для коллбэка на случай, если проверка уйдет в фон (асинхронно)
+        auto wrapped_callback = base::BindOnce(
+                [](net::CertVerifyResult* result_ptr,
+                   scoped_refptr<net::X509Certificate> cert,
+                   net::CompletionOnceCallback original_callback,
+                   int rv) {
+                    // Если дефолтная проверка упала (например, это REALITY), применяем "наш код"
+                    if (rv != net::OK) {
+                        result_ptr->verified_cert = cert;
+                        result_ptr->is_issued_by_known_root = true;
+                        result_ptr->cert_status = 0; // Сбрасываем ошибки
+                        rv = net::OK;
+                    }
+                    std::move(original_callback).Run(rv);
+                },
+                verify_result, params.certificate(), std::move(callback));
+
+        // 1. Вызываем стандартную проверку Chromium ("проверяет сертификат как обычно")
+        int rv = default_verifier_->Verify(
+                params, verify_result, std::move(wrapped_callback), out_req, net_log);
+
+        // 2. Если результат вернулся моментально и это ошибка — перехватываем
+        if (rv != net::OK && rv != net::ERR_IO_PENDING) {
+            verify_result->verified_cert = params.certificate();
+            verify_result->is_issued_by_known_root = true;
+            verify_result->cert_status = 0;
+            return net::OK;
+        }
+
+        // 3. Если всё ОК (валидный сертификат), возвращаем как есть
+        return rv;
+    }
+
+    void SetConfig(const Config& config) override { default_verifier_->SetConfig(config); }
+    void AddObserver(Observer* observer) override { default_verifier_->AddObserver(observer); }
+    void RemoveObserver(Observer* observer) override { default_verifier_->RemoveObserver(observer); }
+
+private:
+    std::unique_ptr<net::CertVerifier> default_verifier_;
+};
 
 extern "C" {
 
@@ -115,6 +173,7 @@ struct EidolonSession : public base::win::ObjectWatcher::Delegate {
 struct EidolonSession {
 #endif
     std::unique_ptr<net::StreamSocket> tcp_socket;
+    std::unique_ptr<net::CertVerifier> cert_verifier; // Владелец верификатора
     std::unique_ptr<net::SSLClientContext> ssl_context; // Должен жить вместе с TLS сокетом
     std::unique_ptr<net::URLRequestContext> url_context;
     std::unique_ptr<net::QuicChromiumClientSession::Handle> quic_session_handle;
@@ -415,7 +474,12 @@ private:
         UNSAFE_BUFFERS(base::span<uint8_t>(ssl_config.eidolon_token)).copy_from(
                 UNSAFE_BUFFERS(base::span<const uint8_t>(token_.data(), copy_len)));
 
-        sess_->ssl_context = std::make_unique<net::SSLClientContext>(nullptr, nullptr, nullptr, nullptr, nullptr);
+        // Создаем стандартный верификатор (без сетевых загрузчиков)
+        sess_->cert_verifier = net::CertVerifier::CreateDefault(nullptr);
+
+        // Передаем cert_verifier.get() вторым аргументом
+        sess_->ssl_context = std::make_unique<net::SSLClientContext>(
+                nullptr, sess_->cert_verifier.get(), nullptr, nullptr, nullptr);
 
         sess_->tcp_socket = std::make_unique<net::SSLClientSocketImpl>(
                 sess_->ssl_context.get(), std::move(raw_socket_), net::HostPortPair(host_, port_), ssl_config);
@@ -492,6 +556,11 @@ EIDOLON_EXPORT EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, 
 
         net::URLRequestContextBuilder builder;
         builder.DisableHttpCache();
+
+        // Создаем настоящий верификатор для QUIC
+        builder.SetCertVerifier(
+                std::make_unique<EidolonCertVerifier>(net::CertVerifier::CreateDefault(nullptr))
+        );
 
         auto quic_context = std::make_unique<net::QuicContext>();
         quic_context->params()->supported_versions = net::DefaultSupportedQuicVersions();
