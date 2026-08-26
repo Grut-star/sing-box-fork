@@ -7,6 +7,8 @@ package eidolon
 #include <stdlib.h>
 #include <stdint.h>
 
+extern void eidolon_init();
+
 // Модифицированные сигнатуры C для передачи data_fd как uintptr_t (безопасно для Windows SOCKET)
 // extern EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd);
 // extern EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd);
@@ -22,6 +24,11 @@ import (
 	"time"
 	"unsafe"
 )
+
+func init() {
+    // Гарантирует, что среда Chromium инициализируется один раз при старте
+    C.eidolon_init()
+}
 
 // NativeStackConn реализует стандартный интерфейс net.Conn,
 // но физически I/O операции идут через платформозависимый пайп напрямую в ядро Chromium.

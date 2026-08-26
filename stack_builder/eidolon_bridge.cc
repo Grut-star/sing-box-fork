@@ -58,7 +58,27 @@ typedef SSIZE_T ssize_t;
 #include "net/base/host_port_pair.h"
 #include "net/spdy/multiplexed_session_creation_initiator.h"
 
+#include "base/at_exit.h"
+#include "base/message_loop/message_pump_type.h"
+#include "base/task/single_thread_task_executor.h"
+#include "base/task/thread_pool/thread_pool_instance.h"
+
+// Держим эти объекты живыми на протяжении всей работы приложения
+static std::unique_ptr<base::AtExitManager> g_exit_manager;
+static std::unique_ptr<base::SingleThreadTaskExecutor> g_io_task_executor;
+
 extern "C" {
+
+    EIDOLON_EXPORT void eidolon_init() {
+        if (!g_exit_manager) {
+            // Менеджер очистки ресурсов (обязателен для Chromium)
+            g_exit_manager = std::make_unique<base::AtExitManager>();
+            // Запуск пула потоков
+            base::ThreadPoolInstance::CreateAndStartWithDefaultParams("Eidolon_ThreadPool");
+            // Главный исполнитель для текущего потока с поддержкой IO (сокеты, FD)
+            g_io_task_executor = std::make_unique<base::SingleThreadTaskExecutor>(base::MessagePumpType::IO);
+        }
+    }
 
 // Глобальный IO-поток Chromium
 static base::Thread* g_io_thread = nullptr;

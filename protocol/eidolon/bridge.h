@@ -31,6 +31,8 @@ EIDOLON_EXPORT int eidolon_read(EidolonHandle handle, uint8_t* buffer, size_t bu
 EIDOLON_EXPORT int eidolon_write(EidolonHandle handle, const uint8_t* buffer, size_t buffer_len);
 EIDOLON_EXPORT void eidolon_close(EidolonHandle handle);
 
+EIDOLON_EXPORT void eidolon_init();
+
 #ifdef __cplusplus
 }
 #endif
