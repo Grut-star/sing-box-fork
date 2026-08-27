@@ -115,13 +115,12 @@ public:
     void Verify2QwacBinding(
             const std::string& binding,
             const std::string& hostname,
-            net::CertVerifyResult* verify_result,
-            net::CompletionOnceCallback callback,
-            std::unique_ptr<Request>* out_req,
+            const scoped_refptr<net::X509Certificate>& tls_cert,
+            base::OnceCallback<void(const scoped_refptr<net::X509Certificate>&)> callback,
             const net::NetLogWithSource& net_log) override {
 
         default_verifier_->Verify2QwacBinding(
-                binding, verify_result, std::move(callback), out_req, net_log);
+                binding, hostname, tls_cert, std::move(callback), net_log);
     }
 
     void SetConfig(const Config& config) override { default_verifier_->SetConfig(config); }
