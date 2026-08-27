@@ -113,14 +113,14 @@ public:
     }
 
     void Verify2QwacBinding(
-            const RequestParams& params,
+            const std::string& binding,
             net::CertVerifyResult* verify_result,
             net::CompletionOnceCallback callback,
             std::unique_ptr<Request>* out_req,
             const net::NetLogWithSource& net_log) override {
 
         default_verifier_->Verify2QwacBinding(
-                params, verify_result, std::move(callback), out_req, net_log);
+                binding, verify_result, std::move(callback), out_req, net_log);
     }
 
     void SetConfig(const Config& config) override { default_verifier_->SetConfig(config); }
@@ -140,7 +140,7 @@ static base::Thread* g_io_thread = nullptr;
 #if BUILDFLAG(IS_POSIX)
 // КРИТИЧНО: Явный наблюдатель за дескрипторами для POSIX.
 // Без него FileDescriptorWatcher::WatchReadable падает с SIGSEGV.
-static std::unique_ptr<base::FileDescriptorWatcher> g_file_descriptor_watcher;
+static base::FileDescriptorWatcher* g_file_descriptor_watcher = nullptr;
 #endif
 
 // Единая функция инициализации (вызывается из Go)
