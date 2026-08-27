@@ -489,9 +489,61 @@ private:
         if (rv != net::ERR_IO_PENDING) OnTcpConnected(rv);
     }
 
+//    void OnTcpConnected(int rv) {
+//        if (rv != net::OK) { Finish(false); return; }
+//
+//        net::SSLConfig ssl_config;
+//        ssl_config.eidolon_active = true;
+//
+//        size_t copy_len = std::min(token_.size(), static_cast<size_t>(32));
+//        UNSAFE_BUFFERS(base::span<uint8_t>(ssl_config.eidolon_token)).copy_from(
+//                UNSAFE_BUFFERS(base::span<const uint8_t>(token_.data(), copy_len)));
+//
+//        // 1. Убеждаемся, что верификатор создан
+//        if (!sess_->cert_verifier) {
+//            sess_->cert_verifier = net::CertVerifier::CreateDefault(nullptr);
+//        }
+//
+//        // Внедряем g_transport_security_state.get() третьим аргументом!
+//        // Остальные (SSLConfigService, SSLClientSessionCache, SCTAuditingDelegate)
+//        // можно смело оставлять nullptr, движок это допускает.
+//        sess_->ssl_context = std::make_unique<net::SSLClientContext>(
+//                /* ssl_config_service = */ nullptr,
+//                sess_->cert_verifier.get(),
+//                g_transport_security_state.get(),
+//                /* ssl_client_session_cache = */ nullptr,
+//                /* sct_auditing_delegate = */ nullptr);
+//
+//
+//        sess_->tcp_socket = std::make_unique<net::SSLClientSocketImpl>(
+//                sess_->ssl_context.get(), std::move(raw_socket_), net::HostPortPair(host_, port_), ssl_config);
+//
+//        rv = sess_->tcp_socket->Connect(base::BindOnce(&TCPDialHelper::OnSslConnected, base::Unretained(this)));
+//        if (rv != net::ERR_IO_PENDING) OnSslConnected(rv);
+//    }
     void OnTcpConnected(int rv) {
         if (rv != net::OK) { Finish(false); return; }
 
+        // 1. Делегируем сборку всего стека (включая TransportSecurityState) билдеру
+        net::URLRequestContextBuilder builder;
+        builder.DisableHttpCache();
+
+        // Внедряем наш кастомный верификатор
+        builder.SetCertVerifier(
+                std::make_unique<EidolonCertVerifier>(net::CertVerifier::CreateDefault(nullptr))
+        );
+
+        // Сохраняем контекст в сессии, чтобы он жил всё время соединения
+        sess_->url_context = builder.Build();
+
+        // 2. Извлекаем HttpNetworkSession через фабрику транзакций
+        net::HttpNetworkSession* http_session =
+                sess_->url_context->http_transaction_factory()->GetSession();
+
+        // 3. Получаем легитимный, правильно инициализированный SSLClientContext!
+        net::SSLClientContext* ssl_context = http_session->ssl_client_context();
+
+        // 4. Готовим конфигурацию SSL с нашим токеном
         net::SSLConfig ssl_config;
         ssl_config.eidolon_active = true;
 
@@ -499,24 +551,12 @@ private:
         UNSAFE_BUFFERS(base::span<uint8_t>(ssl_config.eidolon_token)).copy_from(
                 UNSAFE_BUFFERS(base::span<const uint8_t>(token_.data(), copy_len)));
 
-        // 1. Убеждаемся, что верификатор создан
-        if (!sess_->cert_verifier) {
-            sess_->cert_verifier = net::CertVerifier::CreateDefault(nullptr);
-        }
-
-        // Внедряем g_transport_security_state.get() третьим аргументом!
-        // Остальные (SSLConfigService, SSLClientSessionCache, SCTAuditingDelegate)
-        // можно смело оставлять nullptr, движок это допускает.
-        sess_->ssl_context = std::make_unique<net::SSLClientContext>(
-                /* ssl_config_service = */ nullptr,
-                sess_->cert_verifier.get(),
-                g_transport_security_state.get(),
-                /* ssl_client_session_cache = */ nullptr,
-                /* sct_auditing_delegate = */ nullptr);
-
-
-        sess_->tcp_socket = std::make_unique<net::SSLClientSocketImpl>(
-                sess_->ssl_context.get(), std::move(raw_socket_), net::HostPortPair(host_, port_), ssl_config);
+        // 5. Создаем SSLClientSocket штатным фабричным методом Chromium
+        sess_->tcp_socket = ssl_context->CreateSSLClientSocket(
+                std::move(raw_socket_),
+                net::HostPortPair(host_, port_),
+                ssl_config
+        );
 
         rv = sess_->tcp_socket->Connect(base::BindOnce(&TCPDialHelper::OnSslConnected, base::Unretained(this)));
         if (rv != net::ERR_IO_PENDING) OnSslConnected(rv);
