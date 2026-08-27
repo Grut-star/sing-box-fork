@@ -499,19 +499,21 @@ private:
         UNSAFE_BUFFERS(base::span<uint8_t>(ssl_config.eidolon_token)).copy_from(
                 UNSAFE_BUFFERS(base::span<const uint8_t>(token_.data(), copy_len)));
 
+        // 1. Убеждаемся, что верификатор создан
+        if (!sess_->cert_verifier) {
+            sess_->cert_verifier = net::CertVerifier::CreateDefault(nullptr);
+        }
+
         // Внедряем g_transport_security_state.get() третьим аргументом!
         // Остальные (SSLConfigService, SSLClientSessionCache, SCTAuditingDelegate)
         // можно смело оставлять nullptr, движок это допускает.
         sess_->ssl_context = std::make_unique<net::SSLClientContext>(
-                nullptr,
+                /* ssl_config_service = */ nullptr,
                 sess_->cert_verifier.get(),
                 g_transport_security_state.get(),
-                nullptr,
-                nullptr);
+                /* ssl_client_session_cache = */ nullptr,
+                /* sct_auditing_delegate = */ nullptr);
 
-        // Передаем cert_verifier.get() вторым аргументом
-        sess_->ssl_context = std::make_unique<net::SSLClientContext>(
-                nullptr, sess_->cert_verifier.get(), nullptr, nullptr, nullptr);
 
         sess_->tcp_socket = std::make_unique<net::SSLClientSocketImpl>(
                 sess_->ssl_context.get(), std::move(raw_socket_), net::HostPortPair(host_, port_), ssl_config);
