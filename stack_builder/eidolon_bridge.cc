@@ -67,6 +67,7 @@ typedef SSIZE_T ssize_t;
 #include "net/cert/cert_verifier.h"
 #include "net/cert/cert_verify_result.h"
 #include "net/base/net_errors.h"
+#include "net/proxy_resolution/configured_proxy_resolution_service.h"
 #include "base/memory/scoped_refptr.h"
 #include "net/cert/x509_certificate.h"
 #include "base/functional/bind.h"
@@ -527,6 +528,11 @@ private:
         // 1. Делегируем сборку всего стека (включая TransportSecurityState) билдеру
         net::URLRequestContextBuilder builder;
         builder.DisableHttpCache();
+
+        // Явно отключаем поиск системных прокси (PAC/WPAD)
+        builder.set_proxy_resolution_service(
+                net::ConfiguredProxyResolutionService::CreateDirect()
+        );
 
         // Внедряем наш кастомный верификатор
         builder.SetCertVerifier(
