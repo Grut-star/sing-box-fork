@@ -20,6 +20,7 @@ typedef SSIZE_T ssize_t;
 // --- ДОБАВЛЕННЫЕ ИНКЛУДЫ ДЛЯ ИНИЦИАЛИЗАЦИИ ---
 #include "base/at_exit.h"
 #include "base/task/thread_pool/thread_pool_instance.h"
+#include "base/command_line.h"
 
 #include <vector>
 #include <string>
@@ -145,6 +146,11 @@ static base::FileDescriptorWatcher* g_file_descriptor_watcher = nullptr;
 
 // Единая функция инициализации (вызывается из Go)
 EIDOLON_EXPORT void eidolon_init() {
+    // 0. Инициализация командной строки (критично для сетевого стека Chromium)
+    if (!base::CommandLine::InitializedForCurrentProcess()) {
+        base::CommandLine::Init(0, nullptr);
+    }
+
     if (!g_exit_manager) {
         // 1. Инициализация менеджера очистки
         g_exit_manager = new base::AtExitManager();
