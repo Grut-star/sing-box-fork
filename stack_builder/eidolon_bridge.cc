@@ -34,6 +34,8 @@ typedef SSIZE_T ssize_t;
 #include "net/third_party/quiche/src/quiche/common/http/http_header_block.h"
 #include "net/spdy/spdy_http_utils.h"
 #include "net/http/http_util.h"
+#include "net/http/transport_security_state.h"
+#include "net/socket/ssl_client_socket.h"
 #include "components/version_info/version_info.h"
 #include "base/strings/string_number_conversions.h"
 #include "third_party/boringssl/src/include/openssl/ssl.h"
@@ -138,6 +140,9 @@ extern "C" {
 static base::AtExitManager* g_exit_manager = nullptr;
 static base::Thread* g_io_thread = nullptr;
 
+// Добавляем глобальный стейт безопасности транспорта
+static std::unique_ptr<net::TransportSecurityState> g_transport_security_state = nullptr;
+
 #if BUILDFLAG(IS_POSIX)
 // КРИТИЧНО: Явный наблюдатель за дескрипторами для POSIX.
 // Без него FileDescriptorWatcher::WatchReadable падает с SIGSEGV.
@@ -163,6 +168,9 @@ EIDOLON_EXPORT void eidolon_init() {
         base::Thread::Options options;
         options.message_pump_type = base::MessagePumpType::IO;
         g_io_thread->StartWithOptions(std::move(options));
+
+        // Инициализируем TransportSecurityState (безопасно, так как есть дефолтный конструктор)
+        g_transport_security_state = std::make_unique<net::TransportSecurityState>();
 
 #if BUILDFLAG(IS_POSIX)
         // 4. ВОТ РЕШЕНИЕ ПРОБЛЕМЫ: явно создаем FileDescriptorWatcher
@@ -491,8 +499,15 @@ private:
         UNSAFE_BUFFERS(base::span<uint8_t>(ssl_config.eidolon_token)).copy_from(
                 UNSAFE_BUFFERS(base::span<const uint8_t>(token_.data(), copy_len)));
 
-        // Создаем стандартный верификатор (без сетевых загрузчиков)
-        sess_->cert_verifier = net::CertVerifier::CreateDefault(nullptr);
+        // Внедряем g_transport_security_state.get() третьим аргументом!
+        // Остальные (SSLConfigService, SSLClientSessionCache, SCTAuditingDelegate)
+        // можно смело оставлять nullptr, движок это допускает.
+        sess_->ssl_context = std::make_unique<net::SSLClientContext>(
+                nullptr,
+                sess_->cert_verifier.get(),
+                g_transport_security_state.get(),
+                nullptr,
+                nullptr);
 
         // Передаем cert_verifier.get() вторым аргументом
         sess_->ssl_context = std::make_unique<net::SSLClientContext>(
