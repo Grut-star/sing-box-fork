@@ -114,6 +114,7 @@ public:
 
     void Verify2QwacBinding(
             const std::string& binding,
+            const std::string& hostname,
             net::CertVerifyResult* verify_result,
             net::CompletionOnceCallback callback,
             std::unique_ptr<Request>* out_req,
