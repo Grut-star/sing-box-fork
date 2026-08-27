@@ -112,6 +112,17 @@ public:
         return rv;
     }
 
+    void Verify2QwacBinding(
+            const RequestParams& params,
+            net::CertVerifyResult* verify_result,
+            net::CompletionOnceCallback callback,
+            std::unique_ptr<Request>* out_req,
+            const net::NetLogWithSource& net_log) override {
+
+        default_verifier_->Verify2QwacBinding(
+                params, verify_result, std::move(callback), out_req, net_log);
+    }
+
     void SetConfig(const Config& config) override { default_verifier_->SetConfig(config); }
     void AddObserver(Observer* observer) override { default_verifier_->AddObserver(observer); }
     void RemoveObserver(Observer* observer) override { default_verifier_->RemoveObserver(observer); }
@@ -123,7 +134,7 @@ private:
 extern "C" {
 
 // Глобальные объекты жизненного цикла
-static std::unique_ptr<base::AtExitManager> g_exit_manager;
+static base::AtExitManager* g_exit_manager = nullptr;
 static base::Thread* g_io_thread = nullptr;
 
 #if BUILDFLAG(IS_POSIX)
@@ -136,7 +147,7 @@ static std::unique_ptr<base::FileDescriptorWatcher> g_file_descriptor_watcher;
 EIDOLON_EXPORT void eidolon_init() {
     if (!g_exit_manager) {
         // 1. Инициализация менеджера очистки
-        g_exit_manager = std::make_unique<base::AtExitManager>();
+        g_exit_manager = new base::AtExitManager();
 
         // 2. Инициализация пула потоков Chromium (необходим для внутренних нужд движка)
         base::ThreadPoolInstance::CreateAndStartWithDefaultParams("Eidolon_ThreadPool");
@@ -150,7 +161,7 @@ EIDOLON_EXPORT void eidolon_init() {
 #if BUILDFLAG(IS_POSIX)
         // 4. ВОТ РЕШЕНИЕ ПРОБЛЕМЫ: явно создаем FileDescriptorWatcher
         // и указываем ему использовать TaskRunner нашего IO-потока.
-        g_file_descriptor_watcher = std::make_unique<base::FileDescriptorWatcher>(
+        g_file_descriptor_watcher = new base::FileDescriptorWatcher(
             g_io_thread->task_runner()
         );
 #endif
