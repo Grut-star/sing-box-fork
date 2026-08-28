@@ -92,7 +92,7 @@ if [ "$target_os" = android ]; then
   # ===========================================================================
   echo "Patching Android NDK libraries (ensuring cached NDK is also fixed)..."
   cd third_party/android_toolchain/ndk
-  CLANG_LIB_DIR=$(find toolchains/llvm/prebuilt/linux-x86_64/lib64/clang -type d -name "linux" | head -n 1)
+  CLANG_LIB_DIR=$(find toolchains/llvm/prebuilt/linux-x86_64/lib/clang -type d -name "linux" | head -n 1)
   if [ -n "$CLANG_LIB_DIR" ]; then
     # aarch64
     mkdir -p toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/27

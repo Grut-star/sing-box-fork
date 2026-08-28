@@ -176,6 +176,26 @@ else
   ln -sf "$(which python3)" third_party/cpython3/host/bin/python3
 fi
 
+if [ "$host_os" = "win" ]; then
+  echo "Hotfixing broken Windows SDK 10.0.28000.0..."
+  python3 -c "
+filepath = 'build/toolchain/win/setup_toolchain.py'
+with open(filepath, 'r') as f:
+    content = f.read()
+
+# Инъекция кода перед возвратом переменных окружения
+injection = '''for k in variables:
+        if type(variables[k]) == str:
+            variables[k] = variables[k].replace(\"10.0.28000.0\", \"10.0.22621.0\")
+    return _ExtractImportantEnvironment(variables)'''
+
+content = content.replace('return _ExtractImportantEnvironment(variables)', injection)
+
+with open(filepath, 'w') as f:
+    f.write(content)
+"
+fi
+
 echo "Running GN..."
 ./gn/out/gn gen "$out" --args="$flags $EXTRA_FLAGS"
 

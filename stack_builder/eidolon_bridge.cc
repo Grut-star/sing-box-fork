@@ -12,6 +12,8 @@
 #include <windows.h>
 #include <basetsd.h>
 #include "base/win/object_watcher.h"
+#include "base/memory/raw_ptr.h"
+#include "base/no_destructor.h"
 
 typedef SSIZE_T ssize_t;
 
@@ -137,6 +139,7 @@ private:
     std::unique_ptr<net::CertVerifier> default_verifier_;
 };
 
+struct EidolonSession;
 // -------------------------------------------------------------------------
 // ХЕЛПЕР ДЛЯ АСИНХРОННОГО ДОЗВОНА QUIC (Без блокировок)
 // -------------------------------------------------------------------------
@@ -251,11 +254,11 @@ private:
         delete this;
     }
 
-    EidolonSession* sess_;
+    raw_ptr<EidolonSession> sess_;
     std::string host_;
     uint16_t port_;
     std::vector<uint8_t> token_;
-    base::WaitableEvent* event_;
+    raw_ptr<base::WaitableEvent> event_;
     url::SchemeHostPort scheme_host_port_;
 };
 
@@ -266,7 +269,7 @@ static base::AtExitManager* g_exit_manager = nullptr;
 static base::Thread* g_io_thread = nullptr;
 
 // Добавляем глобальный стейт безопасности транспорта
-static std::unique_ptr<net::TransportSecurityState> g_transport_security_state = nullptr;
+static base::NoDestructor<net::TransportSecurityState> g_transport_security_state;
 
 #if BUILDFLAG(IS_POSIX)
 // КРИТИЧНО: Явный наблюдатель за дескрипторами для POSIX.
@@ -712,11 +715,11 @@ private:
         delete this; // Самоуничтожение
     }
 
-    EidolonSession* sess_;
+    raw_ptr<EidolonSession> sess_;
     std::string host_;
     uint16_t port_;
     std::vector<uint8_t> token_;
-    base::WaitableEvent* event_;
+    raw_ptr<base::WaitableEvent> event_;
     std::unique_ptr<net::StreamSocket> raw_socket_;
 };
 
