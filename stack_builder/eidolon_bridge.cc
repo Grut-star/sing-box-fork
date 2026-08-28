@@ -637,6 +637,11 @@ EIDOLON_EXPORT EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, 
         net::URLRequestContextBuilder builder;
         builder.DisableHttpCache();
 
+        // Явно отключаем поиск системных прокси (PAC/WPAD)
+        builder.set_proxy_resolution_service(
+                net::ConfiguredProxyResolutionService::CreateDirect()
+        );
+
         // Создаем настоящий верификатор для QUIC
         builder.SetCertVerifier(
                 std::make_unique<EidolonCertVerifier>(net::CertVerifier::CreateDefault(nullptr))
