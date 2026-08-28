@@ -1,10 +1,7 @@
 name: Build Eidolon Stack
 on:
-  #schedule:
-  #  - cron: '0 3 * * *' # Запуск каждый день в 03:00 UTC
-  workflow_dispatch: # Оставляем кнопку для ручного запуска
+  workflow_dispatch:
 
-# Выдаем права на создание релизов и управление actions
 permissions:
   contents: write
   actions: write
@@ -42,7 +39,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${{ steps.get_version.outputs.VERSION }}"
-          # Проверяем, существует ли релиз с тегом v{VERSION}
           if gh release view "v$VERSION" --repo ${{ github.repository }} >/dev/null 2>&1; then
             echo "Release v$VERSION already exists. Skipping build."
             echo "SHOULD_BUILD=false" >> $GITHUB_OUTPUT
@@ -105,6 +101,8 @@ jobs:
     env:
       CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
     steps:
+      - name: Enable Git symlinks
+        run: git config --global core.symlinks true
       - uses: actions/checkout@v4
       - name: Setup workspace
         working-directory: .
@@ -133,7 +131,7 @@ jobs:
   cache-toolchains-mac-x64:
     needs: prepare
     if: needs.prepare.outputs.should_build == 'true'
-    runs-on: macos-15-intel
+    runs-on: macos-13
     env:
       CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
     steps:
@@ -321,6 +319,8 @@ jobs:
       EXTRA_FLAGS: 'target_cpu="${{ matrix.arch }}"'
       BUNDLE: eidolon-${{ github.event.release.tag_name || 'dev' }}-${{ github.job }}-${{ matrix.arch }}
     steps:
+      - name: Enable Git symlinks
+        run: git config --global core.symlinks true
       - uses: actions/checkout@v4
       - name: Setup workspace
         working-directory: .
@@ -339,6 +339,8 @@ jobs:
             ~/bin/ninja.exe
           key: toolchains-win-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
       - name: Download Chromium
+        env:
+          MSYS: winsymlinks:nativestrict
         run: |
           curl.exe -L "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-${{ env.CHROMIUM_VERSION }}.tar.xz" -o chromium.tar.xz
           tar -xJ -f chromium.tar.xz --strip-components=1 || true
@@ -359,7 +361,7 @@ jobs:
   mac-x64:
     needs: [prepare, cache-toolchains-mac-x64]
     if: needs.prepare.outputs.should_build == 'true'
-    runs-on: macos-15-intel
+    runs-on: macos-13
     strategy:
       fail-fast: false
       matrix:
@@ -443,42 +445,3 @@ jobs:
         with:
           name: ${{ env.BUNDLE }}.tar.xz
           path: src/${{ env.BUNDLE }}.tar.xz
-
-
-#  publish_and_cleanup:
-#    needs: [ prepare, linux, android, win, mac-x64, mac-arm64 ]
-#    if: needs.prepare.outputs.should_build == 'true'
-#    runs-on: ubuntu-22.04
-#    defaults:
-#      run:
-#        working-directory: .
-#    steps:
-#      - name: Download all artifacts
-#        uses: actions/download-artifact@v4
-#        with:
-#          path: artifacts
-#
-#      - name: Create GitHub Release
-#        env:
-#          GH_TOKEN: ${{ github.token }}
-#          VERSION: ${{ needs.prepare.outputs.chromium_version }}
-#        run: |
-#          # actions/download-artifact скачивает файлы по папкам. Вытаскиваем их в корень.
-#          find artifacts -type f \( -name "*.tar.xz" -o -name "*.zip" \) -exec mv {} . \;
-#
-#          echo "Creating Release v$VERSION..."
-#          gh release create "v$VERSION" *.tar.xz *.zip \
-#            --repo ${{ github.repository }} \
-#            --title "Eidolon Stack v$VERSION" \
-#            --notes "Automated build of Chromium $VERSION network stack." \
-#            --latest
-#
-#      - name: Delete old workflow runs
-#        env:
-#          GH_TOKEN: ${{ github.token }}
-#        run: |
-#          echo "Cleaning up old workflow runs to save space..."
-#          # Получаем ID всех завершенных запусков, пропускаем последние 3, остальные удаляем
-#          gh run list --status completed --limit 100 --json databaseId -q '.[].databaseId' \
-#            | tail -n +4 \
-#            | xargs -I{} gh run delete {} --repo ${{ github.repository }} || true

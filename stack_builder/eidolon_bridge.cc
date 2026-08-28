@@ -71,6 +71,8 @@ typedef SSIZE_T ssize_t;
 #include "base/memory/scoped_refptr.h"
 #include "net/cert/x509_certificate.h"
 #include "base/functional/bind.h"
+#include "net/proxy_resolution/proxy_config_service_fixed.h"
+#include "net/proxy_resolution/proxy_config_with_annotation.h"
 
 class EidolonCertVerifier : public net::CertVerifier {
 public:
@@ -530,8 +532,14 @@ private:
         builder.DisableHttpCache();
 
         // Явно отключаем поиск системных прокси (PAC/WPAD)
-        builder.set_proxy_resolution_service(
-                net::ConfiguredProxyResolutionService::CreateDirect()
+//        builder.set_proxy_resolution_service(
+//                net::ConfiguredProxyResolutionService::CreateDirect()
+//        );
+        // Явно отключаем прокси через фиксированный конфиг, чтобы не падали DCHECK при ошибках SSL
+        builder.set_proxy_config_service(
+                std::make_unique<net::ProxyConfigServiceFixed>(
+                        net::ProxyConfigWithAnnotation::CreateDirect()
+                )
         );
 
         // Внедряем наш кастомный верификатор
@@ -638,8 +646,14 @@ EIDOLON_EXPORT EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, 
         builder.DisableHttpCache();
 
         // Явно отключаем поиск системных прокси (PAC/WPAD)
-        builder.set_proxy_resolution_service(
-                net::ConfiguredProxyResolutionService::CreateDirect()
+//        builder.set_proxy_resolution_service(
+//                net::ConfiguredProxyResolutionService::CreateDirect()
+//        );
+        // Явно отключаем прокси через фиксированный конфиг, чтобы не падали DCHECK при ошибках SSL
+        builder.set_proxy_config_service(
+                std::make_unique<net::ProxyConfigServiceFixed>(
+                        net::ProxyConfigWithAnnotation::CreateDirect()
+                )
         );
 
         // Создаем настоящий верификатор для QUIC
