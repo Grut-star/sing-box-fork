@@ -165,6 +165,17 @@ echo "=== DIAGNOSTICS: WHO IS REQUIRING ATOMIC IN GN? ==="
 grep -rn '"atomic"' build/config/ || true
 echo "==================================================="
 
+echo "Patching Chromium's bundled Python to use system Python..."
+rm -rf third_party/cpython3/host/bin/python3* third_party/cpython3/host/bin/python.exe*
+mkdir -p third_party/cpython3/host/bin
+
+if [ "$host_os" = "win" ]; then
+  SYS_PYTHON=$(which python3 2>/dev/null || which python)
+  cp "$SYS_PYTHON" third_party/cpython3/host/bin/python3.exe
+else
+  ln -sf "$(which python3)" third_party/cpython3/host/bin/python3
+fi
+
 echo "Running GN..."
 ./gn/out/gn gen "$out" --args="$flags $EXTRA_FLAGS"
 

@@ -137,6 +137,128 @@ private:
     std::unique_ptr<net::CertVerifier> default_verifier_;
 };
 
+// -------------------------------------------------------------------------
+// ХЕЛПЕР ДЛЯ АСИНХРОННОГО ДОЗВОНА QUIC (Без блокировок)
+// -------------------------------------------------------------------------
+class QUICDialHelper {
+public:
+    static void Start(EidolonSession* sess, const std::string& host, uint16_t port, const std::vector<uint8_t>& token, base::WaitableEvent* event) {
+        auto* dialer = new QUICDialHelper(sess, host, port, token, event);
+        dialer->Run();
+    }
+
+private:
+    QUICDialHelper(EidolonSession* sess, const std::string& host, uint16_t port, const std::vector<uint8_t>& token, base::WaitableEvent* event)
+            : sess_(sess), host_(host), port_(port), token_(token), event_(event), scheme_host_port_("https", host, port) {}
+
+    void Run() {
+        net::URLRequestContextBuilder builder;
+        builder.DisableHttpCache();
+
+        builder.set_proxy_config_service(
+                std::make_unique<net::ProxyConfigServiceFixed>(
+                        net::ProxyConfigWithAnnotation::CreateDirect()
+                )
+        );
+
+        builder.SetCertVerifier(
+                std::make_unique<EidolonCertVerifier>(net::CertVerifier::CreateDefault(nullptr))
+        );
+
+        auto quic_context = std::make_unique<net::QuicContext>();
+        quic_context->params()->supported_versions = net::DefaultSupportedQuicVersions();
+
+        builder.SetSpdyAndQuicEnabled(false, true);
+        builder.set_quic_context(std::move(quic_context));
+        sess_->url_context = builder.Build();
+
+        net::HttpNetworkSession* http_session = sess_->url_context->http_transaction_factory()->GetSession();
+        net::QuicSessionPool* quic_pool = http_session->quic_session_pool();
+
+        net::HostPortPair host_port(host_, port_);
+
+        net::IPAddress ip;
+        if (!ip.AssignFromIPLiteral(host_)) { Finish(false); return; }
+
+        net::QuicSessionKey session_key(
+                host_port, net::PRIVACY_MODE_DISABLED, net::ProxyChain::Direct(),
+                net::SessionUsage::kDestination, net::SocketTag(),
+                net::NetworkAnonymizationKey(), net::SecureDnsPolicy::kAllow,
+                false, false, net::handles::kInvalidNetworkHandle);
+
+        net::QuicEndpoint quic_endpoint(
+                net::DefaultSupportedQuicVersions().front(),
+                net::IPEndPoint(ip, port_),
+                net::ConnectionEndpointMetadata());
+
+        sess_->quic_attempt = quic_pool->CreateSessionAttempt(
+                nullptr, session_key, quic_endpoint, 0,
+                base::TimeTicks::Now(), base::TimeTicks::Now(),
+                std::nullopt, false, {},
+                net::MultiplexedSessionCreationInitiator::kUnknown, std::nullopt);
+
+        // 1. Старт хендшейка (учитываем синхронное завершение)
+        int rv = sess_->quic_attempt->Start(base::BindOnce(&QUICDialHelper::OnSessionAttemptComplete, base::Unretained(this)));
+        if (rv != net::ERR_IO_PENDING) OnSessionAttemptComplete(rv);
+    }
+
+    void OnSessionAttemptComplete(int rv) {
+        if (rv != net::OK || !sess_->quic_attempt->session()) {
+            Finish(false); return;
+        }
+
+        sess_->quic_session_handle = sess_->quic_attempt->session()->CreateHandle(std::move(scheme_host_port_));
+        if (!sess_->quic_session_handle || !sess_->quic_session_handle->IsConnected()) {
+            Finish(false); return;
+        }
+
+        // 2. Запрос стрима (учитываем синхронное завершение)
+        int stream_rv = sess_->quic_session_handle->RequestStream(
+                true,
+                base::BindOnce(&QUICDialHelper::OnStreamRequested, base::Unretained(this)),
+                TRAFFIC_ANNOTATION_FOR_TESTS);
+
+        if (stream_rv != net::ERR_IO_PENDING) OnStreamRequested(stream_rv);
+    }
+
+    void OnStreamRequested(int rv) {
+        if (rv != net::OK) {
+            Finish(false); return;
+        }
+
+        sess_->quic_stream_handle = sess_->quic_session_handle->ReleaseStream();
+
+        quiche::HttpHeaderBlock headers;
+        headers[":method"] = "CONNECT";
+        headers[":authority"] = host_ + ":" + std::to_string(port_);
+        headers[":scheme"] = "https";
+        headers["user-agent"] = version_info::GetProductNameAndVersionForUserAgent();
+        headers["x-eidolon-token"] = base::HexEncode(token_);
+        headers["padding"] = std::string(32, '0');
+
+        sess_->quic_stream_handle->WriteHeaders(std::move(headers), false, nullptr);
+
+        Finish(true);
+    }
+
+    void Finish(bool success) {
+        if (success) {
+            sess_->StartPump();
+        } else {
+            sess_->Close();
+        }
+        event_->Signal();
+        delete this;
+    }
+
+    EidolonSession* sess_;
+    std::string host_;
+    uint16_t port_;
+    std::vector<uint8_t> token_;
+    base::WaitableEvent* event_;
+    url::SchemeHostPort scheme_host_port_;
+};
+
 extern "C" {
 
 // Глобальные объекты жизненного цикла
@@ -206,7 +328,7 @@ struct EidolonSession {
     std::unique_ptr<net::URLRequestContext> url_context;
     std::unique_ptr<net::QuicChromiumClientSession::Handle> quic_session_handle;
     std::unique_ptr<net::QuicChromiumClientStream::Handle> quic_stream_handle;
-
+    std::unique_ptr<net::QuicSessionAttempt> quic_attempt; // Сохраняем попытку установки QUIC-сессии
     uintptr_t data_fd_ = 0;
     bool is_quic_ = false;
     bool is_closed_ = false;
@@ -641,113 +763,7 @@ EIDOLON_EXPORT EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, 
     // 2. Передаем std::vector<uint8_t> tok в PostTask
     g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
             EidolonSession* sess, std::string host_str, uint16_t port_num, std::vector<uint8_t> tok, base::WaitableEvent* event) {
-
-        net::URLRequestContextBuilder builder;
-        builder.DisableHttpCache();
-
-        // Явно отключаем поиск системных прокси (PAC/WPAD)
-//        builder.set_proxy_resolution_service(
-//                net::ConfiguredProxyResolutionService::CreateDirect()
-//        );
-        // Явно отключаем прокси через фиксированный конфиг, чтобы не падали DCHECK при ошибках SSL
-        builder.set_proxy_config_service(
-                std::make_unique<net::ProxyConfigServiceFixed>(
-                        net::ProxyConfigWithAnnotation::CreateDirect()
-                )
-        );
-
-        // Создаем настоящий верификатор для QUIC
-        builder.SetCertVerifier(
-                std::make_unique<EidolonCertVerifier>(net::CertVerifier::CreateDefault(nullptr))
-        );
-
-        auto quic_context = std::make_unique<net::QuicContext>();
-        quic_context->params()->supported_versions = net::DefaultSupportedQuicVersions();
-
-        builder.SetSpdyAndQuicEnabled(false, true);
-        builder.set_quic_context(std::move(quic_context));
-        sess->url_context = builder.Build();
-
-        net::HttpNetworkSession* http_session = sess->url_context->http_transaction_factory()->GetSession();
-        net::QuicSessionPool* quic_pool = http_session->quic_session_pool();
-
-        net::HostPortPair host_port(host_str, port_num);
-        url::SchemeHostPort scheme_host_port("https", host_str, port_num);
-
-        net::IPAddress ip;
-        if (!ip.AssignFromIPLiteral(host_str)) {
-            sess->Close();
-            event->Signal();
-            return;
-        }
-
-        net::QuicSessionKey session_key(
-                host_port, net::PRIVACY_MODE_DISABLED, net::ProxyChain::Direct(),
-                net::SessionUsage::kDestination, net::SocketTag(),
-                net::NetworkAnonymizationKey(), net::SecureDnsPolicy::kAllow,
-                false, false, net::handles::kInvalidNetworkHandle);
-
-        net::QuicEndpoint quic_endpoint(
-                net::DefaultSupportedQuicVersions().front(),
-                net::IPEndPoint(ip, port_num),
-                net::ConnectionEndpointMetadata());
-
-        auto session_attempt = quic_pool->CreateSessionAttempt(
-                nullptr, session_key, quic_endpoint, 0,
-                base::TimeTicks::Now(), base::TimeTicks::Now(),
-                std::nullopt, false, {},
-                net::MultiplexedSessionCreationInitiator::kUnknown, std::nullopt);
-
-        // 3. Пробрасываем std::vector<uint8_t> inner_tok во вложенный коллбэк
-        int rv = session_attempt->Start(base::BindOnce([](
-                EidolonSession* inner_sess, net::QuicSessionAttempt* attempt, url::SchemeHostPort shp,
-                std::vector<uint8_t> inner_tok, base::WaitableEvent* inner_event, int result) {
-
-            if (result == net::OK && attempt->session()) {
-                inner_sess->quic_session_handle = attempt->session()->CreateHandle(std::move(shp));
-                if (inner_sess->quic_session_handle && inner_sess->quic_session_handle->IsConnected()) {
-                    inner_sess->quic_session_handle->RequestStream(
-                            true,
-                            base::BindOnce([](EidolonSession* s, url::SchemeHostPort shp_inner, std::vector<uint8_t> final_tok, base::WaitableEvent* ev, int stream_result) {
-                                if (stream_result == net::OK) {
-                                    s->quic_stream_handle = s->quic_session_handle->ReleaseStream();
-                                    // Формируем легитимные HTTP/3 заголовки для маскировки (Browser Parroting)
-                                    quiche::HttpHeaderBlock headers;
-                                    headers[":method"] = "CONNECT";
-                                    headers[":authority"] = shp_inner.host() + ":" + std::to_string(shp_inner.port());
-                                    headers[":scheme"] = "https";
-                                    // Динамический User-Agent от текущей версии движка (например, 152.0.0.0)
-                                    headers["user-agent"] = version_info::GetProductNameAndVersionForUserAgent();
-                                    // Передаем токен в заголовке, как того требует архитектура
-                                    headers["x-eidolon-token"] = base::HexEncode(final_tok);//base::HexEncode(final_tok.data(), final_tok.size());
-                                    // Опционально: Паддинг заголовков для сглаживания фингерпринта длин пакетов (как в NaïveProxy)
-                                    headers["padding"] = std::string(32, '0');
-
-                                    // Отправляем заголовки. fin = false, так как дальше пойдет наша полезная нагрузка (помпа)
-                                    // Передаем пустой коллбэк, так как Chromium забуферизует фрейм HEADERS и отправит его в поток
-                                    s->quic_stream_handle->WriteHeaders(std::move(headers), false, nullptr);
-
-                                    s->StartPump(); // Запускаем двунаправленную бинарную помпу
-                                } else {
-                                    s->Close();
-                                }
-                                ev->Signal();
-                                // передаем shp_inner и final_tok
-                            }, inner_sess, shp, inner_tok, inner_event),
-                            TRAFFIC_ANNOTATION_FOR_TESTS);
-                    return;
-                }
-            }
-            inner_sess->Close();
-            inner_event->Signal();
-            // Передаем tok из внешнего контекста
-        }, sess, session_attempt.get(), scheme_host_port, tok, event));
-
-        if (rv != net::ERR_IO_PENDING) {
-            sess->Close();
-            event->Signal();
-        }
-        // Передаем token_vec из главного потока
+        QUICDialHelper::Start(sess, host_str, port_num, tok, event);
     }, session.get(), target_host, port, token_vec, &connect_event));
 
     connect_event.Wait();
