@@ -72,7 +72,6 @@ typedef SSIZE_T ssize_t;
 #include "net/proxy_resolution/configured_proxy_resolution_service.h"
 #include "base/memory/scoped_refptr.h"
 #include "net/cert/x509_certificate.h"
-#include "base/functional/bind.h"
 #include "net/proxy_resolution/proxy_config_service_fixed.h"
 #include "net/proxy_resolution/proxy_config_with_annotation.h"
 
@@ -139,183 +138,6 @@ private:
     std::unique_ptr<net::CertVerifier> default_verifier_;
 };
 
-struct EidolonSession;
-// -------------------------------------------------------------------------
-// ХЕЛПЕР ДЛЯ АСИНХРОННОГО ДОЗВОНА QUIC (Без блокировок)
-// -------------------------------------------------------------------------
-class QUICDialHelper {
-public:
-    static void Start(EidolonSession* sess, const std::string& host, uint16_t port, const std::vector<uint8_t>& token, base::WaitableEvent* event) {
-        auto* dialer = new QUICDialHelper(sess, host, port, token, event);
-        dialer->Run();
-    }
-
-private:
-    QUICDialHelper(EidolonSession* sess, const std::string& host, uint16_t port, const std::vector<uint8_t>& token, base::WaitableEvent* event)
-            : sess_(sess), host_(host), port_(port), token_(token), event_(event), scheme_host_port_("https", host, port) {}
-
-    void Run() {
-        net::URLRequestContextBuilder builder;
-        builder.DisableHttpCache();
-
-        builder.set_proxy_config_service(
-                std::make_unique<net::ProxyConfigServiceFixed>(
-                        net::ProxyConfigWithAnnotation::CreateDirect()
-                )
-        );
-
-        builder.SetCertVerifier(
-                std::make_unique<EidolonCertVerifier>(net::CertVerifier::CreateDefault(nullptr))
-        );
-
-        auto quic_context = std::make_unique<net::QuicContext>();
-        quic_context->params()->supported_versions = net::DefaultSupportedQuicVersions();
-
-        builder.SetSpdyAndQuicEnabled(false, true);
-        builder.set_quic_context(std::move(quic_context));
-        sess_->url_context = builder.Build();
-
-        net::HttpNetworkSession* http_session = sess_->url_context->http_transaction_factory()->GetSession();
-        net::QuicSessionPool* quic_pool = http_session->quic_session_pool();
-
-        net::HostPortPair host_port(host_, port_);
-
-        net::IPAddress ip;
-        if (!ip.AssignFromIPLiteral(host_)) { Finish(false); return; }
-
-        net::QuicSessionKey session_key(
-                host_port, net::PRIVACY_MODE_DISABLED, net::ProxyChain::Direct(),
-                net::SessionUsage::kDestination, net::SocketTag(),
-                net::NetworkAnonymizationKey(), net::SecureDnsPolicy::kAllow,
-                false, false, net::handles::kInvalidNetworkHandle);
-
-        net::QuicEndpoint quic_endpoint(
-                net::DefaultSupportedQuicVersions().front(),
-                net::IPEndPoint(ip, port_),
-                net::ConnectionEndpointMetadata());
-
-        sess_->quic_attempt = quic_pool->CreateSessionAttempt(
-                nullptr, session_key, quic_endpoint, 0,
-                base::TimeTicks::Now(), base::TimeTicks::Now(),
-                std::nullopt, false, {},
-                net::MultiplexedSessionCreationInitiator::kUnknown, std::nullopt);
-
-        // 1. Старт хендшейка (учитываем синхронное завершение)
-        int rv = sess_->quic_attempt->Start(base::BindOnce(&QUICDialHelper::OnSessionAttemptComplete, base::Unretained(this)));
-        if (rv != net::ERR_IO_PENDING) OnSessionAttemptComplete(rv);
-    }
-
-    void OnSessionAttemptComplete(int rv) {
-        if (rv != net::OK || !sess_->quic_attempt->session()) {
-            Finish(false); return;
-        }
-
-        sess_->quic_session_handle = sess_->quic_attempt->session()->CreateHandle(std::move(scheme_host_port_));
-        if (!sess_->quic_session_handle || !sess_->quic_session_handle->IsConnected()) {
-            Finish(false); return;
-        }
-
-        // 2. Запрос стрима (учитываем синхронное завершение)
-        int stream_rv = sess_->quic_session_handle->RequestStream(
-                true,
-                base::BindOnce(&QUICDialHelper::OnStreamRequested, base::Unretained(this)),
-                TRAFFIC_ANNOTATION_FOR_TESTS);
-
-        if (stream_rv != net::ERR_IO_PENDING) OnStreamRequested(stream_rv);
-    }
-
-    void OnStreamRequested(int rv) {
-        if (rv != net::OK) {
-            Finish(false); return;
-        }
-
-        sess_->quic_stream_handle = sess_->quic_session_handle->ReleaseStream();
-
-        quiche::HttpHeaderBlock headers;
-        headers[":method"] = "CONNECT";
-        headers[":authority"] = host_ + ":" + std::to_string(port_);
-        headers[":scheme"] = "https";
-        headers["user-agent"] = version_info::GetProductNameAndVersionForUserAgent();
-        headers["x-eidolon-token"] = base::HexEncode(token_);
-        headers["padding"] = std::string(32, '0');
-
-        sess_->quic_stream_handle->WriteHeaders(std::move(headers), false, nullptr);
-
-        Finish(true);
-    }
-
-    void Finish(bool success) {
-        if (success) {
-            sess_->StartPump();
-        } else {
-            sess_->Close();
-        }
-        event_->Signal();
-        delete this;
-    }
-
-    raw_ptr<EidolonSession> sess_;
-    std::string host_;
-    uint16_t port_;
-    std::vector<uint8_t> token_;
-    raw_ptr<base::WaitableEvent> event_;
-    url::SchemeHostPort scheme_host_port_;
-};
-
-extern "C" {
-
-// Глобальные объекты жизненного цикла
-static base::AtExitManager* g_exit_manager = nullptr;
-static base::Thread* g_io_thread = nullptr;
-
-// Добавляем глобальный стейт безопасности транспорта
-static base::NoDestructor<net::TransportSecurityState> g_transport_security_state;
-
-#if BUILDFLAG(IS_POSIX)
-// КРИТИЧНО: Явный наблюдатель за дескрипторами для POSIX.
-// Без него FileDescriptorWatcher::WatchReadable падает с SIGSEGV.
-static base::FileDescriptorWatcher* g_file_descriptor_watcher = nullptr;
-#endif
-
-// Единая функция инициализации (вызывается из Go)
-EIDOLON_EXPORT void eidolon_init() {
-    // 0. Инициализация командной строки (критично для сетевого стека Chromium)
-    if (!base::CommandLine::InitializedForCurrentProcess()) {
-        base::CommandLine::Init(0, nullptr);
-    }
-
-    if (!g_exit_manager) {
-        // 1. Инициализация менеджера очистки
-        g_exit_manager = new base::AtExitManager();
-
-        // 2. Инициализация пула потоков Chromium (необходим для внутренних нужд движка)
-        base::ThreadPoolInstance::CreateAndStartWithDefaultParams("Eidolon_ThreadPool");
-
-        // 3. Создаем наш выделенный IO-поток для работы с сетью
-        g_io_thread = new base::Thread("EidolonIOThread");
-        base::Thread::Options options;
-        options.message_pump_type = base::MessagePumpType::IO;
-        g_io_thread->StartWithOptions(std::move(options));
-
-        // Инициализируем TransportSecurityState (безопасно, так как есть дефолтный конструктор)
-        g_transport_security_state = std::make_unique<net::TransportSecurityState>();
-
-#if BUILDFLAG(IS_POSIX)
-        // 4. ВОТ РЕШЕНИЕ ПРОБЛЕМЫ: явно создаем FileDescriptorWatcher
-        // и указываем ему использовать TaskRunner нашего IO-потока.
-        g_file_descriptor_watcher = new base::FileDescriptorWatcher(
-            g_io_thread->task_runner()
-        );
-#endif
-    }
-}
-
-void EnsureChromiumIOThread() {
-    // Подменяем старый вызов, чтобы гарантировать полную инициализацию
-    // при любых сценариях дозвона
-    eidolon_init();
-}
-
 // -------------------------------------------------------------------------
 // АСИНХРОННАЯ СЕССИЯ (DATA PUMP)
 // -------------------------------------------------------------------------
@@ -369,13 +191,6 @@ struct EidolonSession {
     ~EidolonSession() override {
         Close();
     }
-#else
-    ~EidolonSession() {
-        Close();
-    }
-#endif
-
-#if BUILDFLAG(IS_WIN)
     // События от Windows Sockets
     void OnObjectSignaled(HANDLE object) override {
         if (is_closed_) return;
@@ -395,6 +210,10 @@ struct EidolonSession {
                 socket_watcher_.StartWatchingOnce(socket_event_, this);
             }
         }
+    }
+#else
+    ~EidolonSession() {
+        Close();
     }
 #endif
 
@@ -593,6 +412,128 @@ struct EidolonSession {
 };
 
 // -------------------------------------------------------------------------
+// ХЕЛПЕР ДЛЯ АСИНХРОННОГО ДОЗВОНА QUIC (Без блокировок)
+// -------------------------------------------------------------------------
+class QUICDialHelper {
+public:
+    static void Start(EidolonSession* sess, const std::string& host, uint16_t port, const std::vector<uint8_t>& token, base::WaitableEvent* event) {
+        auto* dialer = new QUICDialHelper(sess, host, port, token, event);
+        dialer->Run();
+    }
+
+private:
+    QUICDialHelper(EidolonSession* sess, const std::string& host, uint16_t port, const std::vector<uint8_t>& token, base::WaitableEvent* event)
+            : sess_(sess), host_(host), port_(port), token_(token), event_(event), scheme_host_port_("https", host, port) {}
+
+    void Run() {
+        net::URLRequestContextBuilder builder;
+        builder.DisableHttpCache();
+
+        builder.set_proxy_config_service(
+                std::make_unique<net::ProxyConfigServiceFixed>(
+                        net::ProxyConfigWithAnnotation::CreateDirect()
+                )
+        );
+
+        builder.SetCertVerifier(
+                std::make_unique<EidolonCertVerifier>(net::CertVerifier::CreateDefault(nullptr))
+        );
+
+        auto quic_context = std::make_unique<net::QuicContext>();
+        quic_context->params()->supported_versions = net::DefaultSupportedQuicVersions();
+
+        builder.SetSpdyAndQuicEnabled(false, true);
+        builder.set_quic_context(std::move(quic_context));
+        sess_->url_context = builder.Build();
+
+        net::HttpNetworkSession* http_session = sess_->url_context->http_transaction_factory()->GetSession();
+        net::QuicSessionPool* quic_pool = http_session->quic_session_pool();
+
+        net::HostPortPair host_port(host_, port_);
+
+        net::IPAddress ip;
+        if (!ip.AssignFromIPLiteral(host_)) { Finish(false); return; }
+
+        net::QuicSessionKey session_key(
+                host_port, net::PRIVACY_MODE_DISABLED, net::ProxyChain::Direct(),
+                net::SessionUsage::kDestination, net::SocketTag(),
+                net::NetworkAnonymizationKey(), net::SecureDnsPolicy::kAllow,
+                false, false, net::handles::kInvalidNetworkHandle);
+
+        net::QuicEndpoint quic_endpoint(
+                net::DefaultSupportedQuicVersions().front(),
+                net::IPEndPoint(ip, port_),
+                net::ConnectionEndpointMetadata());
+
+        sess_->quic_attempt = quic_pool->CreateSessionAttempt(
+                nullptr, session_key, quic_endpoint, 0,
+                base::TimeTicks::Now(), base::TimeTicks::Now(),
+                std::nullopt, false, {},
+                net::MultiplexedSessionCreationInitiator::kUnknown, std::nullopt);
+
+        // 1. Старт хендшейка (учитываем синхронное завершение)
+        int rv = sess_->quic_attempt->Start(base::BindOnce(&QUICDialHelper::OnSessionAttemptComplete, base::Unretained(this)));
+        if (rv != net::ERR_IO_PENDING) OnSessionAttemptComplete(rv);
+    }
+
+    void OnSessionAttemptComplete(int rv) {
+        if (rv != net::OK || !sess_->quic_attempt->session()) {
+            Finish(false); return;
+        }
+
+        sess_->quic_session_handle = sess_->quic_attempt->session()->CreateHandle(std::move(scheme_host_port_));
+        if (!sess_->quic_session_handle || !sess_->quic_session_handle->IsConnected()) {
+            Finish(false); return;
+        }
+
+        // 2. Запрос стрима (учитываем синхронное завершение)
+        int stream_rv = sess_->quic_session_handle->RequestStream(
+                true,
+                base::BindOnce(&QUICDialHelper::OnStreamRequested, base::Unretained(this)),
+                TRAFFIC_ANNOTATION_FOR_TESTS);
+
+        if (stream_rv != net::ERR_IO_PENDING) OnStreamRequested(stream_rv);
+    }
+
+    void OnStreamRequested(int rv) {
+        if (rv != net::OK) {
+            Finish(false); return;
+        }
+
+        sess_->quic_stream_handle = sess_->quic_session_handle->ReleaseStream();
+
+        quiche::HttpHeaderBlock headers;
+        headers[":method"] = "CONNECT";
+        headers[":authority"] = host_ + ":" + std::to_string(port_);
+        headers[":scheme"] = "https";
+        headers["user-agent"] = version_info::GetProductNameAndVersionForUserAgent();
+        headers["x-eidolon-token"] = base::HexEncode(token_);
+        headers["padding"] = std::string(32, '0');
+
+        sess_->quic_stream_handle->WriteHeaders(std::move(headers), false, nullptr);
+
+        Finish(true);
+    }
+
+    void Finish(bool success) {
+        if (success) {
+            sess_->StartPump();
+        } else {
+            sess_->Close();
+        }
+        event_->Signal();
+        delete this;
+    }
+
+    raw_ptr<EidolonSession> sess_;
+    std::string host_;
+    uint16_t port_;
+    std::vector<uint8_t> token_;
+    raw_ptr<base::WaitableEvent> event_;
+    url::SchemeHostPort scheme_host_port_;
+};
+
+// -------------------------------------------------------------------------
 // ХЕЛПЕР ДЛЯ АСИНХРОННОГО ДОЗВОНА TCP (Без блокировок)
 // -------------------------------------------------------------------------
 class TCPDialHelper {
@@ -617,38 +558,6 @@ private:
         if (rv != net::ERR_IO_PENDING) OnTcpConnected(rv);
     }
 
-//    void OnTcpConnected(int rv) {
-//        if (rv != net::OK) { Finish(false); return; }
-//
-//        net::SSLConfig ssl_config;
-//        ssl_config.eidolon_active = true;
-//
-//        size_t copy_len = std::min(token_.size(), static_cast<size_t>(32));
-//        UNSAFE_BUFFERS(base::span<uint8_t>(ssl_config.eidolon_token)).copy_from(
-//                UNSAFE_BUFFERS(base::span<const uint8_t>(token_.data(), copy_len)));
-//
-//        // 1. Убеждаемся, что верификатор создан
-//        if (!sess_->cert_verifier) {
-//            sess_->cert_verifier = net::CertVerifier::CreateDefault(nullptr);
-//        }
-//
-//        // Внедряем g_transport_security_state.get() третьим аргументом!
-//        // Остальные (SSLConfigService, SSLClientSessionCache, SCTAuditingDelegate)
-//        // можно смело оставлять nullptr, движок это допускает.
-//        sess_->ssl_context = std::make_unique<net::SSLClientContext>(
-//                /* ssl_config_service = */ nullptr,
-//                sess_->cert_verifier.get(),
-//                g_transport_security_state.get(),
-//                /* ssl_client_session_cache = */ nullptr,
-//                /* sct_auditing_delegate = */ nullptr);
-//
-//
-//        sess_->tcp_socket = std::make_unique<net::SSLClientSocketImpl>(
-//                sess_->ssl_context.get(), std::move(raw_socket_), net::HostPortPair(host_, port_), ssl_config);
-//
-//        rv = sess_->tcp_socket->Connect(base::BindOnce(&TCPDialHelper::OnSslConnected, base::Unretained(this)));
-//        if (rv != net::ERR_IO_PENDING) OnSslConnected(rv);
-//    }
     void OnTcpConnected(int rv) {
         if (rv != net::OK) { Finish(false); return; }
 
@@ -657,9 +566,6 @@ private:
         builder.DisableHttpCache();
 
         // Явно отключаем поиск системных прокси (PAC/WPAD)
-//        builder.set_proxy_resolution_service(
-//                net::ConfiguredProxyResolutionService::CreateDirect()
-//        );
         // Явно отключаем прокси через фиксированный конфиг, чтобы не падали DCHECK при ошибках SSL
         builder.set_proxy_config_service(
                 std::make_unique<net::ProxyConfigServiceFixed>(
@@ -727,6 +633,58 @@ private:
 // C-API (ДЛЯ GOLANG)
 // -------------------------------------------------------------------------
 
+extern "C" {
+
+// Глобальные объекты жизненного цикла
+static base::AtExitManager* g_exit_manager = nullptr;
+static base::Thread* g_io_thread = nullptr;
+
+// Добавляем глобальный стейт безопасности транспорта
+static base::NoDestructor<net::TransportSecurityState> g_transport_security_state;
+
+#if BUILDFLAG(IS_POSIX)
+// КРИТИЧНО: Явный наблюдатель за дескрипторами для POSIX.
+// Без него FileDescriptorWatcher::WatchReadable падает с SIGSEGV.
+static base::FileDescriptorWatcher* g_file_descriptor_watcher = nullptr;
+#endif
+
+// Единая функция инициализации (вызывается из Go)
+EIDOLON_EXPORT void eidolon_init() {
+    // 0. Инициализация командной строки (критично для сетевого стека Chromium)
+    if (!base::CommandLine::InitializedForCurrentProcess()) {
+        base::CommandLine::Init(0, nullptr);
+    }
+
+    if (!g_exit_manager) {
+        // 1. Инициализация менеджера очистки
+        g_exit_manager = new base::AtExitManager();
+
+        // 2. Инициализация пула потоков Chromium (необходим для внутренних нужд движка)
+        base::ThreadPoolInstance::CreateAndStartWithDefaultParams("Eidolon_ThreadPool");
+
+        // 3. Создаем наш выделенный IO-поток для работы с сетью
+        g_io_thread = new base::Thread("EidolonIOThread");
+        base::Thread::Options options;
+        options.message_pump_type = base::MessagePumpType::IO;
+        g_io_thread->StartWithOptions(std::move(options));
+
+        // Инициализируем TransportSecurityState (безопасно, так как есть дефолтный конструктор)
+#if BUILDFLAG(IS_POSIX)
+        // 4. ВОТ РЕШЕНИЕ ПРОБЛЕМЫ: явно создаем FileDescriptorWatcher
+        // и указываем ему использовать TaskRunner нашего IO-потока.
+        g_file_descriptor_watcher = new base::FileDescriptorWatcher(
+            g_io_thread->task_runner()
+        );
+#endif
+    }
+}
+
+void EnsureChromiumIOThread() {
+    // Подменяем старый вызов, чтобы гарантировать полную инициализацию
+    // при любых сценариях дозвона
+    eidolon_init();
+}
+
 EIDOLON_EXPORT EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd) {
     EnsureChromiumIOThread();
 
@@ -776,46 +734,46 @@ EIDOLON_EXPORT EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, 
 }
 
 EIDOLON_EXPORT int eidolon_export_key(EidolonHandle handle, uint8_t* out_key, size_t key_len) {
-    if (!handle || key_len != 32) return -1;
-    auto* session = static_cast<EidolonSession*>(handle);
+if (!handle || key_len != 32) return -1;
+auto* session = static_cast<EidolonSession*>(handle);
 
-    int result = -1;
-    base::WaitableEvent event(base::WaitableEvent::ResetPolicy::MANUAL, base::WaitableEvent::InitialState::NOT_SIGNALED);
+int result = -1;
+base::WaitableEvent event(base::WaitableEvent::ResetPolicy::MANUAL, base::WaitableEvent::InitialState::NOT_SIGNALED);
 
-    // Выполнение строго в IO-потоке, чтобы исключить Data Race с помпой
-    g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
-            EidolonSession* s, uint8_t* key, size_t len, int* res, base::WaitableEvent* ev) {
+// Выполнение строго в IO-потоке, чтобы исключить Data Race с помпой
+g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
+        EidolonSession* s, uint8_t* key, size_t len, int* res, base::WaitableEvent* ev) {
 
-        if (s->is_quic_) {
-            if (s->quic_session_handle && s->quic_session_handle->ExportKeyingMaterial("eidolon-traffic-key", "", key, len)) {
+    if (s->is_quic_) {
+        if (s->quic_session_handle && s->quic_session_handle->ExportKeyingMaterial("eidolon-traffic-key", "", key, len)) {
+            *res = 0;
+        }
+    } else {
+        auto* ssl_socket = static_cast<net::SSLClientSocketImpl*>(s->tcp_socket.get());
+        if (ssl_socket && ssl_socket->GetSSL()) {
+            if (SSL_export_keying_material(ssl_socket->GetSSL(), key, len, "eidolon-traffic-key", 19, nullptr, 0, 0) == 1) {
                 *res = 0;
             }
-        } else {
-            auto* ssl_socket = static_cast<net::SSLClientSocketImpl*>(s->tcp_socket.get());
-            if (ssl_socket && ssl_socket->GetSSL()) {
-                if (SSL_export_keying_material(ssl_socket->GetSSL(), key, len, "eidolon-traffic-key", 19, nullptr, 0, 0) == 1) {
-                    *res = 0;
-                }
-            }
         }
-        ev->Signal();
-    }, session, out_key, key_len, &result, &event));
+    }
+    ev->Signal();
+}, session, out_key, key_len, &result, &event));
 
-    event.Wait();
-    return result;
+event.Wait();
+return result;
 }
 
 EIDOLON_EXPORT void eidolon_close(EidolonHandle handle) {
-    if (!handle) return;
-    auto* session = static_cast<EidolonSession*>(handle);
+if (!handle) return;
+auto* session = static_cast<EidolonSession*>(handle);
 
-    if (g_io_thread) {
-        g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](EidolonSession* s) {
-            delete s; // Деструктор автоматически вызовет Close()
-        }, session));
-    } else {
-        delete session;
-    }
+if (g_io_thread) {
+g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](EidolonSession* s) {
+    delete s; // Деструктор автоматически вызовет Close()
+}, session));
+} else {
+delete session;
+}
 }
 
 } // extern "C"
