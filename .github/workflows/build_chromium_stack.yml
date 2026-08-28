@@ -102,6 +102,7 @@ jobs:
       CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
     steps:
       - name: Enable Git symlinks
+        working-directory: .
         run: git config --global core.symlinks true
       - uses: actions/checkout@v4
       - name: Setup workspace
@@ -320,6 +321,7 @@ jobs:
       BUNDLE: eidolon-${{ github.event.release.tag_name || 'dev' }}-${{ github.job }}-${{ matrix.arch }}
     steps:
       - name: Enable Git symlinks
+        working-directory: .
         run: git config --global core.symlinks true
       - uses: actions/checkout@v4
       - name: Setup workspace
