@@ -486,11 +486,7 @@ private:
         );
 
         builder.SetCertVerifier(
-                std::make_unique<EidolonCertVerifier>(
-                        net::CertVerifier::CreateDefault(
-                                net::CertVerifyProc::CreateSystemVerifyProc(nullptr)
-                        )
-                )
+                std::make_unique<EidolonCertVerifier>(net::CertVerifier::CreateDefault(nullptr))
         );
 
         auto quic_context = std::make_unique<net::QuicContext>();
@@ -632,11 +628,7 @@ private:
 
         // Внедряем наш кастомный верификатор
         builder.SetCertVerifier(
-                std::make_unique<EidolonCertVerifier>(
-                        net::CertVerifier::CreateDefault(
-                                net::CertVerifyProc::CreateSystemVerifyProc(nullptr)
-                        )
-                )
+                std::make_unique<EidolonCertVerifier>(net::CertVerifier::CreateDefault(nullptr))
         );
 
         // Сохраняем контекст в сессии, чтобы он жил всё время соединения
