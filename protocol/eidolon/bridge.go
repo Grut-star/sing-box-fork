@@ -114,6 +114,59 @@ func dialNative(ctx context.Context, host string, port int, token []byte, isQUIC
 	}
 }
 
+func ListenNativeQUIC(ctx context.Context, host string, port int, secret []byte, onAccept func(net.Conn, []byte, []byte)) error {
+	localListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+
+	go func() {
+		for {
+			conn, err := localListener.Accept()
+			if err != nil {
+				return
+			}
+
+			// Читаем: 32 (Token) + 32 (SessionKey) + 16 (FlowID) = 80 байт
+			meta := make([]byte, 80)
+			if _, err := io.ReadFull(conn, meta); err == nil {
+				token := meta[:32]
+				sessionKey := meta[32:64]
+				flowID := meta[64:]
+
+				// БЕСКОМПРОМИССНАЯ БЕЗОПАСНОСТЬ: Проверяем токен в Go
+				if !ValidateTokenConstantTime(string(secret), token, nil) {
+					conn.Close() // C++ мост поймает разрыв TCP и аппаратно сбросит QUIC Stream
+					continue
+				}
+
+				go onAccept(conn, sessionKey, flowID)
+			} else {
+				conn.Close()
+			}
+		}
+	}()
+
+	localPort := localListener.Addr().(*net.TCPAddr).Port
+	cHost := C.CString(host)
+	defer C.free(unsafe.Pointer(cHost))
+	cSecret := (*C.uint8_t)(unsafe.Pointer(&secret[0]))
+
+	handle := C.eidolon_listen_quic(cHost, C.uint16_t(port), cSecret, C.size_t(len(secret)), C.uintptr_t(localPort))
+	if handle == nil {
+		localListener.Close()
+		return errors.New("failed to start native QUIC listener in C++")
+	}
+
+	go func() {
+		<-ctx.Done()
+		C.eidolon_close(handle)
+		localListener.Close()
+	}()
+
+	return nil
+}
+
 // ExportKeyingMaterial запрашивает 32 байта ключа для TLS Exporter из C++
 func (c *NativeStackConn) ExportKeyingMaterial() ([]byte, error) {
 	key := make([]byte, 32)

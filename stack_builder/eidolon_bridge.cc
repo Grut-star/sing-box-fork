@@ -75,6 +75,15 @@ typedef SSIZE_T ssize_t;
 #include "net/proxy_resolution/proxy_config_service_fixed.h"
 #include "net/proxy_resolution/proxy_config_with_annotation.h"
 
+#include "net/quic/crypto/proof_source_chromium.h"
+#include "quiche/quic/tools/quic_simple_server_backend.h"
+#include "quiche/quic/tools/quic_memory_cache_backend.h"
+#include "quiche/quic/tools/quic_server.h"
+#include "quiche/quic/tools/quic_simple_dispatcher.h"
+#include "quiche/quic/tools/quic_simple_server_session.h"
+#include "quiche/quic/tools/quic_simple_server_stream.h"
+#include "base/task/thread_pool.h"
+
 class EidolonCertVerifier : public net::CertVerifier {
 public:
     explicit EidolonCertVerifier(std::unique_ptr<net::CertVerifier> default_verifier)
@@ -433,7 +442,7 @@ struct EidolonSession {
 // -------------------------------------------------------------------------
 // ХЕЛПЕР ДЛЯ АСИНХРОННОГО ДОЗВОНА QUIC (Без блокировок)
 // -------------------------------------------------------------------------
-class QUICDialHelper {
+class QUICDialHelper : public net::QuicSessionAttempt::Delegate {
 public:
     static void Start(EidolonSession* sess, const std::string& host, uint16_t port, const std::vector<uint8_t>& token, base::WaitableEvent* event) {
         auto* dialer = new QUICDialHelper(sess, host, port, token, event);
@@ -485,7 +494,7 @@ private:
                 net::ConnectionEndpointMetadata());
 
         sess_->quic_attempt = quic_pool->CreateSessionAttempt(
-                nullptr, session_key, quic_endpoint, 0,
+                this, session_key, quic_endpoint, 0,
                 base::TimeTicks::Now(), base::TimeTicks::Now(),
                 std::nullopt, false, {},
                 net::MultiplexedSessionCreationInitiator::kUnknown, std::nullopt);
@@ -648,84 +657,332 @@ private:
     std::unique_ptr<net::StreamSocket> raw_socket_;
 };
 
+class EidolonServerStream;
+
+class BidirectionalPump : public base::RefCountedThreadSafe<BidirectionalPump> {
+public:
+    BidirectionalPump(EidolonServerStream* quic_stream, scoped_refptr<base::SingleThreadTaskRunner> quic_runner)
+            : quic_stream_(quic_stream), quic_runner_(std::move(quic_runner)),
+              read_buf_(base::MakeRefCounted<net::IOBufferWithSize>(65536)) {}
+
+    // Вызывается строго на g_io_thread
+    void ConnectTCP(uint16_t cb_port, std::string token, std::string session_key, std::string flow_id) {
+        net::IPAddress ip;
+        ip.AssignFromIPLiteral("127.0.0.1");
+
+        tcp_socket_ = std::make_unique<net::TCPClientSocket>(
+                net::AddressList(net::IPEndPoint(ip, cb_port)), nullptr, nullptr, nullptr, net::NetLogSource(), net::handles::kInvalidNetworkHandle);
+
+        int rv = tcp_socket_->Connect(base::BindOnce(&BidirectionalPump::OnTCPConnect, base::RetainedRef(this), token, session_key, flow_id));
+        if (rv != net::ERR_IO_PENDING) OnTCPConnect(token, session_key, flow_id, rv);
+    }
+
+    // Вызывается на QUIC-потоке
+    void WriteToTCP(std::string_view data) {
+        g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](scoped_refptr<BidirectionalPump> self, std::string d) {
+            if (!self->tcp_socket_) return;
+            auto io_buf = base::MakeRefCounted<net::StringIOBuffer>(d);
+            self->tcp_socket_->Write(io_buf.get(), d.size(), base::BindOnce([](int){}), net::TRAFFIC_ANNOTATION_FOR_TESTS);
+        }, base::RetainedRef(this), std::string(data)));
+    }
+
+    // Вызывается деструктором EidolonServerStream
+    void DetachQUIC() {
+        base::AutoLock lock(quic_lock_);
+        quic_stream_ = nullptr;
+    }
+
+private:
+    friend class base::RefCountedThreadSafe<BidirectionalPump>;
+    ~BidirectionalPump() = default;
+
+    void OnTCPConnect(std::string token, std::string session_key, std::string flow_id, int rv) {
+        if (rv != net::OK) return;
+        // Передаем в Go: Токен (32) + Ключ (32) + FlowID (16) = 80 байт
+        std::string meta = token + session_key + flow_id;
+        auto io_buf = base::MakeRefCounted<net::StringIOBuffer>(meta);
+        tcp_socket_->Write(io_buf.get(), meta.size(), base::BindOnce([](int){}), net::TRAFFIC_ANNOTATION_FOR_TESTS);
+        PumpTCPToQUIC();
+    }
+
+    void PumpTCPToQUIC() {
+        if (!tcp_socket_) return;
+        int rv = tcp_socket_->Read(read_buf_.get(), read_buf_->size(),
+                                   base::BindOnce(&BidirectionalPump::OnTCPRead, base::RetainedRef(this)));
+        if (rv != net::ERR_IO_PENDING) OnTCPRead(rv);
+    }
+
+    void OnTCPRead(int rv) {
+        if (rv <= 0) {
+            tcp_socket_.reset();
+            quic_runner_->PostTask(FROM_HERE, base::BindOnce([](scoped_refptr<BidirectionalPump> self) {
+                base::AutoLock lock(self->quic_lock_);
+                if (self->quic_stream_) {
+                    self->quic_stream_->Reset(quic::QUIC_STREAM_CANCELLED);
+                }
+            }, base::RetainedRef(this)));
+            return;
+        }
+
+        quic_runner_->PostTask(FROM_HERE, base::BindOnce([](scoped_refptr<BidirectionalPump> self, std::string d) {
+            base::AutoLock lock(self->quic_lock_);
+            if (self->quic_stream_) {
+                self->quic_stream_->WriteOrBufferBody(d, false);
+            }
+        }, base::RetainedRef(this), std::string(read_buf_->data(), rv)));
+
+        PumpTCPToQUIC();
+    }
+
+    base::Lock quic_lock_;
+    raw_ptr<EidolonServerStream> quic_stream_;
+    scoped_refptr<base::SingleThreadTaskRunner> quic_runner_;
+    std::unique_ptr<net::StreamSocket> tcp_socket_;
+    scoped_refptr<net::IOBufferWithSize> read_buf_;
+};
+
+class EidolonServerStream : public quic::QuicSpdyStream {
+public:
+    EidolonServerStream(quic::QuicStreamId id, quic::QuicSpdySession* session, uint16_t cb_port)
+            : quic::QuicSpdyStream(id, session, quic::BIDIRECTIONAL), cb_port_(cb_port) {}
+
+    ~EidolonServerStream() override {
+        if (pump_) pump_->DetachQUIC();
+    }
+
+    void OnInitialHeadersComplete(bool fin, size_t frame_len, const quic::QuicHeaderList& header_list) override {
+        quic::QuicSpdyStream::OnInitialHeadersComplete(fin, frame_len, header_list);
+        quiche::HttpHeaderBlock response_headers;
+        response_headers[":status"] = "200";
+        WriteHeaders(std::move(response_headers), false, nullptr);
+    }
+
+    void OnBodyAvailable() override {
+        while (sequencer()->HasBytesToRead()) {
+            struct iovec iov;
+            if (sequencer()->GetReadableRegions(&iov, 1) == 0) break;
+            std::string_view data(static_cast<const char*>(iov.iov_base), iov.iov_len);
+
+            if (!flow_id_read_) {
+                buffer_.append(data);
+                sequencer()->MarkConsumed(iov.iov_len);
+
+                if (buffer_.size() >= 50) {
+                    uint16_t pad_len = (static_cast<uint8_t>(buffer_[48]) << 8) | static_cast<uint8_t>(buffer_[49]);
+                    if (buffer_.size() >= 50u + pad_len) {
+                        std::string token = buffer_.substr(0, 32);
+                        std::string flow_id = buffer_.substr(32, 16);
+                        flow_id_read_ = true;
+
+                        uint8_t key[32] = {0};
+                        if (session()->GetCryptoStream()) {
+                            std::string exported;
+                            if (session()->GetCryptoStream()->ExportKeyingMaterial("eidolon-traffic-key", "", 32, &exported)) {
+                                memcpy(key, exported.data(), 32);
+                            }
+                        }
+
+                        ForwardToGo(token, std::string((char*)key, 32), flow_id);
+
+                        if (buffer_.size() > 50u + pad_len) {
+                            if (pump_) pump_->WriteToTCP(buffer_.substr(50 + pad_len));
+                            else leftover_data_ = buffer_.substr(50 + pad_len);
+                        }
+                        buffer_.clear();
+                    }
+                }
+            } else {
+                if (pump_) pump_->WriteToTCP(data);
+                else leftover_data_.append(data);
+                sequencer()->MarkConsumed(iov.iov_len);
+            }
+        }
+        if (sequencer()->IsClosed()) OnFinRead();
+    }
+
+private:
+    void ForwardToGo(const std::string& token, const std::string& session_key, const std::string& flow_id) {
+        pump_ = base::MakeRefCounted<BidirectionalPump>(this, base::SingleThreadTaskRunner::GetCurrentDefault());
+        g_io_thread->task_runner()->PostTask(FROM_HERE,
+                                             base::BindOnce(&BidirectionalPump::ConnectTCP, pump_, cb_port_, token, session_key, flow_id));
+
+        if (!leftover_data_.empty()) {
+            pump_->WriteToTCP(leftover_data_);
+            leftover_data_.clear();
+        }
+    }
+
+    uint16_t cb_port_;
+    bool flow_id_read_ = false;
+    std::string buffer_;
+    std::string leftover_data_;
+    scoped_refptr<BidirectionalPump> pump_;
+};
+
+class EidolonServerSession : public quic::QuicSimpleServerSession {
+public:
+    EidolonServerSession(const quic::QuicConfig& config, const quic::ParsedQuicVersionVector& supported_versions,
+                         quic::QuicConnection* connection, quic::QuicSession::Visitor* visitor,
+                         quic::QuicCryptoServerStreamBase::Helper* helper, const quic::QuicCryptoServerConfig* crypto_config,
+                         quic::QuicCompressedCertsCache* compressed_certs_cache, quic::QuicSimpleServerBackend* backend,
+                         uint16_t cb_port)
+            : quic::QuicSimpleServerSession(config, supported_versions, connection, visitor, helper, crypto_config, compressed_certs_cache, backend),
+              cb_port_(cb_port) {}
+
+protected:
+    quic::QuicSpdyStream* CreateIncomingStream(quic::QuicStreamId id) override {
+        if (!ShouldCreateIncomingStream(id)) return nullptr;
+        auto* stream = new EidolonServerStream(id, this, cb_port_);
+        ActivateStream(absl::WrapUnique(stream));
+        return stream;
+    }
+private:
+    uint16_t cb_port_;
+};
+
+class EidolonDispatcher : public quic::QuicSimpleDispatcher {
+public:
+    EidolonDispatcher(const quic::QuicConfig* config, const quic::QuicCryptoServerConfig* crypto_config,
+                      quic::QuicVersionManager* version_manager, std::unique_ptr<quic::QuicConnectionHelperInterface> helper,
+                      std::unique_ptr<quic::QuicCryptoServerStreamBase::Helper> session_helper,
+                      std::unique_ptr<quic::QuicAlarmFactory> alarm_factory, quic::QuicSimpleServerBackend* backend,
+                      uint8_t expected_server_connection_id_length, quic::ConnectionIdGeneratorInterface& generator,
+                      uint16_t cb_port)
+            : quic::QuicSimpleDispatcher(config, crypto_config, version_manager, std::move(helper), std::move(session_helper),
+                                         std::move(alarm_factory), backend, expected_server_connection_id_length, generator),
+              cb_port_(cb_port) {}
+
+protected:
+    std::unique_ptr<quic::QuicSession> CreateQuicSession(
+            quic::QuicConnectionId connection_id, const quic::QuicSocketAddress& self_address,
+            const quic::QuicSocketAddress& peer_address, absl::string_view alpn,
+            const quic::ParsedQuicVersion& version, const quic::ParsedClientHello& parsed_chlo,
+            quic::ConnectionIdGeneratorInterface& connection_id_generator) override {
+
+        quic::QuicConnection* connection = new quic::QuicConnection(
+                connection_id, self_address, peer_address, helper(), alarm_factory(), writer(),
+                false, quic::Perspective::IS_SERVER, {version}, connection_id_generator);
+
+        auto session = std::make_unique<EidolonServerSession>(
+                config(), GetSupportedVersions(), connection, this, session_helper(),
+                crypto_config(), compressed_certs_cache(), server_backend(), cb_port_);
+        session->Initialize();
+        return session;
+    }
+private:
+    uint16_t cb_port_;
+};
+
+class EidolonServer : public quic::QuicServer {
+public:
+    EidolonServer(std::unique_ptr<quic::ProofSource> proof_source, quic::QuicSimpleServerBackend* backend, uint16_t cb_port)
+            : quic::QuicServer(std::move(proof_source), nullptr, backend), cb_port_(cb_port) {}
+
+protected:
+    quic::QuicDispatcher* CreateQuicDispatcher() override {
+        return new EidolonDispatcher(
+                &config(), &crypto_config(), version_manager(),
+                std::make_unique<quic::QuicDefaultConnectionHelper>(),
+                std::make_unique<quic::QuicSimpleCryptoServerStreamHelper>(),
+                event_loop()->CreateAlarmFactory(), server_backend(),
+                expected_server_connection_id_length(), connection_id_generator(), cb_port_);
+    }
+private:
+    uint16_t cb_port_;
+};
+
+class QUICListenHelper {
+public:
+    static void Start(const std::string& host, uint16_t port, uint16_t cb_port) {
+        auto* listener = new QUICListenHelper(host, port, cb_port);
+        base::ThreadPool::PostTask(FROM_HERE, {base::MayBlock()},
+                                   base::BindOnce(&QUICListenHelper::Run, base::Unretained(listener)));
+    }
+
+private:
+    QUICListenHelper(const std::string& host, uint16_t port, uint16_t cb_port)
+            : host_(host), port_(port), cb_port_(cb_port) {}
+
+    void Run() {
+        backend_ = std::make_unique<quic::QuicMemoryCacheBackend>();
+
+        auto proof_source = std::make_unique<net::ProofSourceChromium>();
+        // ВАЖНО: Инициализация сертификатов, иначе Chromium аппаратно сбросит ClientHello[cite: 5, 6]
+        proof_source->Initialize(
+                base::FilePath("cert.pem"),
+                base::FilePath("key.pem"),
+                base::FilePath(""));
+
+        server_ = std::make_unique<EidolonServer>(std::move(proof_source), backend_.get(), cb_port_);
+
+        quic::QuicIpAddress ip;
+        ip.FromString(host_);
+        quic::QuicSocketAddress address(ip, port_);
+
+        if (server_->CreateUDPSocketAndListen(address)) {
+            server_->HandleEventsForever();
+        }
+        delete this;
+    }
+
+    std::unique_ptr<quic::QuicMemoryCacheBackend> backend_;
+    std::unique_ptr<EidolonServer> server_;
+    std::string host_;
+    uint16_t port_;
+    uint16_t cb_port_;
+};
+
 // -------------------------------------------------------------------------
 // C-API (ДЛЯ GOLANG)
 // -------------------------------------------------------------------------
 
 extern "C" {
 
-// Глобальные объекты жизненного цикла
 static base::AtExitManager* g_exit_manager = nullptr;
 static base::Thread* g_io_thread = nullptr;
-
-// Добавляем глобальный стейт безопасности транспорта
 static base::NoDestructor<net::TransportSecurityState> g_transport_security_state;
 
 #if BUILDFLAG(IS_POSIX)
-// КРИТИЧНО: Явный наблюдатель за дескрипторами для POSIX.
-// Без него FileDescriptorWatcher::WatchReadable падает с SIGSEGV.
 static base::FileDescriptorWatcher* g_file_descriptor_watcher = nullptr;
 #endif
 
-// Единая функция инициализации (вызывается из Go)
 EIDOLON_EXPORT void eidolon_init() {
-    // 0. Инициализация командной строки (критично для сетевого стека Chromium)
     if (!base::CommandLine::InitializedForCurrentProcess()) {
         base::CommandLine::Init(0, nullptr);
     }
-
     if (!g_exit_manager) {
-        // 1. Инициализация менеджера очистки
         g_exit_manager = new base::AtExitManager();
-
-        // 2. Инициализация пула потоков Chromium (необходим для внутренних нужд движка)
         base::ThreadPoolInstance::CreateAndStartWithDefaultParams("Eidolon_ThreadPool");
-
-        // 3. Создаем наш выделенный IO-поток для работы с сетью
         g_io_thread = new base::Thread("EidolonIOThread");
         base::Thread::Options options;
         options.message_pump_type = base::MessagePumpType::IO;
         g_io_thread->StartWithOptions(std::move(options));
 
-        // Инициализируем TransportSecurityState (безопасно, так как есть дефолтный конструктор)
 #if BUILDFLAG(IS_POSIX)
-        // 4. ВОТ РЕШЕНИЕ ПРОБЛЕМЫ: явно создаем FileDescriptorWatcher
-        // и указываем ему использовать TaskRunner нашего IO-потока.
-        g_file_descriptor_watcher = new base::FileDescriptorWatcher(
-            g_io_thread->task_runner()
-        );
+        g_file_descriptor_watcher = new base::FileDescriptorWatcher(g_io_thread->task_runner());
 #endif
     }
 }
 
 void EnsureChromiumIOThread() {
-    // Подменяем старый вызов, чтобы гарантировать полную инициализацию
-    // при любых сценариях дозвона
     eidolon_init();
 }
 
 EIDOLON_EXPORT EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd) {
     EnsureChromiumIOThread();
-
     auto session = std::make_unique<EidolonSession>(data_fd, false);
     std::string target_host(host);
     auto safe_span = UNSAFE_BUFFERS(base::span<const uint8_t>(token, token_len));
     std::vector<uint8_t> token_vec(safe_span.begin(), safe_span.end());
+    base::WaitableEvent connect_event(base::WaitableEvent::ResetPolicy::MANUAL, base::WaitableEvent::InitialState::NOT_SIGNALED);
 
-    base::WaitableEvent connect_event(base::WaitableEvent::ResetPolicy::MANUAL,
-                                      base::WaitableEvent::InitialState::NOT_SIGNALED);
-
-    // Дозвон происходит полностью в IO-потоке
     g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
             EidolonSession* sess, std::string host_str, uint16_t port_num, std::vector<uint8_t> tok, base::WaitableEvent* event) {
         TCPDialHelper::Start(sess, host_str, port_num, tok, event);
     }, session.get(), target_host, port, token_vec, &connect_event));
 
-    // Блокируем Go-горутину (это нормально, CGO вызов вернется после хендшейка)
     connect_event.Wait();
-
     if (session->is_closed_) {
-        // PREVENT MAIN THREAD CRASH: Delete URLRequestContext on IO Thread
         auto* s_ptr = session.release();
         g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](EidolonSession* s) { delete s; }, s_ptr));
         return nullptr;
@@ -735,26 +992,18 @@ EIDOLON_EXPORT EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, c
 
 EIDOLON_EXPORT EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd) {
     EnsureChromiumIOThread();
-
     auto session = std::make_unique<EidolonSession>(data_fd, true);
     std::string target_host(host);
-
-    // 1. Преобразуем сырой токен в вектор для безопасной передачи
     std::vector<uint8_t> token_vec(token, token + token_len);
+    base::WaitableEvent connect_event(base::WaitableEvent::ResetPolicy::MANUAL, base::WaitableEvent::InitialState::NOT_SIGNALED);
 
-    base::WaitableEvent connect_event(base::WaitableEvent::ResetPolicy::MANUAL,
-                                      base::WaitableEvent::InitialState::NOT_SIGNALED);
-
-    // 2. Передаем std::vector<uint8_t> tok в PostTask
     g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
             EidolonSession* sess, std::string host_str, uint16_t port_num, std::vector<uint8_t> tok, base::WaitableEvent* event) {
         QUICDialHelper::Start(sess, host_str, port_num, tok, event);
     }, session.get(), target_host, port, token_vec, &connect_event));
 
     connect_event.Wait();
-
     if (session->is_closed_) {
-        // PREVENT MAIN THREAD CRASH: Delete URLRequestContext on IO Thread
         auto* s_ptr = session.release();
         g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](EidolonSession* s) { delete s; }, s_ptr));
         return nullptr;
@@ -765,14 +1014,11 @@ EIDOLON_EXPORT EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, 
 EIDOLON_EXPORT int eidolon_export_key(EidolonHandle handle, uint8_t* out_key, size_t key_len) {
 if (!handle || key_len != 32) return -1;
 auto* session = static_cast<EidolonSession*>(handle);
-
 int result = -1;
 base::WaitableEvent event(base::WaitableEvent::ResetPolicy::MANUAL, base::WaitableEvent::InitialState::NOT_SIGNALED);
 
-// Выполнение строго в IO-потоке, чтобы исключить Data Race с помпой
 g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
         EidolonSession* s, uint8_t* key, size_t len, int* res, base::WaitableEvent* ev) {
-
     if (s->is_quic_) {
         if (s->quic_session_handle && s->quic_session_handle->ExportKeyingMaterial("eidolon-traffic-key", "", key, len)) {
             *res = 0;
@@ -795,14 +1041,26 @@ return result;
 EIDOLON_EXPORT void eidolon_close(EidolonHandle handle) {
 if (!handle) return;
 auto* session = static_cast<EidolonSession*>(handle);
-
 if (g_io_thread) {
 g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](EidolonSession* s) {
-    delete s; // Деструктор автоматически вызовет Close()
+    delete s;
 }, session));
 } else {
 delete session;
 }
+}
+
+EIDOLON_EXPORT EidolonHandle eidolon_listen_quic(const char* host, uint16_t port, const uint8_t* secret, size_t secret_len, uintptr_t cb_port) {
+    EnsureChromiumIOThread();
+    auto session = std::make_unique<EidolonSession>(0, true);
+    std::string target_host(host);
+
+    g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
+            std::string host_str, uint16_t port_num, uint16_t p) {
+        QUICListenHelper::Start(host_str, port_num, p);
+    }, target_host, port, static_cast<uint16_t>(cb_port)));
+
+    return session.release();
 }
 
 } // extern "C"
