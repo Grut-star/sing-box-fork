@@ -257,6 +257,11 @@ struct EidolonSession {
                     std::string(reinterpret_cast<char*>(temp_buf.data()), bytes_read));
             socket_write_pending_ = true;
 
+#if BUILDFLAG(IS_POSIX)
+            // PREVENT 100% CPU BUSY LOOP: Приостанавливаем опрос FD
+            fd_read_controller_.reset();
+#endif
+
             int rv = 0;
             if (is_quic_) {
                 std::string_view data_sv(write_buf->data(), bytes_read);
@@ -270,11 +275,8 @@ struct EidolonSession {
                         TRAFFIC_ANNOTATION_FOR_TESTS);
             }
 
-            if (rv != net::ERR_IO_PENDING) {
-                OnSocketWriteComplete(rv);
-            }
+            if (rv != net::ERR_IO_PENDING) OnSocketWriteComplete(rv);
         } else if (bytes_read == 0 || (bytes_read < 0 && !is_eagain)) {
-            // Сокет со стороны Go был закрыт (EOF) или произошла фатальная ошибка
             Close();
         }
     }
@@ -285,7 +287,19 @@ struct EidolonSession {
 
         if (rv < 0) {
             Close(); // Ошибка записи в сеть
+            return;
         }
+#if BUILDFLAG(IS_POSIX)
+        // Возобновляем прослушивание FD после того как буфер сети освободился
+        if (!fd_read_controller_) {
+            fd_read_controller_ = base::FileDescriptorWatcher::WatchReadable(
+                    static_cast<int>(data_fd_),
+                    base::BindRepeating(&EidolonSession::OnFdReadable, base::Unretained(this)));
+        }
+#elif BUILDFLAG(IS_WIN)
+        // PREVENT DEADLOCK: Восстанавливаем edge-trigger на Windows
+        OnFdReadable();
+#endif
         // Если сеть готова, OnFdReadable вызовется автоматически nhờ FileDescriptorWatcher / ObjectWatcher
     }
 
@@ -365,12 +379,17 @@ struct EidolonSession {
         } else {
             // Всё записано, выключаем watcher записи и продолжаем читать сеть
             fd_write_controller_.reset();
-            DoSocketRead();
+            // PREVENT STACK OVERFLOW: Разрываем синхронную рекурсию через очередь задач
+            if (!socket_read_pending_) {
+                base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+                    FROM_HERE, base::BindOnce(&EidolonSession::DoSocketRead, base::Unretained(this)));
+            }
         }
 #elif BUILDFLAG(IS_WIN)
         // Для Windows событие FD_WRITE сработает автоматически (edge-triggered)
-        if (pending_fd_writes_.empty()) {
-            DoSocketRead();
+        if (pending_fd_writes_.empty() && !socket_read_pending_) {
+            base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+                FROM_HERE, base::BindOnce(&EidolonSession::DoSocketRead, base::Unretained(this)));
         }
 #endif
     }
@@ -705,7 +724,12 @@ EIDOLON_EXPORT EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, c
     // Блокируем Go-горутину (это нормально, CGO вызов вернется после хендшейка)
     connect_event.Wait();
 
-    if (session->is_closed_) return nullptr;
+    if (session->is_closed_) {
+        // PREVENT MAIN THREAD CRASH: Delete URLRequestContext on IO Thread
+        auto* s_ptr = session.release();
+        g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](EidolonSession* s) { delete s; }, s_ptr));
+        return nullptr;
+    }
     return session.release();
 }
 
@@ -729,7 +753,12 @@ EIDOLON_EXPORT EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, 
 
     connect_event.Wait();
 
-    if (session->is_closed_) return nullptr;
+    if (session->is_closed_) {
+        // PREVENT MAIN THREAD CRASH: Delete URLRequestContext on IO Thread
+        auto* s_ptr = session.release();
+        g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](EidolonSession* s) { delete s; }, s_ptr));
+        return nullptr;
+    }
     return session.release();
 }
 

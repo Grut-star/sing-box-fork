@@ -179,20 +179,16 @@ fi
 if [ "$host_os" = "win" ]; then
   echo "Hotfixing broken Windows SDK 10.0.28000.0..."
   python3 -c "
-filepath = 'build/toolchain/win/setup_toolchain.py'
-with open(filepath, 'r') as f:
-    content = f.read()
-
-# Инъекция кода перед возвратом переменных окружения
-injection = '''for k in variables:
-        if type(variables[k]) == str:
-            variables[k] = variables[k].replace(\"10.0.28000.0\", \"10.0.22621.0\")
-    return _ExtractImportantEnvironment(variables)'''
-
-content = content.replace('return _ExtractImportantEnvironment(variables)', injection)
-
-with open(filepath, 'w') as f:
-    f.write(content)
+import os
+files = ['build/toolchain/win/setup_toolchain.py', 'build/vs_toolchain.py']
+for filepath in files:
+    if os.path.exists(filepath):
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = f.read()
+        # Жесткая подмена версии SDK до начала работы парсеров
+        content = content.replace('10.0.28000.0', '10.0.22621.0')
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(content)
 "
 fi
 
