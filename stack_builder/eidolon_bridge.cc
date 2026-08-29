@@ -85,6 +85,8 @@ typedef SSIZE_T ssize_t;
 #include "base/task/thread_pool.h"
 #include "quiche/quic/core/quic_default_connection_helper.h"
 #include "quiche/quic/tools/quic_simple_crypto_server_stream_helper.h"
+#include "net/cert/cert_verify_proc.h"
+#include <optional>
 
 static base::AtExitManager* g_exit_manager = nullptr;
 static base::Thread* g_io_thread = nullptr;
@@ -462,11 +464,15 @@ public:
 private:
     QUICDialHelper(EidolonSession* sess, const std::string& host, uint16_t port, const std::vector<uint8_t>& token, base::WaitableEvent* event)
             : sess_(sess), host_(host), port_(port), token_(token), event_(event), scheme_host_port_("https", host, port) {
-        // Init alias key
-        session_alias_key_ = net::QuicSessionAliasKey(
+
+        // Создаем временный ключ сессии для инициализации QuicSessionAliasKey
+        net::QuicSessionKey session_key(
                 net::HostPortPair(host, port), net::PRIVACY_MODE_DISABLED, net::ProxyChain::Direct(),
                 net::SessionUsage::kDestination, net::SocketTag(),
-                net::NetworkAnonymizationKey(), net::SecureDnsPolicy::kAllow, false);
+                net::NetworkAnonymizationKey(), net::SecureDnsPolicy::kAllow,
+                false, false, net::handles::kInvalidNetworkHandle);
+
+        session_alias_key_ = net::QuicSessionAliasKey(scheme_host_port_, session_key);
     }
 
     void Run() {
@@ -480,7 +486,11 @@ private:
         );
 
         builder.SetCertVerifier(
-                std::make_unique<EidolonCertVerifier>(net::CertVerifier::CreateDefault(nullptr))
+                std::make_unique<EidolonCertVerifier>(
+                        net::CertVerifier::CreateDefault(
+                                net::CertVerifyProc::CreateSystemVerifyProc(nullptr)
+                        )
+                )
         );
 
         auto quic_context = std::make_unique<net::QuicContext>();
@@ -622,7 +632,11 @@ private:
 
         // Внедряем наш кастомный верификатор
         builder.SetCertVerifier(
-                std::make_unique<EidolonCertVerifier>(net::CertVerifier::CreateDefault(nullptr))
+                std::make_unique<EidolonCertVerifier>(
+                        net::CertVerifier::CreateDefault(
+                                net::CertVerifyProc::CreateSystemVerifyProc(nullptr)
+                        )
+                )
         );
 
         // Сохраняем контекст в сессии, чтобы он жил всё время соединения
@@ -738,115 +752,11 @@ public:
                         flow_id_read_ = true;
 
                         uint8_t key[32] = {0};
-                        if (session()->GetMutableCryptoStream()) {
+
+                        quic::QuicCryptoStream* crypto_stream = const_cast<quic::QuicCryptoStream*>(session()->GetCryptoStream());
+                        if (crypto_stream) {
                             std::string exported;
-                            if (session()->GetMutableCryptoStream()->ExportKeyingMaterial("eidolon-traffic-key", "", 32, &exported)) {
-                                memcpy(key, exported.data(), 32);
-                            }
-                        }
-
-                        ForwardToGo(token, std::string((char*)key, 32), flow_id);
-
-                        if (buffer_.size() > 50u + pad_len) {
-                            if (pump_) pump_->WriteToTCP(buffer_.substr(50 + pad_len));
-                            else leftover_data_ = buffer_.substr(50 + pad_len);
-                        }
-                        buffer_.clear();
-                    }
-                }
-            } else {
-                if (pump_) pump_->WriteToTCP(data);
-                else leftover_data_.append(data);
-                sequencer()->MarkConsumed(iov.iov_len);
-            }
-        }
-        if (sequencer()->IsClosed()) OnFinRead();
-    }
-
-private:
-    void ForwardToGo(const std::string& token, const std::string& session_key, const std::string& flow_id) {
-        pump_ = base::MakeRefCounted<BidirectionalPump>(this, base::SingleThreadTaskRunner::GetCurrentDefault());
-        g_io_thread->task_runner()->PostTask(FROM_HERE,
-                                             base::BindOnce(&BidirectionalPump::ConnectTCP, pump_, cb_port_, token, session_key, flow_id));
-
-        if (!leftover_data_.empty()) {
-            pump_->WriteToTCP(leftover_data_);
-            leftover_data_.clear();
-        }
-    }
-
-    uint16_t cb_port_;
-    bool flow_id_read_ = false;
-    std::string buffer_;
-    std::string leftover_data_;
-    scoped_refptr<BidirectionalPump> pump_;
-};
-
-class EidolonServerStream;
-
-class BidirectionalPump : public base::RefCountedThreadSafe<BidirectionalPump> {
-public:
-    BidirectionalPump(EidolonServerStream* quic_stream, scoped_refptr<base::SingleThreadTaskRunner> quic_runner)
-            : quic_stream_(quic_stream), quic_runner_(std::move(quic_runner)),
-              read_buf_(base::MakeRefCounted<net::IOBufferWithSize>(65536)) {}
-
-    // Только объявления. Реализации перенесены ниже EidolonServerStream.
-    void ConnectTCP(uint16_t cb_port, std::string token, std::string session_key, std::string flow_id);
-    void WriteToTCP(std::string_view data);
-    void DetachQUIC();
-
-private:
-    friend class base::RefCountedThreadSafe<BidirectionalPump>;
-    ~BidirectionalPump() = default;
-
-    void OnTCPConnect(std::string token, std::string session_key, std::string flow_id, int rv);
-    void PumpTCPToQUIC();
-    void OnTCPRead(int rv);
-
-    base::Lock quic_lock_;
-    raw_ptr<EidolonServerStream> quic_stream_;
-    scoped_refptr<base::SingleThreadTaskRunner> quic_runner_;
-    std::unique_ptr<net::StreamSocket> tcp_socket_;
-    scoped_refptr<net::IOBufferWithSize> read_buf_;
-};
-
-class EidolonServerStream : public quic::QuicSpdyStream {
-public:
-    EidolonServerStream(quic::QuicStreamId id, quic::QuicSpdySession* session, uint16_t cb_port)
-            : quic::QuicSpdyStream(id, session, quic::BIDIRECTIONAL), cb_port_(cb_port) {}
-
-    ~EidolonServerStream() override {
-        if (pump_) pump_->DetachQUIC();
-    }
-
-    void OnInitialHeadersComplete(bool fin, size_t frame_len, const quic::QuicHeaderList& header_list) override {
-        quic::QuicSpdyStream::OnInitialHeadersComplete(fin, frame_len, header_list);
-        quiche::HttpHeaderBlock response_headers;
-        response_headers[":status"] = "200";
-        WriteHeaders(std::move(response_headers), false, nullptr);
-    }
-
-    void OnBodyAvailable() override {
-        while (sequencer()->HasBytesToRead()) {
-            struct iovec iov;
-            if (sequencer()->GetReadableRegions(&iov, 1) == 0) break;
-            std::string_view data(static_cast<const char*>(iov.iov_base), iov.iov_len);
-
-            if (!flow_id_read_) {
-                buffer_.append(data);
-                sequencer()->MarkConsumed(iov.iov_len);
-
-                if (buffer_.size() >= 50) {
-                    uint16_t pad_len = (static_cast<uint8_t>(buffer_[48]) << 8) | static_cast<uint8_t>(buffer_[49]);
-                    if (buffer_.size() >= 50u + pad_len) {
-                        std::string token = buffer_.substr(0, 32);
-                        std::string flow_id = buffer_.substr(32, 16);
-                        flow_id_read_ = true;
-
-                        uint8_t key[32] = {0};
-                        if (session()->GetMutableCryptoStream()) {
-                            std::string exported;
-                            if (session()->GetMutableCryptoStream()->ExportKeyingMaterial("eidolon-traffic-key", "", 32, &exported)) {
+                            if (crypto_stream->ExportKeyingMaterial("eidolon-traffic-key", "", 32, &exported)) {
                                 memcpy(key, exported.data(), 32);
                             }
                         }
@@ -1043,9 +953,9 @@ private:
         auto proof_source = std::make_unique<net::ProofSourceChromium>();
         // ВАЖНО: Инициализация сертификатов, иначе Chromium аппаратно сбросит ClientHello[cite: 5, 6]
         proof_source->Initialize(
-                base::FilePath("cert.pem"),
-                base::FilePath("key.pem"),
-                base::FilePath(""));
+                base::FilePath(FILE_PATH_LITERAL("cert.pem")),
+                base::FilePath(FILE_PATH_LITERAL("key.pem")),
+                base::FilePath(FILE_PATH_LITERAL("")));
 
         server_ = std::make_unique<EidolonServer>(std::move(proof_source), backend_.get(), cb_port_);
 
@@ -1157,9 +1067,14 @@ g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
             *res = 0;
         }
     } else {
-        auto* ssl_socket = static_cast<net::SSLClientSocketImpl*>(s->tcp_socket.get());
-        if (ssl_socket && ssl_socket->GetSSL()) {
-            if (SSL_export_keying_material(ssl_socket->GetSSL(), key, len, "eidolon-traffic-key", 19, nullptr, 0, 0) == 1) {
+        auto* ssl_socket = static_cast<net::SSLClientSocket*>(s->tcp_socket.get());
+        if (ssl_socket) {
+            int export_rv = ssl_socket->ExportKeyingMaterial(
+                    "eidolon-traffic-key",
+                    std::nullopt,
+                    base::span<uint8_t>(key, len)
+            );
+            if (export_rv == net::OK) {
                 *res = 0;
             }
         }

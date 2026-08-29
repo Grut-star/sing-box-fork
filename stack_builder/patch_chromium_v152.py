@@ -128,5 +128,11 @@ def main():
         r'    }\n'
     )
 
+    apply_patch(
+        'third_party/abseil-cpp/absl/base/internal/spinlock_win32.inc',
+        r'#include <windows\.h>',
+        r'#include <minwinbase.h>\n#include <windows.h>'
+    )
+
 if __name__ == '__main__':
     main()
