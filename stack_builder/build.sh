@@ -141,8 +141,7 @@ shared_library("libeidolon") {
     "//third_party/boringssl:boringssl",
     "//components/version_info",
     "//net/third_party/quiche:quiche_tool_support",
-    "//net/third_party/quiche:quiche_test_support",
-    "//net:test_support"
+    "//net/third_party/quiche:epoll_tool_support"
   ]
 }
 EOF
@@ -212,6 +211,10 @@ if [ "$host_os" = linux ]; then
     CCACHE_DIR=$PWD/.host_tool_cache ninja -C "$out" $clang_x64_targets
   fi
 fi
+
+echo "Mocking missing test dependencies for GN/Ninja..."
+mkdir -p third_party/test_fonts/test_fonts
+touch third_party/test_fonts/test_fonts/Ahem.ttf
 
 echo "Building libeidolon (VERBOSE)..."
 if ! ninja -v -C "$out" eidolon; then
