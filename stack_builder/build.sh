@@ -139,6 +139,7 @@ shared_library("libeidolon") {
     "//crypto:crypto",
     "//third_party/boringssl:boringssl",
     "//components/version_info",
+    "//net/third_party/quiche:quiche_tool_support",
   ]
 }
 EOF
