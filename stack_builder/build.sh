@@ -131,6 +131,7 @@ cp ../protocol/eidolon/bridge.h net/eidolon/
 
 cat << 'EOF' > net/eidolon/BUILD.gn
 shared_library("libeidolon") {
+  testonly = true
   sources = [ "eidolon_bridge.cc" ]
   deps = [
     "//net:net",
@@ -144,7 +145,7 @@ shared_library("libeidolon") {
 }
 EOF
 
-echo 'group("eidolon") { deps = [ "//net/eidolon:libeidolon" ] }' >> BUILD.gn
+echo 'group("eidolon") { testonly = true; deps = [ "//net/eidolon:libeidolon" ] }' >> BUILD.gn
 
 rm -rf "./$out"
 mkdir -p out
