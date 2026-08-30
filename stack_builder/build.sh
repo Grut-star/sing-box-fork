@@ -132,7 +132,10 @@ cp ../protocol/eidolon/bridge.h net/eidolon/
 cat << 'EOF' > net/eidolon/BUILD.gn
 shared_library("libeidolon") {
   testonly = true
-  sources = [ "eidolon_bridge.cc" ]
+  sources = [
+      "eidolon_bridge.cc",
+      "//net/third_party/quiche/src/quiche/quic/tools/quic_server.cc"
+    ]
   deps = [
     "//net:net",
     "//base:base",
