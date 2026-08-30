@@ -145,7 +145,10 @@ shared_library("libeidolon") {
 }
 EOF
 
-echo 'group("eidolon") { testonly = true; deps = [ "//net/eidolon:libeidolon" ] }' >> BUILD.gn
+echo 'group("eidolon") {' >> BUILD.gn
+echo '  testonly = true' >> BUILD.gn
+echo '  deps = [ "//net/eidolon:libeidolon" ]' >> BUILD.gn
+echo '}' >> BUILD.gn
 
 rm -rf "./$out"
 mkdir -p out
