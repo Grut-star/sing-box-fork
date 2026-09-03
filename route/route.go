@@ -49,7 +49,8 @@ func (r *Router) RouteConnection(ctx context.Context, conn net.Conn, metadata ad
             fmt.Printf("[FIREWALL-GO] Анализ прямого IP -> %s (UID: %d)\n", ipStr, uid)
 
     		// TODO: В будущем здесь добавить проверку белого списка IP
-    		isIpAllowed := false
+    		//isIpAllowed := false
+    		isIpAllowed := sharedfirewall.IsUidAllowed(uid)
 
     		if !isIpAllowed {
     			// Уведомляем Android-клиент (вызывается асинхронно, чтобы не тормозить ядро)
@@ -141,11 +142,15 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
             	buf.ReleaseMulti(buffers) // Очищаем буфер
             	return fmt.Errorf("TCP connection from UID %d blocked by strict TUN rules", uid)
             }
+
+            isAllowed = true
+
             // Или можно пускать по определенному UID (например, системные)
     		if uid == 1000 {
     	    	isAllowed = false
     		}
         }
+
 
     	if !isAllowed {
     		buf.ReleaseMulti(buffers) // Обязательно освобождаем память
@@ -213,7 +218,8 @@ func (r *Router) RoutePacketConnection(ctx context.Context, conn N.PacketConn, m
 
             fmt.Printf("[FIREWALL-GO] Анализ прямого IP -> %s (UID: %d)\n", ipStr, uid)
 
-    		isIpAllowed := false
+    		//isIpAllowed := false
+    		isIpAllowed := sharedfirewall.IsUidAllowed(uid)
 
     		if !isIpAllowed {
     			sharedfirewall.GlobalInterceptor.NotifyDirectIpBlocked(uid, ipStr)
