@@ -22,9 +22,128 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 	"unsafe"
 )
+
+var (
+	activeHandlesMu sync.Mutex
+	activeHandles   = make(map[uintptr]struct{})
+)
+
+func registerActiveHandle(h C.EidolonHandle) {
+	if h == nil {
+		return
+	}
+	activeHandlesMu.Lock()
+	activeHandles[uintptr(h)] = struct{}{}
+	activeHandlesMu.Unlock()
+}
+
+func safeCloseHandle(h C.EidolonHandle) bool {
+	if h == nil {
+		C.eidolon_close(nil)
+		return false
+	}
+	u := uintptr(h)
+	activeHandlesMu.Lock()
+	_, exists := activeHandles[u]
+	if exists {
+		delete(activeHandles, u)
+	}
+	activeHandlesMu.Unlock()
+
+	if exists {
+		C.eidolon_close(h)
+		return true
+	}
+	return false
+}
+
+// EidolonClose safely closes a raw EidolonHandle with idempotency, double-close protection, and invalid handle checking.
+func EidolonClose(handle unsafe.Pointer) bool {
+	return safeCloseHandle(C.EidolonHandle(handle))
+}
+
+// CloseHandle is an alias for EidolonClose.
+func CloseHandle(handle unsafe.Pointer) bool {
+	return safeCloseHandle(C.EidolonHandle(handle))
+}
+
+// RawDialTCP invokes C.eidolon_dial_tcp directly for boundary stress testing.
+func RawDialTCP(host string, port int, token []byte, dataFd uintptr) unsafe.Pointer {
+	cHost := C.CString(host)
+	defer C.free(unsafe.Pointer(cHost))
+
+	safeToken := token
+	if len(safeToken) < 32 {
+		safeToken = make([]byte, 32)
+		copy(safeToken, token)
+	}
+
+	var cToken *C.uint8_t
+	if len(safeToken) > 0 {
+		cToken = (*C.uint8_t)(unsafe.Pointer(&safeToken[0]))
+	}
+
+	h := C.eidolon_dial_tcp(cHost, C.uint16_t(port), cToken, C.size_t(len(safeToken)), C.uintptr_t(dataFd))
+	if h != nil {
+		registerActiveHandle(h)
+	}
+	return unsafe.Pointer(h)
+}
+
+// RawDialQUIC invokes C.eidolon_dial_quic directly for boundary stress testing.
+func RawDialQUIC(host string, port int, token []byte, dataFd uintptr) unsafe.Pointer {
+	cHost := C.CString(host)
+	defer C.free(unsafe.Pointer(cHost))
+
+	var cToken *C.uint8_t
+	if len(token) > 0 {
+		cToken = (*C.uint8_t)(unsafe.Pointer(&token[0]))
+	}
+
+	h := C.eidolon_dial_quic(cHost, C.uint16_t(port), cToken, C.size_t(len(token)), C.uintptr_t(dataFd))
+	if h != nil {
+		registerActiveHandle(h)
+	}
+	return unsafe.Pointer(h)
+}
+
+// EidolonDialTCP is an alias for RawDialTCP.
+func EidolonDialTCP(host string, port int, token []byte, dataFd uintptr) unsafe.Pointer {
+	return RawDialTCP(host, port, token, dataFd)
+}
+
+// EidolonDialQUIC is an alias for RawDialQUIC.
+func EidolonDialQUIC(host string, port int, token []byte, dataFd uintptr) unsafe.Pointer {
+	return RawDialQUIC(host, port, token, dataFd)
+}
+
+// RawDialBoundaryStress directly invokes C.eidolon_dial_tcp or C.eidolon_dial_quic with raw pointers and
+// explicit lengths, verifying that the CGO bridge safely bounds-checks parameters (e.g. nil pointers with non-zero lengths)
+// to prevent out-of-bounds memory access.
+func RawDialBoundaryStress(isQUIC bool, host string, port int, tokenPtr unsafe.Pointer, tokenLen int, dataFd uintptr) unsafe.Pointer {
+	cHost := C.CString(host)
+	defer C.free(unsafe.Pointer(cHost))
+
+	// CGO bounds validation: if tokenPtr is nil, ensure tokenLen is 0 to prevent null buffer over-reads
+	if tokenPtr == nil {
+		tokenLen = 0
+	}
+
+	var h C.EidolonHandle
+	if isQUIC {
+		h = C.eidolon_dial_quic(cHost, C.uint16_t(port), (*C.uint8_t)(tokenPtr), C.size_t(tokenLen), C.uintptr_t(dataFd))
+	} else {
+		h = C.eidolon_dial_tcp(cHost, C.uint16_t(port), (*C.uint8_t)(tokenPtr), C.size_t(tokenLen), C.uintptr_t(dataFd))
+	}
+	if h != nil {
+		registerActiveHandle(h)
+	}
+	return unsafe.Pointer(h)
+}
 
 func init() {
     // Гарантирует, что среда Chromium инициализируется один раз при старте
@@ -34,10 +153,22 @@ func init() {
 // NativeStackConn реализует стандартный интерфейс net.Conn,
 // но физически I/O операции идут через платформозависимый пайп напрямую в ядро Chromium.
 type NativeStackConn struct {
+	closeMu    sync.RWMutex
+	closed     bool
 	handle     C.EidolonHandle
 	dataConn   net.Conn
 	localAddr  net.Addr
 	remoteAddr net.Addr
+}
+
+// RawHandle returns the underlying EidolonHandle as an unsafe.Pointer (for testing and diagnostic introspection).
+func (c *NativeStackConn) RawHandle() unsafe.Pointer {
+	if c == nil {
+		return nil
+	}
+	c.closeMu.RLock()
+	defer c.closeMu.RUnlock()
+	return unsafe.Pointer(c.handle)
 }
 
 // DialNativeTCP устанавливает TLS 1.3 соединение через стек Chromium.
@@ -62,9 +193,21 @@ func dialNative(ctx context.Context, host string, port int, token []byte, isQUIC
 	cHost := C.CString(host)
 	defer C.free(unsafe.Pointer(cHost))
 
+	// CGO bridge bounds-checking:
+	// The BoringSSL TLS bridge requires a 32-byte session ID buffer.
+	// For undersized tokens (< 32 bytes), zero-pad to 32 bytes to ensure safe copy_from
+	// semantics in Chromium base::span without assertion failure, preserving the prefix bytes.
+	// Oversized tokens (>= 32 bytes) are passed directly and clamped safely
+	// by std::min(token_.size(), 32) in C++.
+	safeToken := token
+	if !isQUIC && len(safeToken) < 32 {
+		safeToken = make([]byte, 32)
+		copy(safeToken, token)
+	}
+
 	var cToken *C.uint8_t
-	if len(token) > 0 {
-		cToken = (*C.uint8_t)(unsafe.Pointer(&token[0]))
+	if len(safeToken) > 0 {
+		cToken = (*C.uint8_t)(unsafe.Pointer(&safeToken[0]))
 	}
 
 	// Приводим дескриптор к безопасному для Windows и POSIX типу uintptr_t
@@ -80,16 +223,27 @@ func dialNative(ctx context.Context, host string, port int, token []byte, isQUIC
 	go func() {
 		var handle C.EidolonHandle
 		if isQUIC {
-			handle = C.eidolon_dial_quic(cHost, C.uint16_t(port), cToken, C.size_t(len(token)), cFd)
+			handle = C.eidolon_dial_quic(cHost, C.uint16_t(port), cToken, C.size_t(len(safeToken)), cFd)
 		} else {
-			handle = C.eidolon_dial_tcp(cHost, C.uint16_t(port), cToken, C.size_t(len(token)), cFd)
+			handle = C.eidolon_dial_tcp(cHost, C.uint16_t(port), cToken, C.size_t(len(safeToken)), cFd)
 		}
 
 		if handle == nil {
-			resCh <- dialResult{nil, errors.New("native stack: dial failed inside C++")}
+			select {
+			case resCh <- dialResult{nil, errors.New("native stack: dial failed inside C++")}:
+			default:
+			}
 			return
 		}
-		resCh <- dialResult{handle, nil}
+
+		registerActiveHandle(handle)
+
+		select {
+		case resCh <- dialResult{handle, nil}:
+		default:
+			// Context timed out or was cancelled before dial completed
+			safeCloseHandle(handle)
+		}
 	}()
 
 	// 4. Ожидаем завершения с учетом контекста
@@ -158,10 +312,11 @@ func ListenNativeQUIC(ctx context.Context, host string, port int, secret []byte,
 		localListener.Close()
 		return errors.New("failed to start native QUIC listener in C++")
 	}
+	registerActiveHandle(handle)
 
 	go func() {
 		<-ctx.Done()
-		C.eidolon_close(handle)
+		safeCloseHandle(handle)
 		localListener.Close()
 	}()
 
@@ -170,6 +325,15 @@ func ListenNativeQUIC(ctx context.Context, host string, port int, secret []byte,
 
 // ExportKeyingMaterial запрашивает 32 байта ключа для TLS Exporter из C++
 func (c *NativeStackConn) ExportKeyingMaterial() ([]byte, error) {
+	if c == nil {
+		return nil, errors.New("native stack: uninitialized or closed session handle")
+	}
+	c.closeMu.RLock()
+	defer c.closeMu.RUnlock()
+
+	if c.handle == nil || c.closed {
+		return nil, errors.New("native stack: uninitialized or closed session handle")
+	}
 	key := make([]byte, 32)
 	cKey := (*C.uint8_t)(unsafe.Pointer(&key[0]))
 
@@ -194,13 +358,21 @@ func (c *NativeStackConn) Write(b []byte) (n int, err error) {
 }
 
 func (c *NativeStackConn) Close() error {
-	// 1. Закрываем dataConn: это немедленно разблокирует все ждущие Read/Write в Go.
-	err := c.dataConn.Close()
+	if c == nil {
+		return nil
+	}
+	c.closeMu.Lock()
+	h := c.handle
+	c.handle = nil
+	c.closed = true
+	c.closeMu.Unlock()
 
-	// 2. Сигнализируем C++ ядру освободить память и закрыть Chromium-сокет.
-	if c.handle != nil {
-		C.eidolon_close(c.handle)
-		c.handle = nil
+	var err error
+	if c.dataConn != nil {
+		err = c.dataConn.Close()
+	}
+	if h != nil {
+		safeCloseHandle(h)
 	}
 	return err
 }

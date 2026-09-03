@@ -12,9 +12,9 @@ import (
 const timeWindow = 5 // Окно валидности токена в секундах
 
 var (
-	currentTokens sync.Map     // Текущий кэш токенов
-	pastTokens    sync.Map     // Предыдущий кэш токенов (для мягкого перехода)
-	cacheMutex    sync.RWMutex // Защита от состояния гонки при ротации
+	currentTokens = &sync.Map{} // Текущий кэш токенов
+	pastTokens    = &sync.Map{} // Предыдущий кэш токенов (для мягкого перехода)
+	cacheMutex    sync.RWMutex  // Защита от состояния гонки при ротации
 )
 
 func init() {
@@ -25,7 +25,7 @@ func init() {
 			time.Sleep(10 * time.Second)
 			cacheMutex.Lock()
 			pastTokens = currentTokens
-			currentTokens = sync.Map{}
+			currentTokens = &sync.Map{}
 			cacheMutex.Unlock()
 		}
 	}()

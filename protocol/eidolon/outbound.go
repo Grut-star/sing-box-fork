@@ -2,7 +2,6 @@ package eidolon
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"net"

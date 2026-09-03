@@ -46,3 +46,17 @@ func createNativePipe(isQUIC bool) (net.Conn, uintptr, error) {
 
 	return goConn, fd, nil
 }
+
+func closeNativePipeFd(fd uintptr) {
+	// Handled by GC/Windows socket teardown or CloseHandle
+}
+
+// CreateNativePipe creates a native IPC pipe pair for Go and C++ communication.
+func CreateNativePipe(isQUIC bool) (net.Conn, uintptr, error) {
+	return createNativePipe(isQUIC)
+}
+
+// CloseNativePipeFd closes the native pipe file descriptor.
+func CloseNativePipeFd(fd uintptr) {
+	closeNativePipeFd(fd)
+}

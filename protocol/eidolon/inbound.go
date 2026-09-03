@@ -101,7 +101,9 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
     options.ListenOptions.ListenPort = 8443
 
     // Моно-сервер: возвращаем зонды на локальный HTTP-порт Caddy
-    options.Dest = "127.0.0.1:8080"
+    if options.Dest == "" {
+        options.Dest = "127.0.0.1:8080"
+    }
 
     i := &Inbound{
         ctx:     ctx,

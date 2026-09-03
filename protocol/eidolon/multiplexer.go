@@ -2,18 +2,11 @@ package eidolon
 
 import (
 	"context"
-	"encoding/binary"
-    "errors"
-    "io"
 	"net"
 	"sync"
-	"time"
 
-
-	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/smux"
-	//"github.com/quic-go/quic-go"
 )
 // UoTPacketConn оборачивает TCP-сокет, превращая его в net.PacketConn.
 // Формат кадра: [2 байта длины (BigEndian)] + [Полезная нагрузка]

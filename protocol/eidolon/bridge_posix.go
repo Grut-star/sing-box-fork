@@ -28,3 +28,19 @@ func createNativePipe(isQUIC bool) (net.Conn, uintptr, error) {
 
 	return dataConn, uintptr(fds[1]), nil
 }
+
+func closeNativePipeFd(fd uintptr) {
+	if fd != 0 {
+		syscall.Close(int(fd))
+	}
+}
+
+// CreateNativePipe creates a native IPC pipe pair for Go and C++ communication.
+func CreateNativePipe(isQUIC bool) (net.Conn, uintptr, error) {
+	return createNativePipe(isQUIC)
+}
+
+// CloseNativePipeFd closes the native pipe file descriptor.
+func CloseNativePipeFd(fd uintptr) {
+	closeNativePipeFd(fd)
+}
