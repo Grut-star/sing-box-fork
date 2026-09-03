@@ -1,0 +1,193 @@
+package eidolon_shield
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/binary"
+	"encoding/hex"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"sync"
+	"time"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+)
+
+func init() {
+	caddy.RegisterModule(EidolonShield{})
+	httpcaddyfile.RegisterHandlerDirective("eidolon_shield", parseCaddyfile)
+}
+
+const timeWindow = 30 // Окно валидности токена в секундах
+
+// EidolonShield — кастомный плагин безопасности для Caddy (Fronting)
+type EidolonShield struct {
+	Upstream string `json:"upstream,omitempty"` // Адрес внутреннего ядра Eidolon
+	Secret   string `json:"secret,omitempty"`   // Мастер-секрет для HMAC
+
+	secretMu   sync.RWMutex // Защита секрета
+
+	proxy      *httputil.ReverseProxy
+	seenTokens sync.Map
+	lastClear  int64
+	clearMutex sync.Mutex
+}
+
+// CaddyModuleInfo предоставляет информацию о модуле для системы Caddy
+func (EidolonShield) CaddyModuleInfo() caddy.ModuleInfo {
+	return caddy.ModuleInfo{
+		ID:  "http.handlers.eidolon_shield",
+		New: func() caddy.Module { return &EidolonShield{} },
+	}
+}
+
+// Provision инициализирует прокси до ядра и устанавливает таймеры
+func (s *EidolonShield) Provision(ctx caddy.Context) error {
+// Для HTTP/3 схема обязательно должна быть https
+    targetURL, err := url.Parse("https://" + s.Upstream)
+    if err != nil {
+        return err
+    }
+    s.proxy = httputil.NewSingleHostReverseProxy(targetURL)
+	// Внедряем QUIC-транспорт для связи с ядром
+    s.proxy.Transport = &http3.RoundTripper{
+        TLSClientConfig: &tls.Config{
+            InsecureSkipVerify: true, // Ядро использует самоподписанный/внутренний сертификат
+        },
+    }
+
+    s.lastClear = time.Now().Unix()
+
+	// Поднимаем локальный API для приема новых секретов от ядра
+    go func() {
+        mux := http.NewServeServeMux()
+        mux.HandleFunc("/_internal/update_secret", func(w http.ResponseWriter, r *http.Request) {
+            // Защита: принимаем запросы ТОЛЬКО с локалхоста
+            if r.RemoteAddr != "127.0.0.1" && r.RemoteAddr != "[::1]" {
+                w.WriteHeader(http.StatusForbidden)
+                return
+            }
+            newSecret := r.Header.Get("X-New-Secret")
+            if newSecret != "" {
+                s.secretMu.Lock()
+                s.Secret = newSecret
+                s.secretMu.Unlock()
+                w.WriteHeader(http.StatusOK)
+            }
+        })
+        // Слушаем нестандартный локальный порт
+        http.ListenAndServe("127.0.0.1:11223", mux)
+    }()
+
+	return nil
+}
+
+// ServeHTTP обрабатывает каждый запрос
+func (s *EidolonShield) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	tokenHex := r.Header.Get("X-Eidolon-Token")
+
+	// 1. Быстрая эвристика: если заголовок есть и его длина 64 символа (hex-строка 32 байт)
+	if len(tokenHex) == 64 && s.isAuthorized(tokenHex) {
+		// Очищаем заголовок, чтобы не передавать его дальше в открытом виде (Defense in Depth)
+		r.Header.Del("X-Eidolon-Token")
+
+        // 1. Извлекаем ключ на стороне Caddy (RFC 5705)
+        if r.TLS != nil {
+            sessionKey, err := r.TLS.ExportKeyingMaterial("eidolon-traffic-key", nil, 32)
+            if err == nil {
+                // 2. Передаем ключ ядру через внутренний заголовок
+                r.Header.Set("X-Eidolon-Derived-Key", hex.EncodeToString(sessionKey))
+            }
+        }
+
+        // Проксируем в ядро по безопасному localhost
+        s.proxy.ServeHTTP(w, r)
+        return nil
+
+	// 2. Если токена нет или он недействителен — передаем запрос дальше по цепочке Caddy.
+	// Это заставит Caddy отдать обычный сайт, скрыв факт наличия прокси (Probe Resistance).
+	return next.ServeHTTP(w, r)
+}
+
+// isAuthorized выполняет криптографическую проверку за константное время с защитой от Replay
+func (s *EidolonShield) isAuthorized(tokenHex string) bool {
+	token, err := hex.DecodeString(tokenHex)
+	if err != nil {
+		return false
+	}
+
+	now := time.Now().Unix()
+
+	// Очистка кэша отработанных токенов (не блокирует горячий путь, использует TryLock)
+	if now-s.lastClear > timeWindow*2 {
+		if s.clearMutex.TryLock() {
+			s.seenTokens = sync.Map{}
+			s.lastClear = now
+			s.clearMutex.Unlock()
+		}
+	}
+
+	isValid := byte(0)
+
+	// Проверяем 3 временных окна (чтобы компенсировать небольшую рассинхронизацию часов)
+	for offset := int64(-1); offset <= 1; offset++ {
+		t := (now / timeWindow) + offset
+		buf := make([]byte, 8)
+		binary.BigEndian.PutUint64(buf, uint64(t))
+
+		mac := hmac.New(sha256.New, []byte(s.Secret))
+		mac.Write(buf)
+
+		// Защита от тайминг-атак с помощью ConstantTimeCompare
+		match := subtle.ConstantTimeCompare(token, mac.Sum(nil))
+		isValid = isValid | byte(match)
+	}
+
+	// Если токен криптографически верен
+	if isValid == 1 {
+		// Проверяем, не использовался ли он ранее (Защита от Replay-атак)
+		if _, loaded := s.seenTokens.LoadOrStore(tokenHex, true); loaded {
+			return false // Поймали MitM-перехватчика! Токен скомпрометирован.
+		}
+		return true
+	}
+
+	return false
+}
+
+// parseCaddyfile парсит директивы из Caddyfile
+func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
+	var s EidolonShield
+	err := s.UnmarshalCaddyfile(h.Dispenser)
+	return &s, err
+}
+
+// UnmarshalCaddyfile читает настройки Caddyfile
+func (s *EidolonShield) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	for d.Next() {
+		for d.NextBlock(0) {
+			switch d.Val() {
+			case "upstream":
+				if !d.Args(&s.Upstream) {
+					return d.ArgErr()
+				}
+			case "secret":
+				if !d.Args(&s.Secret) {
+					return d.ArgErr()
+				}
+			default:
+				return d.Errf("unrecognized eidolon_shield option: %s", d.Val())
+			}
+		}
+	}
+	return nil
+}
+
+// Гарантируем, что интерфейсы Caddy реализованы
+var _ caddyhttp.MiddlewareHandler = (*EidolonShield)(nil)
+var _ caddyfile.Unmarshaler = (*EidolonShield)(nil)

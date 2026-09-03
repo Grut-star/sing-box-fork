@@ -2,7 +2,7 @@ package eidolon
 
 /*
 #cgo CFLAGS: -I${SRCDIR}
-#cgo LDFLAGS: -L${SRCDIR}/lib -leidolon_net -lstdc++
+#cgo LDFLAGS: -L${SRCDIR}/lib -leidolon -lstdc++
 #include "bridge.h"
 #include <stdlib.h>
 #include <stdint.h>
@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"time"
 	"unsafe"
