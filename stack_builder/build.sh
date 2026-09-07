@@ -141,6 +141,7 @@ shared_library("libeidolon") {
     "//third_party/boringssl:boringssl",
     "//components/version_info",
     "//net/third_party/quiche:quiche_tool_support"
+    "//net/third_party/quiche:quic_server_core"
   ]
 
   if (is_linux || is_chromeos) {
@@ -185,20 +186,24 @@ else
   ln -sf "$(which python3)" third_party/cpython3/host/bin/python3
 fi
 
-if [ "$host_os" = "win" ]; then
-  echo "Hotfixing broken Windows SDK 10.0.28000.0..."
-  python3 -c "
-import os
-files = ['build/toolchain/win/setup_toolchain.py', 'build/vs_toolchain.py']
-for filepath in files:
-    if os.path.exists(filepath):
-        with open(filepath, 'r', encoding='utf-8') as f:
-            content = f.read()
-        # Жесткая подмена версии SDK до начала работы парсеров
-        content = content.replace('10.0.28000.0', '10.0.22621.0')
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(content)
-"
+#if [ "$host_os" = "win" ]; then
+#  echo "Hotfixing broken Windows SDK 10.0.28000.0..."
+#  python3 -c "
+#import os
+#files = ['build/toolchain/win/setup_toolchain.py', 'build/vs_toolchain.py']
+#for filepath in files:
+#    if os.path.exists(filepath):
+#        with open(filepath, 'r', encoding='utf-8') as f:
+#            content = f.read()
+#        # Жесткая подмена версии SDK до начала работы парсеров
+#        content = content.replace('10.0.28000.0', '10.0.22621.0')
+#        with open(filepath, 'w', encoding='utf-8') as f:
+#            f.write(content)
+#"
+#fi
+
+if [ "$IS_ANDROID" = "true" ]; then
+  sed -i 's/"atomic"//g' build/config/linux/BUILD.gn || true
 fi
 
 echo "Running GN..."
