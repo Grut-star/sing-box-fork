@@ -140,9 +140,12 @@ shared_library("libeidolon") {
     "//crypto:crypto",
     "//third_party/boringssl:boringssl",
     "//components/version_info",
-    "//net/third_party/quiche:quiche_tool_support",
-    "//net/third_party/quiche:epoll_tool_support"
+    "//net/third_party/quiche:quiche_tool_support"
   ]
+
+  if (is_linux || is_chromeos) {
+    deps += [ "//net/third_party/quiche:epoll_tool_support" ]
+  }
 }
 EOF
 
