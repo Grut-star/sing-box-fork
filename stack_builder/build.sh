@@ -208,6 +208,9 @@ for filepath in files:
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(content)
 "
+# Вырезаем фантомный макрос Chromium и ставим валидный hex для Windows 11 22H2
+  echo "Patching missing NTDDI macro..."
+  sed -i 's/NTDDI_WIN11_BR/0x0A00000C/g' build/config/win/BUILD.gn || true
 fi
 
 if [ "$IS_ANDROID" = "true" ]; then
