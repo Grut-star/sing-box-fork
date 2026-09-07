@@ -186,21 +186,29 @@ else
   ln -sf "$(which python3)" third_party/cpython3/host/bin/python3
 fi
 
-#if [ "$host_os" = "win" ]; then
-#  echo "Hotfixing broken Windows SDK 10.0.28000.0..."
-#  python3 -c "
-#import os
-#files = ['build/toolchain/win/setup_toolchain.py', 'build/vs_toolchain.py']
-#for filepath in files:
-#    if os.path.exists(filepath):
-#        with open(filepath, 'r', encoding='utf-8') as f:
-#            content = f.read()
-#        # Жесткая подмена версии SDK до начала работы парсеров
-#        content = content.replace('10.0.28000.0', '10.0.22621.0')
-#        with open(filepath, 'w', encoding='utf-8') as f:
-#            f.write(content)
-#"
-#fi
+if [ "$host_os" = "win" ]; then
+  echo "Hotfixing broken Windows SDK..."
+  python3 -c "
+import os
+files = ['build/toolchain/win/setup_toolchain.py', 'build/vs_toolchain.py']
+sdk_path = r'C:\Program Files (x86)\Windows Kits\10\include'
+
+# Ищем только те SDK, где физически установлены C++ заголовки (um/windows.h)
+valid_sdks = [d for d in os.listdir(sdk_path) if os.path.exists(os.path.join(sdk_path, d, 'um', 'windows.h'))]
+best_sdk = sorted(valid_sdks, key=lambda x: int(x.split('.')[2]))[-1] if valid_sdks else '10.0.26100.0'
+
+print(f'Selected valid Windows SDK: {best_sdk}')
+
+for filepath in files:
+    if os.path.exists(filepath):
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = f.read()
+        # Подменяем сломанную версию на рабочую
+        content = content.replace('10.0.28000.0', best_sdk)
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(content)
+"
+fi
 
 if [ "$IS_ANDROID" = "true" ]; then
   sed -i 's/"atomic"//g' build/config/linux/BUILD.gn || true
