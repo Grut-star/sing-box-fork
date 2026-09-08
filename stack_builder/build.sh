@@ -134,7 +134,7 @@ python3 -c "
 import os
 
 file_path = 'net/eidolon/eidolon_bridge.cc'
-with open(file_path, 'r') as f:
+with open(file_path, 'r', encoding='utf-8') as f:
     code = f.read()
 
 start_str = 'class EidolonServerStream;'
@@ -156,11 +156,11 @@ if func_start in code:
         body = mid[body_start_idx:]
         code = pre + func_start + sig + '\n#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_ANDROID)\n' + body + func_end_str + '\n#else\n    return nullptr;\n#endif\n}' + post
 
-with open(file_path, 'w') as f:
+with open(file_path, 'w', encoding='utf-8') as f:
     f.write(code)
 "
 
-# Включаем поддержку epoll на Android
+# Включаем epoll для Android
 echo "Enabling epoll tool support for Android..."
 sed -i 's/if (is_linux || is_chromeos)/if (is_linux || is_chromeos || is_android)/g' net/third_party/quiche/BUILD.gn || true
 
@@ -179,7 +179,6 @@ shared_library("libeidolon") {
     "//net/third_party/quiche:quic_server_core"
   ]
 
-  # Подключаем epoll-сервер только там, где он физически поддерживается
   if (is_linux || is_chromeos || is_android) {
     deps += [ "//net/third_party/quiche:epoll_tool_support" ]
   }
@@ -246,10 +245,27 @@ for filepath in files:
   find base/win -type f -name "*.h" -exec sed -i 's/#error Windows 10.0.28000.0 SDK or higher required./\/\/ bypassed/g' {} + || true
 fi
 
-# ФИКС: Железобетонная замена флага atomic на c для всех платформ
-echo "Removing obsolete -latomic dependency globally..."
-find build/config -type f -name "*.gn" -exec sed -i 's/"atomic"/"c"/g' {} + || true
-find build/config -type f -name "*.gni" -exec sed -i 's/"atomic"/"c"/g' {} + || true
+# 3. НАДЕЖНОЕ РЕШЕНИЕ ДЛЯ ANDROID: Генерация валидных библиотек-пустышек -latomic
+if [ "$IS_ANDROID" = "true" ]; then
+  echo "Fixing Android -latomic by generating dummy libraries..."
+  echo "void __dummy_atomic() {}" > dummy.c
+  CLANG_BIN="third_party/llvm-build/Release+Asserts/bin/clang"
+  AR_BIN="third_party/llvm-build/Release+Asserts/bin/llvm-ar"
+
+  for target in arm-linux-androideabi aarch64-linux-android i686-linux-android x86_64-linux-android; do
+    $CLANG_BIN -target ${target}27 -c dummy.c -o dummy_${target}.o || true
+    $AR_BIN rcs libatomic_${target}.a dummy_${target}.o || true
+
+    # Инъекция прямо в кэшированный sysroot
+    TARGET_DIR="third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$target"
+    if [ -d "$TARGET_DIR" ]; then
+      mkdir -p "$TARGET_DIR/27"
+      cp libatomic_${target}.a "$TARGET_DIR/27/libatomic.a" || true
+      cp libatomic_${target}.a "$TARGET_DIR/libatomic.a" || true
+    fi
+  done
+  rm -f dummy.c dummy_*.o libatomic_*.a
+fi
 
 echo "Running GN..."
 ./gn/out/gn gen "$out" --args="$flags $EXTRA_FLAGS"
