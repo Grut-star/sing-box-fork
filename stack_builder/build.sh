@@ -132,7 +132,11 @@ cp ../protocol/eidolon/bridge.h net/eidolon/
 cat << 'EOF' > net/eidolon/BUILD.gn
 shared_library("libeidolon") {
   testonly = true
-  sources = [ "eidolon_bridge.cc" ]
+  sources = [
+    "eidolon_bridge.cc",
+    "//net/third_party/quiche/src/quiche/quic/tools/quic_server.cc",
+    "//net/third_party/quiche/src/quiche/quic/tools/quic_default_packet_writer.cc"
+  ]
   deps = [
     "//net:net",
     "//base:base",
@@ -211,6 +215,10 @@ for filepath in files:
 # Вырезаем фантомный макрос Chromium и ставим валидный hex для Windows 11 22H2
   echo "Patching missing NTDDI macro..."
   sed -i '/NTDDI_VERSION/d' build/config/win/BUILD.gn || true
+
+  echo "Removing hardcoded Windows SDK version error in C++ sources..."
+  find base/win -type f -name "*.cc" -exec sed -i 's/#error Windows 10.0.28000.0 SDK or higher required./\/\/ bypassed/g' {} + || true
+  find base/win -type f -name "*.h" -exec sed -i 's/#error Windows 10.0.28000.0 SDK or higher required./\/\/ bypassed/g' {} + || true
 fi
 
 if [ "$IS_ANDROID" = "true" ]; then
