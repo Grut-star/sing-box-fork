@@ -134,8 +134,7 @@ shared_library("libeidolon") {
   testonly = true
   sources = [
     "eidolon_bridge.cc",
-    "//net/third_party/quiche/src/quiche/quic/tools/quic_server.cc",
-    "//net/third_party/quiche/src/quiche/quic/tools/quic_default_packet_writer.cc"
+    "//net/third_party/quiche/src/quiche/quic/tools/quic_server.cc"
   ]
   deps = [
     "//net:net",
@@ -221,9 +220,9 @@ for filepath in files:
   find base/win -type f -name "*.h" -exec sed -i 's/#error Windows 10.0.28000.0 SDK or higher required./\/\/ bypassed/g' {} + || true
 fi
 
-if [ "$IS_ANDROID" = "true" ]; then
-  sed -i 's/"atomic"//g' build/config/linux/BUILD.gn || true
-fi
+# Глобально вырезаем привязку к несуществующей библиотеке atomic
+echo "Removing obsolete -latomic dependency globally..."
+find build/config -type f -name "BUILD.gn" -exec sed -i 's/"atomic"/"c"/g' {} + || true
 
 echo "Running GN..."
 ./gn/out/gn gen "$out" --args="$flags $EXTRA_FLAGS"
