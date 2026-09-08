@@ -143,7 +143,7 @@ end_str = '// C-API (ДЛЯ GOLANG)'
 if start_str in code and end_str in code and 'BUILDFLAG(IS_LINUX)' not in code.split(start_str)[1][:100]:
     pre, rest = code.split(start_str, 1)
     mid, post = rest.split(end_str, 1)
-    code = pre + '\n#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_ANDROID)\n' + start_str + mid + '\n#endif\n\n' + end_str + post
+    code = pre + '\n#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)\n' + start_str + mid + '\n#endif\n\n' + end_str + post
 
 func_start = 'EIDOLON_EXPORT EidolonHandle eidolon_listen_quic'
 if func_start in code:
@@ -154,15 +154,11 @@ if func_start in code:
         body_start_idx = mid.find('{') + 1
         sig = mid[:body_start_idx]
         body = mid[body_start_idx:]
-        code = pre + func_start + sig + '\n#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_ANDROID)\n' + body + func_end_str + '\n#else\n    return nullptr;\n#endif\n}' + post
+        code = pre + func_start + sig + '\n#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)\n' + body + func_end_str + '\n#else\n    return nullptr;\n#endif\n}' + post
 
 with open(file_path, 'w', encoding='utf-8') as f:
     f.write(code)
 "
-
-# Включаем epoll для Android
-echo "Enabling epoll tool support for Android..."
-sed -i 's/if (is_linux || is_chromeos)/if (is_linux || is_chromeos || is_android)/g' net/third_party/quiche/BUILD.gn || true
 
 cat << 'EOF' > net/eidolon/BUILD.gn
 shared_library("libeidolon") {
@@ -179,7 +175,7 @@ shared_library("libeidolon") {
     "//net/third_party/quiche:quic_server_core"
   ]
 
-  if (is_linux || is_chromeos || is_android) {
+  if (is_linux || is_chromeos) {
     deps += [ "//net/third_party/quiche:epoll_tool_support" ]
   }
 }
