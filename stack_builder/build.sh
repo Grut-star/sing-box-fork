@@ -120,22 +120,54 @@ else
   echo 'group("histograms_xml") {}' >> tools/metrics/BUILD.gn
 fi
 
-# 1. Подготавливаем исходники C++ (возвращаем рабочий вариант)
+# 1. Подготавливаем исходники C++
 mkdir -p net/eidolon
 cp eidolon_bridge.cc net/eidolon/
 cp eidolon_bridge.h net/eidolon/
 
-# 2. Подготавливаем CGO-мост, который требует bridge.h
-# Поднимаемся на папку выше и заходим в protocol
+# 2. Подготавливаем CGO-мост
 cp ../protocol/eidolon/bridge.h net/eidolon/
+
+# 3. АВТОПАТЧ: Отключаем серверную часть QUIC для Mac и Windows (где нет epoll)
+echo "Patching eidolon_bridge.cc to isolate epoll dependencies..."
+python3 -c "
+import os
+
+file_path = 'net/eidolon/eidolon_bridge.cc'
+with open(file_path, 'r') as f:
+    code = f.read()
+
+start_str = 'class EidolonServerStream;'
+end_str = '// C-API (ДЛЯ GOLANG)'
+
+if start_str in code and end_str in code and 'BUILDFLAG(IS_LINUX)' not in code.split(start_str)[1][:100]:
+    pre, rest = code.split(start_str, 1)
+    mid, post = rest.split(end_str, 1)
+    code = pre + '\n#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_ANDROID)\n' + start_str + mid + '\n#endif\n\n' + end_str + post
+
+func_start = 'EIDOLON_EXPORT EidolonHandle eidolon_listen_quic'
+if func_start in code:
+    pre, rest = code.split(func_start, 1)
+    func_end_str = 'return session.release();\n}'
+    if func_end_str in rest and 'return nullptr;' not in rest:
+        mid, post = rest.split(func_end_str, 1)
+        body_start_idx = mid.find('{') + 1
+        sig = mid[:body_start_idx]
+        body = mid[body_start_idx:]
+        code = pre + func_start + sig + '\n#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_ANDROID)\n' + body + func_end_str + '\n#else\n    return nullptr;\n#endif\n}' + post
+
+with open(file_path, 'w') as f:
+    f.write(code)
+"
+
+# Включаем поддержку epoll на Android
+echo "Enabling epoll tool support for Android..."
+sed -i 's/if (is_linux || is_chromeos)/if (is_linux || is_chromeos || is_android)/g' net/third_party/quiche/BUILD.gn || true
 
 cat << 'EOF' > net/eidolon/BUILD.gn
 shared_library("libeidolon") {
   testonly = true
-  sources = [
-    "eidolon_bridge.cc",
-    "//net/third_party/quiche/src/quiche/quic/tools/quic_server.cc"
-  ]
+  sources = [ "eidolon_bridge.cc" ]
   deps = [
     "//net:net",
     "//base:base",
@@ -147,7 +179,8 @@ shared_library("libeidolon") {
     "//net/third_party/quiche:quic_server_core"
   ]
 
-  if (is_linux || is_chromeos) {
+  # Подключаем epoll-сервер только там, где он физически поддерживается
+  if (is_linux || is_chromeos || is_android) {
     deps += [ "//net/third_party/quiche:epoll_tool_support" ]
   }
 }
@@ -174,10 +207,6 @@ if [ "$host_os" = "win" ]; then
   fi
 fi
 
-echo "=== DIAGNOSTICS: WHO IS REQUIRING ATOMIC IN GN? ==="
-grep -rn '"atomic"' build/config/ || true
-echo "==================================================="
-
 echo "Patching Chromium's bundled Python to use system Python..."
 rm -rf third_party/cpython3/host/bin/python3* third_party/cpython3/host/bin/python.exe*
 mkdir -p third_party/cpython3/host/bin
@@ -196,7 +225,6 @@ import os
 files = ['build/toolchain/win/setup_toolchain.py', 'build/vs_toolchain.py']
 sdk_path = r'C:\Program Files (x86)\Windows Kits\10\include'
 
-# Ищем только те SDK, где физически установлены C++ заголовки (um/windows.h)
 valid_sdks = [d for d in os.listdir(sdk_path) if os.path.exists(os.path.join(sdk_path, d, 'um', 'windows.h'))]
 best_sdk = sorted(valid_sdks, key=lambda x: int(x.split('.')[2]))[-1] if valid_sdks else '10.0.26100.0'
 
@@ -206,12 +234,10 @@ for filepath in files:
     if os.path.exists(filepath):
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
-        # Подменяем сломанную версию на рабочую
         content = content.replace('10.0.28000.0', best_sdk)
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(content)
 "
-# Вырезаем фантомный макрос Chromium и ставим валидный hex для Windows 11 22H2
   echo "Patching missing NTDDI macro..."
   sed -i '/NTDDI_VERSION/d' build/config/win/BUILD.gn || true
 
@@ -220,16 +246,13 @@ for filepath in files:
   find base/win -type f -name "*.h" -exec sed -i 's/#error Windows 10.0.28000.0 SDK or higher required./\/\/ bypassed/g' {} + || true
 fi
 
-# Глобально вырезаем привязку к несуществующей библиотеке atomic
+# ФИКС: Железобетонная замена флага atomic на c для всех платформ
 echo "Removing obsolete -latomic dependency globally..."
-find build/config -type f -name "BUILD.gn" -exec sed -i 's/"atomic"/"c"/g' {} + || true
+find build/config -type f -name "*.gn" -exec sed -i 's/"atomic"/"c"/g' {} + || true
+find build/config -type f -name "*.gni" -exec sed -i 's/"atomic"/"c"/g' {} + || true
 
 echo "Running GN..."
 ./gn/out/gn gen "$out" --args="$flags $EXTRA_FLAGS"
-
-echo "=== DIAGNOSTICS: CHECKING NINJA FILES FOR -latomic ==="
-grep -rn "latomic" "$out"/ || true
-echo "======================================================"
 
 if [ "$host_os" = linux ]; then
   clang_x64_targets=$(grep -o ' | .*' $out/toolchain.ninja | grep -o ' clang_x64/[^ ]*' | sort -u || true)
@@ -242,12 +265,8 @@ echo "Mocking missing test dependencies for GN/Ninja..."
 mkdir -p third_party/test_fonts/test_fonts
 touch third_party/test_fonts/test_fonts/Ahem.ttf
 
-echo "Building libeidolon (VERBOSE)..."
-if ! ninja -v -C "$out" eidolon; then
-  echo "=== DIAGNOSTICS: LINKER FAILED! DUMPING SYSROOT CONTENTS ==="
-  ls -laR third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/ || true
-  ls -laR third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/linux-x86_64/lib64/clang/ || true
-  echo "============================================================"
+echo "Building libeidolon..."
+if ! ninja -C "$out" eidolon; then
   exit 1
 fi
 
