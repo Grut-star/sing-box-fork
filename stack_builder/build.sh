@@ -128,37 +128,9 @@ cp eidolon_bridge.h net/eidolon/
 # 2. Подготавливаем CGO-мост
 cp ../protocol/eidolon/bridge.h net/eidolon/
 
-# 3. АВТОПАТЧ: Отключаем серверную часть QUIC для Mac и Windows (где нет epoll)
-echo "Patching eidolon_bridge.cc to isolate epoll dependencies..."
-python3 -c "
-import os
-
-file_path = 'net/eidolon/eidolon_bridge.cc'
-with open(file_path, 'r', encoding='utf-8') as f:
-    code = f.read()
-
-start_str = 'class EidolonServerStream;'
-end_str = '// C-API (ДЛЯ GOLANG)'
-
-if start_str in code and end_str in code and 'BUILDFLAG(IS_LINUX)' not in code.split(start_str)[1][:100]:
-    pre, rest = code.split(start_str, 1)
-    mid, post = rest.split(end_str, 1)
-    code = pre + '\n#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)\n' + start_str + mid + '\n#endif\n\n' + end_str + post
-
-func_start = 'EIDOLON_EXPORT EidolonHandle eidolon_listen_quic'
-if func_start in code:
-    pre, rest = code.split(func_start, 1)
-    func_end_str = 'return session.release();\n}'
-    if func_end_str in rest and 'return nullptr;' not in rest:
-        mid, post = rest.split(func_end_str, 1)
-        body_start_idx = mid.find('{') + 1
-        sig = mid[:body_start_idx]
-        body = mid[body_start_idx:]
-        code = pre + func_start + sig + '\n#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)\n' + body + func_end_str + '\n#else\n    return nullptr;\n#endif\n}' + post
-
-with open(file_path, 'w', encoding='utf-8') as f:
-    f.write(code)
-"
+# 2. Включаем epoll для Android
+echo "Enabling epoll tool support for Android..."
+sed -i 's/if (is_linux || is_chromeos)/if (is_linux || is_chromeos || is_android)/g' net/third_party/quiche/BUILD.gn || true
 
 cat << 'EOF' > net/eidolon/BUILD.gn
 shared_library("libeidolon") {
@@ -175,7 +147,7 @@ shared_library("libeidolon") {
     "//net/third_party/quiche:quic_server_core"
   ]
 
-  if (is_linux || is_chromeos) {
+  if (is_linux || is_chromeos || is_android) {
     deps += [ "//net/third_party/quiche:epoll_tool_support" ]
   }
 }
@@ -262,6 +234,10 @@ if [ "$IS_ANDROID" = "true" ]; then
   done
   rm -f dummy.c dummy_*.o libatomic_*.a
 fi
+
+echo "Removing obsolete -latomic dependency globally..."
+find build/config -type f -name "*.gn" -exec sed -i 's/"atomic"/"c"/g' {} + || true
+find build/config -type f -name "*.gni" -exec sed -i 's/"atomic"/"c"/g' {} + || true
 
 echo "Running GN..."
 ./gn/out/gn gen "$out" --args="$flags $EXTRA_FLAGS"

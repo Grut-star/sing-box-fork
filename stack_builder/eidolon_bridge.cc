@@ -76,6 +76,11 @@ typedef SSIZE_T ssize_t;
 #include "net/proxy_resolution/proxy_config_with_annotation.h"
 
 #include "net/quic/crypto/proof_source_chromium.h"
+#include "net/cert/cert_verify_proc.h"
+#include <optional>
+
+// === ЗАЩИТА СЕРВЕРНЫХ ЗАВИСИМОСТЕЙ QUIC ===
+#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_ANDROID)
 #include "quiche/quic/tools/quic_simple_server_backend.h"
 #include "quiche/quic/tools/quic_memory_cache_backend.h"
 #include "quiche/quic/tools/quic_server.h"
@@ -85,8 +90,8 @@ typedef SSIZE_T ssize_t;
 #include "base/task/thread_pool.h"
 #include "quiche/quic/core/quic_default_connection_helper.h"
 #include "quiche/quic/tools/quic_simple_crypto_server_stream_helper.h"
-#include "net/cert/cert_verify_proc.h"
-#include <optional>
+#endif
+// ===========================================
 
 static base::AtExitManager* g_exit_manager = nullptr;
 static base::Thread* g_io_thread = nullptr;
@@ -682,6 +687,9 @@ private:
     std::unique_ptr<net::StreamSocket> raw_socket_;
 };
 
+// === СЕРВЕРНАЯ ЧАСТЬ QUIC СТРОГО ПОД ЛИНУКС/АНДРОИД ===
+#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_ANDROID)
+
 class EidolonServerStream;
 
 class BidirectionalPump : public base::RefCountedThreadSafe<BidirectionalPump> {
@@ -968,6 +976,9 @@ private:
     uint16_t cb_port_;
 };
 
+#endif // BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_ANDROID)
+// ===============================================================
+
 // -------------------------------------------------------------------------
 // C-API (ДЛЯ GOLANG)
 // -------------------------------------------------------------------------
@@ -1029,7 +1040,11 @@ EIDOLON_EXPORT EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, 
     EnsureChromiumIOThread();
     auto session = std::make_unique<EidolonSession>(data_fd, true);
     std::string target_host(host);
-    std::vector<uint8_t> token_vec(token, token + token_len);
+
+    // ФИКС ВАРНИНГА: Используем безопасное копирование span
+    auto safe_span = UNSAFE_BUFFERS(base::span<const uint8_t>(token, token_len));
+    std::vector<uint8_t> token_vec(safe_span.begin(), safe_span.end());
+
     base::WaitableEvent connect_event(base::WaitableEvent::ResetPolicy::MANUAL, base::WaitableEvent::InitialState::NOT_SIGNALED);
 
     g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
@@ -1061,10 +1076,11 @@ g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
     } else {
         auto* ssl_socket = static_cast<net::SSLClientSocket*>(s->tcp_socket.get());
         if (ssl_socket) {
+            // ФИКС ВАРНИНГА: Используем макросы безопасности
             int export_rv = ssl_socket->ExportKeyingMaterial(
                     "eidolon-traffic-key",
                     std::nullopt,
-                    base::span<uint8_t>(key, len)
+                    UNSAFE_BUFFERS(base::span<uint8_t>(key, len))
             );
             if (export_rv == net::OK) {
                 *res = 0;
@@ -1091,6 +1107,7 @@ delete session;
 }
 
 EIDOLON_EXPORT EidolonHandle eidolon_listen_quic(const char* host, uint16_t port, const uint8_t* secret, size_t secret_len, uintptr_t cb_port) {
+#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_ANDROID)
     EnsureChromiumIOThread();
     auto session = std::make_unique<EidolonSession>(0, true);
     std::string target_host(host);
@@ -1101,6 +1118,9 @@ EIDOLON_EXPORT EidolonHandle eidolon_listen_quic(const char* host, uint16_t port
     }, target_host, port, static_cast<uint16_t>(cb_port)));
 
     return session.release();
+#else
+    return nullptr;
+#endif
 }
 
 } // extern "C"
