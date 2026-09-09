@@ -56,20 +56,20 @@ jobs:
           echo "Target Chromium Version: $VALID_VERSION"
           echo "VERSION=$VALID_VERSION" >> $GITHUB_OUTPUT
 
-          - name: Check if Release already exists
-            id: check
-            env:
-              GH_TOKEN: ${{ github.token }}
-            run: |
-              VERSION="${{ steps.get_version.outputs.VERSION }}"
-              # 3. Проверяем, собирали ли мы уже эту ВАЛИДНУЮ версию
-              if gh release view "v$VERSION" --repo ${{ github.repository }} >/dev/null 2>&1; then
-                echo "Release v$VERSION already exists. Skipping build."
-                echo "SHOULD_BUILD=false" >> $GITHUB_OUTPUT
-              else
-                echo "New valid version v$VERSION found. Proceeding with build."
-                echo "SHOULD_BUILD=true" >> $GITHUB_OUTPUT
-              fi
+      - name: Check if Release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.get_version.outputs.VERSION }}"
+          # 3. Проверяем, собирали ли мы уже эту ВАЛИДНУЮ версию
+          if gh release view "v$VERSION" --repo ${{ github.repository }} >/dev/null 2>&1; then
+            echo "Release v$VERSION already exists. Skipping build."
+            echo "SHOULD_BUILD=false" >> $GITHUB_OUTPUT
+          else
+            echo "New valid version v$VERSION found. Proceeding with build."
+            echo "SHOULD_BUILD=true" >> $GITHUB_OUTPUT
+          fi
 
   cache-toolchains-posix:
     needs: prepare
