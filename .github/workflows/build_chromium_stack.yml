@@ -27,25 +27,49 @@ jobs:
       chromium_version: ${{ steps.get_version.outputs.VERSION }}
       should_build: ${{ steps.check.outputs.SHOULD_BUILD }}
     steps:
-      - name: Fetch Latest Chromium Version
+      - name: Fetch Latest Valid Chromium Version
         id: get_version
         run: |
-          VERSION=$(curl -s "https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Android" | jq -r '.[0].version')
-          echo "Target Chromium Version: $VERSION"
-          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
-      - name: Check if Release already exists
-        id: check
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          VERSION="${{ steps.get_version.outputs.VERSION }}"
-          if gh release view "v$VERSION" --repo ${{ github.repository }} >/dev/null 2>&1; then
-            echo "Release v$VERSION already exists. Skipping build."
-            echo "SHOULD_BUILD=false" >> $GITHUB_OUTPUT
+          # 1. Получаем список последних версий
+          VERSIONS=$(curl -s "https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Android" | jq -r '.[].version')
+          
+          VALID_VERSION=""
+          for V in $VERSIONS; do
+          echo "Checking availability of tarball for version $V..."
+          # 2. Легковесный HEAD-запрос для проверки физического наличия архива
+          HTTP_STATUS=$(curl -s -I -o /dev/null -w "%{http_code}" "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-$V.tar.xz")
+          
+          if [ "$HTTP_STATUS" = "200" ]; then
+           echo "Tarball found! Using version $V"
+           VALID_VERSION=$V
+           break
           else
-            echo "New version v$VERSION found. Proceeding with build."
-            echo "SHOULD_BUILD=true" >> $GITHUB_OUTPUT
+           echo "Tarball not found (HTTP $HTTP_STATUS). Trying older release..."
           fi
+          done
+          
+          if [ -z "$VALID_VERSION" ]; then
+          echo "Error: Failed to find any valid Chromium tarballs."
+          exit 1
+          fi
+          
+          echo "Target Chromium Version: $VALID_VERSION"
+          echo "VERSION=$VALID_VERSION" >> $GITHUB_OUTPUT
+
+          - name: Check if Release already exists
+            id: check
+            env:
+              GH_TOKEN: ${{ github.token }}
+            run: |
+              VERSION="${{ steps.get_version.outputs.VERSION }}"
+              # 3. Проверяем, собирали ли мы уже эту ВАЛИДНУЮ версию
+              if gh release view "v$VERSION" --repo ${{ github.repository }} >/dev/null 2>&1; then
+                echo "Release v$VERSION already exists. Skipping build."
+                echo "SHOULD_BUILD=false" >> $GITHUB_OUTPUT
+              else
+                echo "New valid version v$VERSION found. Proceeding with build."
+                echo "SHOULD_BUILD=true" >> $GITHUB_OUTPUT
+              fi
 
   cache-toolchains-posix:
     needs: prepare
