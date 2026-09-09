@@ -124,13 +124,43 @@ fi
 mkdir -p net/eidolon
 cp eidolon_bridge.cc net/eidolon/
 cp eidolon_bridge.h net/eidolon/
-
-# 2. Подготавливаем CGO-мост
 cp ../protocol/eidolon/bridge.h net/eidolon/
 
 # 2. Включаем epoll для Android
-echo "Enabling epoll tool support for Android..."
-sed -i 's/if (is_linux || is_chromeos)/if (is_linux || is_chromeos || is_android)/g' net/third_party/quiche/BUILD.gn || true
+#echo "Enabling epoll tool support for Android..."
+#sed -i 's/if (is_linux || is_chromeos)/if (is_linux || is_chromeos || is_android)/g' net/third_party/quiche/BUILD.gn || true
+
+# 2. Изолируем серверный код QUIC для всех платформ-клиентов (Mac, Win, Android)
+echo "Patching eidolon_bridge.cc to isolate epoll dependencies..."
+python3 -c "
+import os
+
+file_path = 'net/eidolon/eidolon_bridge.cc'
+with open(file_path, 'r', encoding='utf-8') as f:
+    code = f.read()
+
+start_str = 'class EidolonServerStream;'
+end_str = '// C-API (ДЛЯ GOLANG)'
+
+if start_str in code and end_str in code and 'BUILDFLAG(IS_LINUX)' not in code.split(start_str)[1][:100]:
+    pre, rest = code.split(start_str, 1)
+    mid, post = rest.split(end_str, 1)
+    code = pre + '\n#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)\n' + start_str + mid + '\n#endif\n\n' + end_str + post
+
+func_start = 'EIDOLON_EXPORT EidolonHandle eidolon_listen_quic'
+if func_start in code:
+    pre, rest = code.split(func_start, 1)
+    func_end_str = 'return session.release();\n}'
+    if func_end_str in rest and 'return nullptr;' not in rest:
+        mid, post = rest.split(func_end_str, 1)
+        body_start_idx = mid.find('{') + 1
+        sig = mid[:body_start_idx]
+        body = mid[body_start_idx:]
+        code = pre + func_start + sig + '\n#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)\n' + body + func_end_str + '\n#else\n    return nullptr;\n#endif\n}' + post
+
+with open(file_path, 'w', encoding='utf-8') as f:
+    f.write(code)
+"
 
 cat << 'EOF' > net/eidolon/BUILD.gn
 shared_library("libeidolon") {
@@ -147,7 +177,7 @@ shared_library("libeidolon") {
     "//net/third_party/quiche:quic_server_core"
   ]
 
-  if (is_linux || is_chromeos || is_android) {
+  if (is_linux || is_chromeos) {
     deps += [ "//net/third_party/quiche:epoll_tool_support" ]
   }
 }
