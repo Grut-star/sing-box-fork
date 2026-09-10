@@ -80,7 +80,7 @@ typedef SSIZE_T ssize_t;
 #include <optional>
 
 // === ЗАЩИТА СЕРВЕРНЫХ ЗАВИСИМОСТЕЙ QUIC ===
-#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_ANDROID)
+#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
 #include "quiche/quic/tools/quic_simple_server_backend.h"
 #include "quiche/quic/tools/quic_memory_cache_backend.h"
 #include "quiche/quic/tools/quic_server.h"
@@ -687,8 +687,8 @@ private:
     std::unique_ptr<net::StreamSocket> raw_socket_;
 };
 
-// === СЕРВЕРНАЯ ЧАСТЬ QUIC СТРОГО ПОД ЛИНУКС/АНДРОИД ===
-#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_ANDROID)
+// === СЕРВЕРНАЯ ЧАСТЬ QUIC СТРОГО ПОД ЛИНУКС ===
+#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
 
 class EidolonServerStream;
 
@@ -976,7 +976,7 @@ private:
     uint16_t cb_port_;
 };
 
-#endif // BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_ANDROID)
+#endif // BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
 // ===============================================================
 
 // -------------------------------------------------------------------------
@@ -1107,7 +1107,7 @@ delete session;
 }
 
 EIDOLON_EXPORT EidolonHandle eidolon_listen_quic(const char* host, uint16_t port, const uint8_t* secret, size_t secret_len, uintptr_t cb_port) {
-#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_ANDROID)
+#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
     EnsureChromiumIOThread();
     auto session = std::make_unique<EidolonSession>(0, true);
     std::string target_host(host);
