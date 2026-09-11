@@ -30,12 +30,12 @@ jobs:
       - name: Fetch Latest Valid Chromium Version
         id: get_version
         run: |
-          # 1. Получаем список последних версий
-          VERSIONS=$(curl -s "https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Android" | jq -r '.[].version')
+          # 1. Получаем список последних десктопных версий и сортируем по убыванию
+          VERSIONS=$(curl -s "https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Linux" | jq -r '.[].version' | sort -rV | uniq)
           
           VALID_VERSION=""
           for V in $VERSIONS; do
-          echo "Checking availability of tarball for version $V..."
+            echo "Checking availability of tarball for version $V..."
           # 2. Легковесный HEAD-запрос для проверки физического наличия архива
           HTTP_STATUS=$(curl -s -I -o /dev/null -w "%{http_code}" "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-$V.tar.xz")
           

@@ -120,16 +120,39 @@ else
   echo 'group("histograms_xml") {}' >> tools/metrics/BUILD.gn
 fi
 
-# 1. Подготавливаем исходники C++
+# 1. Подготавливаем исходники C++ (возвращаем рабочий вариант)
 mkdir -p net/eidolon
 cp eidolon_bridge.cc net/eidolon/
 cp eidolon_bridge.h net/eidolon/
+
+# === 2. СОЗДАЕМ ФАЙЛ ЭКСПОРТА (VERSION SCRIPT) ===
+cat << 'EOF' > net/eidolon/eidolon.map
+{
+  global:
+    eidolon_*;
+  local:
+    *;
+};
+EOF
+# =================================================
+
+# 3. Подготавливаем CGO-мост, который требует bridge.h
 cp ../protocol/eidolon/bridge.h net/eidolon/
 
 cat << 'EOF' > net/eidolon/BUILD.gn
 shared_library("libeidolon") {
   testonly = true
   sources = [ "eidolon_bridge.cc" ]
+
+  # === ПРАВИЛЬНАЯ НАСТРОЙКА ЛИНКЕРА ДЛЯ МИНИМАЛЬНОГО РАЗМЕРА ===
+  if (is_android) {
+    # Отключаем стандартный JNI-фильтр Chromium
+    configs -= [ "//build/config/android:hide_all_but_jni_onload" ]
+    # Включаем наш фильтр: оставляем только функции eidolon_*
+    ldflags = [ "-Wl,--version-script=" + rebase_path("eidolon.map", root_build_dir) ]
+  }
+  # =============================================================
+
   deps = [
     "//net:net",
     "//base:base",
