@@ -1125,7 +1125,7 @@ EIDOLON_EXPORT EidolonHandle eidolon_listen_quic(const char* host, uint16_t port
 
 } // extern "C"
 
-#if defined(__ANDROID__)
+#if BUILDFLAG(IS_ANDROID)
 #include <jni.h>
 #include "base/android/jni_android.h"
 
