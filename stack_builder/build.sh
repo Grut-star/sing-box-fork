@@ -7,7 +7,9 @@ mkdir -p "$TMPDIR"
 
 out=out/Release
 flags="
-  is_official_build=false
+  is_official_build=true
+  optimize_for_size=true
+  disable_fieldtrial_testing_config=true
   chrome_pgo_phase=0
   exclude_unwind_tables=true
   enable_resource_allowlist_generation=false
