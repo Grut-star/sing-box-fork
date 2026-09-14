@@ -130,7 +130,6 @@ cat << 'EOF' > net/eidolon/eidolon.map
 {
   global:
     eidolon_*;
-    JNI_OnLoad;
   local:
     *;
 };
