@@ -255,7 +255,7 @@ jobs:
       - name: Pack artifacts
         run: |
           mkdir ${{ env.BUNDLE }}
-          cp out/Release/*eidolon* eidolon_bridge.h ${{ env.BUNDLE }}/
+          cp out/Release/*eidolon* eidolon_bridge.h out/Release/chromium_base.jar ${{ env.BUNDLE }}/
           tar cJf ${{ env.BUNDLE }}.tar.xz ${{ env.BUNDLE }}
       - uses: actions/upload-artifact@v4
         with:
@@ -324,7 +324,7 @@ jobs:
       - name: Pack artifacts
         run: |
           mkdir ${{ env.BUNDLE }}
-          cp out/Release/*eidolon* eidolon_bridge.h ${{ env.BUNDLE }}/
+          cp out/Release/*eidolon* eidolon_bridge.h out/Release/chromium_base.jar ${{ env.BUNDLE }}/
           tar cJf ${{ env.BUNDLE }}.tar.xz ${{ env.BUNDLE }}
       - uses: actions/upload-artifact@v4
         with:
@@ -377,7 +377,7 @@ jobs:
       - name: Pack artifacts
         run: |
           mkdir ${{ env.BUNDLE }}
-          cp out/Release/*eidolon* eidolon_bridge.h ${{ env.BUNDLE }}/
+          cp out/Release/*eidolon* eidolon_bridge.h out/Release/chromium_base.jar ${{ env.BUNDLE }}/
           7z a ${{ env.BUNDLE }}.zip ${{ env.BUNDLE }}
       - uses: actions/upload-artifact@v4
         with:
@@ -421,7 +421,7 @@ jobs:
       - name: Pack artifacts
         run: |
           mkdir ${{ env.BUNDLE }}
-          cp out/Release/*eidolon* eidolon_bridge.h ${{ env.BUNDLE }}/
+          cp out/Release/*eidolon* eidolon_bridge.h out/Release/chromium_base.jar ${{ env.BUNDLE }}/
           tar cJf ${{ env.BUNDLE }}.tar.xz ${{ env.BUNDLE }}
       - uses: actions/upload-artifact@v4
         with:
@@ -465,7 +465,7 @@ jobs:
       - name: Pack artifacts
         run: |
           mkdir ${{ env.BUNDLE }}
-          cp out/Release/*eidolon* eidolon_bridge.h ${{ env.BUNDLE }}/
+          cp out/Release/*eidolon* eidolon_bridge.h out/Release/chromium_base.jar ${{ env.BUNDLE }}/
           tar cJf ${{ env.BUNDLE }}.tar.xz ${{ env.BUNDLE }}
       - uses: actions/upload-artifact@v4
         with:

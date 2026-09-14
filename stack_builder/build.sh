@@ -7,9 +7,7 @@ mkdir -p "$TMPDIR"
 
 out=out/Release
 flags="
-  is_official_build=true
-  optimize_for_size=true
-  disable_fieldtrial_testing_config=true
+  is_official_build=false
   chrome_pgo_phase=0
   exclude_unwind_tables=true
   enable_resource_allowlist_generation=false
@@ -69,7 +67,10 @@ if [ "$IS_ANDROID" = "true" ]; then
     use_platform_icu_alternatives=true
     is_desktop_android=true
     use_nss_certs=false
-    default_min_sdk_version=27'
+    default_min_sdk_version=27
+    is_official_build=true
+    optimize_for_size=true
+    disable_fieldtrial_testing_config=true'
 
   if echo "$EXTRA_FLAGS" | grep -q 'target_cpu="x64"\|target_cpu="arm64"'; then
     flags="$flags"'
