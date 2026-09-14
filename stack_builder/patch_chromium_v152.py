@@ -128,6 +128,14 @@ def main():
         r'    }\n'
     )
 
+    # 10. EIDOLON: Bypass JNI_ZERO_CHECK(g_jvm) to allow running without Chromium Java classes
+    apply_patch(
+        'third_party/jni_zero/jni_zero.cc',
+        r'(AttachCurrentThread.*?\{\n\s*)JNI_ZERO_[D]?CHECK\(g_jvm\);',
+        r'\1if (!g_jvm) return nullptr;',
+        replace_all=True
+    )
+
 #     apply_patch(
 #         'third_party/abseil-cpp/absl/base/internal/spinlock_win32.inc',
 #         r'#include <windows\.h>',

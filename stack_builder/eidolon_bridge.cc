@@ -1125,12 +1125,12 @@ EIDOLON_EXPORT EidolonHandle eidolon_listen_quic(const char* host, uint16_t port
 
 } // extern "C"
 
-#if defined(__ANDROID__) || defined(OS_ANDROID) || defined(ANDROID)
-#include <jni.h>
-#include "base/android/jni_android.h"
-
-extern "C" __attribute__((visibility("default"))) jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
-    base::android::InitVM(vm);
-    return JNI_VERSION_1_4;
-}
-#endif
+//#if defined(__ANDROID__) || defined(OS_ANDROID) || defined(ANDROID)
+//#include <jni.h>
+//#include "base/android/jni_android.h"
+//
+//extern "C" __attribute__((visibility("default"))) jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
+//    base::android::InitVM(vm);
+//    return JNI_VERSION_1_4;
+//}
+//#endif
