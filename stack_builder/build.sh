@@ -130,6 +130,7 @@ cat << 'EOF' > net/eidolon/eidolon.map
 {
   global:
     eidolon_*;
+    JNI_OnLoad;
   local:
     *;
 };
@@ -292,4 +293,16 @@ if [ -x "$STRIP_TOOL" ]; then
   fi
 else
   echo "llvm-strip not found, skipping."
+fi
+if [ "$IS_ANDROID" = "true" ]; then
+  echo "Building cronet_package to generate Chromium Java classes..."
+  if ninja -C "$out" cronet_package; then
+    echo "Extracting classes.jar from cronet.aar..."
+    mkdir -p "$out/cronet_extracted"
+    unzip -q -o "$out/cronet/cronet.aar" classes.jar -d "$out/cronet_extracted/" || true
+    mv "$out/cronet_extracted/classes.jar" "$out/chromium_base.jar" || true
+    echo "Generated $out/chromium_base.jar. This file must be added to your Android app's libs/ folder!"
+  else
+    echo "Failed to build cronet_package. Make sure you don't have conflicting patches."
+  fi
 fi
