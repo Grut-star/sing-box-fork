@@ -352,10 +352,13 @@ jobs:
           
               if pkg and ver:
                   pkg_str = pkg.group(1)
-                  # Раскрываем макросы gclient для Linux-сборщика
-                  pkg_str = pkg_str.replace('${{platform}}', 'linux-amd64')
-                  pkg_str = pkg_str.replace('${{os}}', 'linux')
-                  pkg_str = pkg_str.replace('${{arch}}', 'amd64')
+                  # Раскрываем макросы (строго с одной скобкой, чтобы не триггерить GitHub Actions)
+                  pkg_str = pkg_str.replace('${platform}', 'linux-amd64')
+                  pkg_str = pkg_str.replace('{platform}', 'linux-amd64')
+                  pkg_str = pkg_str.replace('${os}', 'linux')
+                  pkg_str = pkg_str.replace('{os}', 'linux')
+                  pkg_str = pkg_str.replace('${arch}', 'amd64')
+                  pkg_str = pkg_str.replace('{arch}', 'amd64')
           
                   ensure.append(f"@Subdir {path}")
                   ensure.append(f"{pkg_str} {ver.group(1)}")
