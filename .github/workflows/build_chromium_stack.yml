@@ -351,8 +351,14 @@ jobs:
               ver = re.search(r"'version'\s*:\s*'([^']+)'", content)
           
               if pkg and ver:
+                  pkg_str = pkg.group(1)
+                  # Раскрываем макросы gclient для Linux-сборщика
+                  pkg_str = pkg_str.replace('${{platform}}', 'linux-amd64')
+                  pkg_str = pkg_str.replace('${{os}}', 'linux')
+                  pkg_str = pkg_str.replace('${{arch}}', 'amd64')
+          
                   ensure.append(f"@Subdir {path}")
-                  ensure.append(f"{pkg.group(1)} {ver.group(1)}")
+                  ensure.append(f"{pkg_str} {ver.group(1)}")
           
           with open("cipd_android.txt", "w") as f:
               f.write("\n".join(ensure) + "\n")
