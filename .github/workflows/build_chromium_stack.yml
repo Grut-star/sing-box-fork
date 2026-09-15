@@ -327,55 +327,56 @@ jobs:
           echo "Downloading CIPD client..."
           curl -L "https://chrome-infra-packages.appspot.com/client?platform=linux-amd64&version=latest" -o cipd
           chmod +x cipd
-          
+
           echo "Parsing DEPS file natively..."
           cat << 'EOF' > parse_deps.py
           exec_locals = {}
-          
-          # Заглушка для перехвата внутренних макросов Chromium
+
           def Var(name):
               return exec_locals.get('vars', {}).get(name, str(name))
-          
+
           with open("DEPS") as f:
               content = f.read()
-          
-          # Напрямую выполняем DEPS как Python-код
+
           try:
               exec(content, {'Var': Var, 'Str': str}, exec_locals)
-          except Exception:
-              pass
-          
+          except Exception as e:
+              print(f"Compilation notice: {e}")
+
           ensure = []
           all_deps = {}
-          
-          # Объединяем универсальные и Android-специфичные зависимости
           all_deps.update(exec_locals.get('deps', {}))
           all_deps.update(exec_locals.get('deps_os', {}).get('android', {}))
-          
+
           for path, dep in all_deps.items():
               if isinstance(dep, dict) and 'packages' in dep:
-                  # Отбираем исключительно релевантные категории для экономии времени
                   if not any(k in path for k in ['android', 'jni', 'r8', 'cronet', 'protobuf', 'jdk', 'buildtools']):
                       continue
-          
+
                   for pkg in dep['packages']:
-                      pkg_name = pkg.get('package', '')
-                      version = pkg.get('version', '')
-          
-                      # Транслируем платформозависимые ключи
+                      pkg_name = pkg.get('package')
+                      version = pkg.get('version')
+
+                      # КРИТИЧЕСКИЙ ФИЛЬТР: Безжалостно отсекаем пакеты-пустышки
+                      if not pkg_name or not version:
+                          continue
+
+                      pkg_name = str(pkg_name)
+                      version = str(version)
+
                       pkg_name = pkg_name.replace('${platform}', 'linux-amd64').replace('{platform}', 'linux-amd64')
                       pkg_name = pkg_name.replace('${os}', 'linux').replace('{os}', 'linux')
                       pkg_name = pkg_name.replace('${arch}', 'amd64').replace('{arch}', 'amd64')
                       pkg_name = pkg_name.replace('$', '')
-          
+
                       path_clean = path.replace('src/', '')
                       ensure.append(f"@Subdir {path_clean}")
                       ensure.append(f"{pkg_name} {version}")
-          
+
           with open("cipd_android.txt", "w") as f:
               f.write("\n".join(ensure) + "\n")
           EOF
-          
+
           python3 parse_deps.py
           echo "Executing CIPD ensure..."
           ./cipd ensure -root . -ensure-file cipd_android.txt
