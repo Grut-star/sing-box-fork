@@ -89,6 +89,7 @@ jobs:
         run: |
           mkdir -p src
           cp -R stack_builder/* src/
+          sed -i 's/\r$//' src/*.sh
           chmod +x src/*.sh
           echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
       - name: Cache toolchains (Linux, OpenWrt, Android)
@@ -255,7 +256,7 @@ jobs:
       - name: Pack artifacts
         run: |
           mkdir ${{ env.BUNDLE }}
-          cp out/Release/*eidolon* eidolon_bridge.h out/Release/chromium_base.jar ${{ env.BUNDLE }}/
+          cp out/Release/*eidolon* eidolon_bridge.h ${{ env.BUNDLE }}/
           tar cJf ${{ env.BUNDLE }}.tar.xz ${{ env.BUNDLE }}
       - uses: actions/upload-artifact@v4
         with:
@@ -289,6 +290,7 @@ jobs:
         run: |
           mkdir -p src
           cp -R stack_builder/* src/
+          sed -i 's/\r$//' src/*.sh
           chmod +x src/*.sh
           echo "${{ env.CHROMIUM_VERSION }}" > CHROMIUM_VERSION
       - uses: actions/setup-java@v4
@@ -377,7 +379,7 @@ jobs:
       - name: Pack artifacts
         run: |
           mkdir ${{ env.BUNDLE }}
-          cp out/Release/*eidolon* eidolon_bridge.h out/Release/chromium_base.jar ${{ env.BUNDLE }}/
+          cp out/Release/*eidolon* eidolon_bridge.h ${{ env.BUNDLE }}/
           7z a ${{ env.BUNDLE }}.zip ${{ env.BUNDLE }}
       - uses: actions/upload-artifact@v4
         with:
@@ -421,7 +423,7 @@ jobs:
       - name: Pack artifacts
         run: |
           mkdir ${{ env.BUNDLE }}
-          cp out/Release/*eidolon* eidolon_bridge.h out/Release/chromium_base.jar ${{ env.BUNDLE }}/
+          cp out/Release/*eidolon* eidolon_bridge.h ${{ env.BUNDLE }}/
           tar cJf ${{ env.BUNDLE }}.tar.xz ${{ env.BUNDLE }}
       - uses: actions/upload-artifact@v4
         with:
@@ -465,7 +467,7 @@ jobs:
       - name: Pack artifacts
         run: |
           mkdir ${{ env.BUNDLE }}
-          cp out/Release/*eidolon* eidolon_bridge.h out/Release/chromium_base.jar ${{ env.BUNDLE }}/
+          cp out/Release/*eidolon* eidolon_bridge.h ${{ env.BUNDLE }}/
           tar cJf ${{ env.BUNDLE }}.tar.xz ${{ env.BUNDLE }}
       - uses: actions/upload-artifact@v4
         with:
