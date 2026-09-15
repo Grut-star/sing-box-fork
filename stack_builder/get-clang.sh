@@ -150,7 +150,8 @@ if [ "$target_os" = android ]; then
 
   cat << 'EOF' > parse_deps.py
 exec_locals = {}
-def Var(name): return str(name)
+def Var(name):
+    return exec_locals.get('vars', {}).get(name, str(name))
 with open("DEPS") as f:
     try:
         exec(f.read(), {'Var': Var, 'Str': str}, exec_locals)
