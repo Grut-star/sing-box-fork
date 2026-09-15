@@ -328,38 +328,49 @@ jobs:
           curl -L "https://chrome-infra-packages.appspot.com/client?platform=linux-amd64&version=latest" -o cipd
           chmod +x cipd
           
-          echo "Parsing DEPS file to generate CIPD manifest..."
+          echo "Parsing DEPS file natively..."
           cat << 'EOF' > parse_deps.py
-          import re
+          exec_locals = {}
+          
+          # Заглушка для перехвата внутренних макросов Chromium
+          def Var(name):
+              return exec_locals.get('vars', {}).get(name, str(name))
           
           with open("DEPS") as f:
-              text = f.read()
+              content = f.read()
+          
+          # Напрямую выполняем DEPS как Python-код
+          try:
+              exec(content, {'Var': Var, 'Str': str}, exec_locals)
+          except Exception:
+              pass
           
           ensure = []
-          # Дробим файл DEPS на самостоятельные модули
-          blocks = re.split(r"'(src/[^']+)'\s*:\s*\{", text)
+          all_deps = {}
           
-          for i in range(1, len(blocks), 2):
-              path = blocks[i].replace("src/", "")
-              content = blocks[i+1]
+          # Объединяем универсальные и Android-специфичные зависимости
+          all_deps.update(exec_locals.get('deps', {}))
+          all_deps.update(exec_locals.get('deps_os', {}).get('android', {}))
           
-              # Оставляем исключительно Android/Java компоненты
-              if "android" not in path and "jni" not in path and "r8" not in path:
-                  continue
+          for path, dep in all_deps.items():
+              if isinstance(dep, dict) and 'packages' in dep:
+                  # Отбираем исключительно релевантные категории для экономии времени
+                  if not any(k in path for k in ['android', 'jni', 'r8', 'cronet', 'protobuf', 'jdk', 'buildtools']):
+                      continue
           
-              pkg = re.search(r"'package'\s*:\s*'([^']+)'", content)
-              ver = re.search(r"'version'\s*:\s*'([^']+)'", content)
+                  for pkg in dep['packages']:
+                      pkg_name = pkg.get('package', '')
+                      version = pkg.get('version', '')
           
-              if pkg and ver:
-                  pkg_str = pkg.group(1)
+                      # Транслируем платформозависимые ключи
+                      pkg_name = pkg_name.replace('${platform}', 'linux-amd64').replace('{platform}', 'linux-amd64')
+                      pkg_name = pkg_name.replace('${os}', 'linux').replace('{os}', 'linux')
+                      pkg_name = pkg_name.replace('${arch}', 'amd64').replace('{arch}', 'amd64')
+                      pkg_name = pkg_name.replace('$', '')
           
-                  # Используем Regex для маскировки паттерна от GitHub Actions
-                  pkg_str = re.sub(r'\$+\{+platform\}+', 'linux-amd64', pkg_str)
-                  pkg_str = re.sub(r'\$+\{+os\}+', 'linux', pkg_str)
-                  pkg_str = re.sub(r'\$+\{+arch\}+', 'amd64', pkg_str)
-          
-                  ensure.append(f"@Subdir {path}")
-                  ensure.append(f"{pkg_str} {ver.group(1)}")
+                      path_clean = path.replace('src/', '')
+                      ensure.append(f"@Subdir {path_clean}")
+                      ensure.append(f"{pkg_name} {version}")
           
           with open("cipd_android.txt", "w") as f:
               f.write("\n".join(ensure) + "\n")
