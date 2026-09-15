@@ -323,6 +323,22 @@ jobs:
           sudo apt install ninja-build pkg-config ccache
       - run: ./get-clang.sh
       - run: ./build.sh
+      - name: Fetch prebuilt Cronet classes (Bypass CIPD deps)
+        run: |
+          if [ ! -f "out/Release/chromium_base.jar" ]; then
+            echo "Fetching official Cronet Java classes from Google Maven..."
+          
+            # Получаем последнюю стабильную версию Cronet
+            META_URL="https://dl.google.com/dl/android/maven2/org/chromium/net/cronet-embedded/maven-metadata.xml"
+            LATEST_CRONET=$(curl -s "$META_URL" | grep -m 1 '<release>' | sed -e 's/<[^>]*>//g' | tr -d ' \n\r')
+            if [ -z "$LATEST_CRONET" ]; then LATEST_CRONET="119.0.6045.31"; fi
+          
+            # Скачиваем AAR и извлекаем classes.jar напрямую в нужную папку
+            AAR_URL="https://dl.google.com/dl/android/maven2/org/chromium/net/cronet-embedded/$LATEST_CRONET/cronet-embedded-$LATEST_CRONET.aar"
+            curl -L -o cronet.aar "$AAR_URL"
+            unzip -q -o cronet.aar classes.jar
+            mv classes.jar out/Release/chromium_base.jar
+          fi
       - name: Pack artifacts
         run: |
           mkdir ${{ env.BUNDLE }}
