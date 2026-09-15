@@ -117,33 +117,74 @@ if [ "$target_os" = android ]; then
   cd -
   # ===========================================================================
 
-  echo "Injecting System JDK via wrapper scripts..."
-  rm -rf third_party/jdk/current
-  mkdir -p third_party/jdk/current/bin
-  for tool in java javac javap jar; do
-    TOOL_PATH=$(which $tool || true)
-    if [ -n "$TOOL_PATH" ]; then
-      cat << EOF > "third_party/jdk/current/bin/$tool"
-#!/bin/sh
-exec "$TOOL_PATH" "\$@"
-EOF
-      chmod +x "third_party/jdk/current/bin/$tool"
-    fi
-  done
+#  echo "Injecting System JDK via wrapper scripts..."
+#  rm -rf third_party/jdk/current
+#  mkdir -p third_party/jdk/current/bin
+#  for tool in java javac javap jar; do
+#    TOOL_PATH=$(which $tool || true)
+#    if [ -n "$TOOL_PATH" ]; then
+#      cat << EOF > "third_party/jdk/current/bin/$tool"
+##!/bin/sh
+#exec "$TOOL_PATH" "\$@"
+#EOF
+#      chmod +x "third_party/jdk/current/bin/$tool"
+#    fi
+#  done
+#
+#  if [ ! -f third_party/android_sdk/public/platforms/android-37.0/android.jar ]; then
+#    echo "Setting up Android SDK mock..."
+#    mkdir -p third_party/android_sdk/public/platforms/android-37.0
+#    if [ -n "$ANDROID_HOME" ] && [ -d "$ANDROID_HOME/platforms" ]; then
+#      LATEST_API=$(ls -1 "$ANDROID_HOME/platforms" 2>/dev/null | grep -E '^android-[0-9]+$' | sort -V | tail -n 1)
+#      if [ -n "$LATEST_API" ]; then
+#        cp "$ANDROID_HOME/platforms/$LATEST_API/android.jar" third_party/android_sdk/public/platforms/android-37.0/android.jar || true
+#      fi
+#    fi
+#    if [ ! -f third_party/android_sdk/public/platforms/android-37.0/android.jar ]; then
+#      curl -L -o third_party/android_sdk/public/platforms/android-37.0/android.jar "https://github.com/Sable/android-platforms/raw/master/android-28/android.jar"
+#    fi
+#  fi
+  echo "Fetching genuine Android Java Toolchain (SDK, JDK, R8, android_deps) via CIPD..."
+  curl -L -s "https://chrome-infra-packages.appspot.com/client?platform=linux-amd64&version=latest" -o cipd
+  chmod +x cipd
 
-  if [ ! -f third_party/android_sdk/public/platforms/android-37.0/android.jar ]; then
-    echo "Setting up Android SDK mock..."
-    mkdir -p third_party/android_sdk/public/platforms/android-37.0
-    if [ -n "$ANDROID_HOME" ] && [ -d "$ANDROID_HOME/platforms" ]; then
-      LATEST_API=$(ls -1 "$ANDROID_HOME/platforms" 2>/dev/null | grep -E '^android-[0-9]+$' | sort -V | tail -n 1)
-      if [ -n "$LATEST_API" ]; then
-        cp "$ANDROID_HOME/platforms/$LATEST_API/android.jar" third_party/android_sdk/public/platforms/android-37.0/android.jar || true
-      fi
-    fi
-    if [ ! -f third_party/android_sdk/public/platforms/android-37.0/android.jar ]; then
-      curl -L -o third_party/android_sdk/public/platforms/android-37.0/android.jar "https://github.com/Sable/android-platforms/raw/master/android-28/android.jar"
-    fi
-  fi
+  cat << 'EOF' > parse_deps.py
+exec_locals = {}
+def Var(name): return str(name)
+with open("DEPS") as f:
+    try:
+        exec(f.read(), {'Var': Var, 'Str': str}, exec_locals)
+    except Exception: pass
+
+ensure = []
+deps = {}
+deps.update(exec_locals.get('deps', {}))
+deps.update(exec_locals.get('deps_os', {}).get('android', {}))
+
+for path, dep in deps.items():
+    if isinstance(dep, dict) and 'packages' in dep:
+        if not any(k in path for k in ['android_deps', 'r8', 'jdk', 'android_sdk']):
+            continue
+        for pkg in dep['packages']:
+            p = str(pkg.get('package', ''))
+            v = str(pkg.get('version', ''))
+            if not p or not v or '{' in p or '$' in p or '{' in v or '$' in v: continue
+
+            # Жестко фиксируем платформу под Linux-раннер GitHub Actions
+            p = p.replace('${platform}', 'linux-amd64').replace('{platform}', 'linux-amd64')
+            p = p.replace('${os}', 'linux').replace('{os}', 'linux')
+            p = p.replace('${arch}', 'amd64').replace('{arch}', 'amd64')
+            p = p.replace('$', '')
+
+            ensure.append(f"@Subdir {path.replace('src/', '')}")
+            ensure.append(f"{p} {v}")
+
+with open("cipd_android.txt", "w") as f: f.write("\n".join(ensure))
+EOF
+
+  python3 parse_deps.py
+  ./cipd ensure -root . -ensure-file cipd_android.txt
+  rm cipd parse_deps.py cipd_android.txt
 fi
 
 if [ ! -d third_party/libunwindstack/.git ]; then

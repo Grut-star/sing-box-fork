@@ -373,29 +373,29 @@ jobs:
 #          echo "Executing CIPD ensure..."
 #          ./cipd ensure -root . -ensure-file cipd_android.txt
       - run: ./build.sh
-      - name: Generate chromium_base.jar from intermediates
-        run: |
-          echo "Collecting compiled Java classes..."
-          mkdir -p out/Release/java_extracted
-          
-          # Ищем все промежуточные JAR, которые УЖЕ сгенерировались при сборке C++ движка
-          find out/Release/obj -type f -name "*.jar" \( -name "*jni_zero*.jar" -o -name "*base_java*.jar" -o -name "*net_java*.jar" -o -name "*url_java*.jar" \) | while read jarfile; do
-              unzip -q -o "$jarfile" -d out/Release/java_extracted/ || true
-          done
-          
-          # Очищаем метаданные, чтобы избежать конфликтов подписей при слиянии
-          rm -rf out/Release/java_extracted/META-INF
-          
-          # Упаковываем извлеченные классы в единый архив
-          if [ "$(ls -A out/Release/java_extracted 2>/dev/null)" ]; then
-              cd out/Release/java_extracted
-              jar cvf ../chromium_base.jar .
-              cd ../../..
-              echo "Successfully generated chromium_base.jar!"
-          else
-              echo "Error: No intermediate Java classes found."
-              exit 1
-          fi
+#      - name: Generate chromium_base.jar from intermediates
+#        run: |
+#          echo "Collecting compiled Java classes..."
+#          mkdir -p out/Release/java_extracted
+#
+#          # Ищем все промежуточные JAR, которые УЖЕ сгенерировались при сборке C++ движка
+#          find out/Release/obj -type f -name "*.jar" \( -name "*jni_zero*.jar" -o -name "*base_java*.jar" -o -name "*net_java*.jar" -o -name "*url_java*.jar" \) | while read jarfile; do
+#              unzip -q -o "$jarfile" -d out/Release/java_extracted/ || true
+#          done
+#
+#          # Очищаем метаданные, чтобы избежать конфликтов подписей при слиянии
+#          rm -rf out/Release/java_extracted/META-INF
+#
+#          # Упаковываем извлеченные классы в единый архив
+#          if [ "$(ls -A out/Release/java_extracted 2>/dev/null)" ]; then
+#              cd out/Release/java_extracted
+#              jar cvf ../chromium_base.jar .
+#              cd ../../..
+#              echo "Successfully generated chromium_base.jar!"
+#          else
+#              echo "Error: No intermediate Java classes found."
+#              exit 1
+#          fi
       - name: Pack artifacts
         run: |
           mkdir ${{ env.BUNDLE }}
