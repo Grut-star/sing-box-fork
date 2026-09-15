@@ -322,23 +322,12 @@ jobs:
           sudo apt update
           sudo apt install ninja-build pkg-config ccache
       - run: ./get-clang.sh
-      - run: ./build.sh
-      - name: Fetch prebuilt Cronet classes (Bypass CIPD deps)
+      - name: Mock missing CIPD Jars
         run: |
-          if [ ! -f "out/Release/chromium_base.jar" ]; then
-            echo "Fetching official Cronet Java classes from Google Maven..."
-          
-            # Получаем последнюю стабильную версию Cronet
-            META_URL="https://dl.google.com/dl/android/maven2/org/chromium/net/cronet-embedded/maven-metadata.xml"
-            LATEST_CRONET=$(curl -s "$META_URL" | grep -m 1 '<release>' | sed -e 's/<[^>]*>//g' | tr -d ' \n\r')
-            if [ -z "$LATEST_CRONET" ]; then LATEST_CRONET="119.0.6045.31"; fi
-          
-            # Скачиваем AAR и извлекаем classes.jar напрямую в нужную папку
-            AAR_URL="https://dl.google.com/dl/android/maven2/org/chromium/net/cronet-embedded/$LATEST_CRONET/cronet-embedded-$LATEST_CRONET.aar"
-            curl -L -o cronet.aar "$AAR_URL"
-            unzip -q -o cronet.aar classes.jar
-            mv classes.jar out/Release/chromium_base.jar
-          fi
+          PROTO_DIR="third_party/android_deps/autorolled/cipd/libs/com_google_protobuf_protobuf_javalite"
+          mkdir -p "$PROTO_DIR"
+          curl -L -o "$PROTO_DIR/protobuf-javalite.jar" "https://repo1.maven.org/maven2/com/google/protobuf/protobuf-javalite/3.21.7/protobuf-javalite-3.21.7.jar"
+      - run: ./build.sh
       - name: Pack artifacts
         run: |
           mkdir ${{ env.BUNDLE }}
