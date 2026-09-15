@@ -336,14 +336,14 @@ jobs:
               text = f.read()
           
           ensure = []
-          # Разбиваем файл DEPS на блоки
+          # Дробим файл DEPS на самостоятельные модули
           blocks = re.split(r"'(src/[^']+)'\s*:\s*\{", text)
           
           for i in range(1, len(blocks), 2):
               path = blocks[i].replace("src/", "")
               content = blocks[i+1]
           
-              # Фильтруем Android зависимости
+              # Оставляем исключительно Android/Java компоненты
               if "android" not in path and "jni" not in path and "r8" not in path:
                   continue
           
@@ -353,13 +353,10 @@ jobs:
               if pkg and ver:
                   pkg_str = pkg.group(1)
           
-                  # 1. Удаляем все символы $, чтобы избежать макросов GHA и CIPD
-                  pkg_str = pkg_str.replace('$', '')
-          
-                  # 2. Безопасно подставляем платформу Linux x64
-                  pkg_str = pkg_str.replace('{platform}', 'linux-amd64')
-                  pkg_str = pkg_str.replace('{os}', 'linux')
-                  pkg_str = pkg_str.replace('{arch}', 'amd64')
+                  # Используем Regex для маскировки паттерна от GitHub Actions
+                  pkg_str = re.sub(r'\$+\{+platform\}+', 'linux-amd64', pkg_str)
+                  pkg_str = re.sub(r'\$+\{+os\}+', 'linux', pkg_str)
+                  pkg_str = re.sub(r'\$+\{+arch\}+', 'amd64', pkg_str)
           
                   ensure.append(f"@Subdir {path}")
                   ensure.append(f"{pkg_str} {ver.group(1)}")
