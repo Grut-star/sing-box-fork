@@ -322,55 +322,22 @@ jobs:
           sudo apt update
           sudo apt install ninja-build pkg-config ccache
       - run: ./get-clang.sh
-      - name: Fetch ALL Android CIPD Dependencies
-        run: |
-          echo "Downloading CIPD client..."
-          curl -L "https://chrome-infra-packages.appspot.com/client?platform=linux-amd64&version=latest" -o cipd
-          chmod +x cipd
-          
-          echo "Parsing DEPS file to generate CIPD manifest..."
-          cat << 'EOF' > parse_deps.py
-          import re
-          
-          with open("DEPS") as f:
-              text = f.read()
-          
-          ensure = []
-          # Разбиваем файл DEPS на блоки по путям 'src/...'
-          blocks = re.split(r"'(src/[^']+)'\s*:\s*\{", text)
-          
-          for i in range(1, len(blocks), 2):
-              path = blocks[i].replace("src/", "")
-              content = blocks[i+1]
-          
-              # Фильтруем только Java/Android зависимости
-              if "android" not in path and "jni" not in path and "r8" not in path:
-                  continue
-          
-              pkg = re.search(r"'package'\s*:\s*'([^']+)'", content)
-              ver = re.search(r"'version'\s*:\s*'([^']+)'", content)
-          
-              if pkg and ver:
-                  pkg_str = pkg.group(1)
-                  # Раскрываем макросы (строго с одной скобкой, чтобы не триггерить GitHub Actions)
-                  pkg_str = pkg_str.replace('${platform}', 'linux-amd64')
-                  pkg_str = pkg_str.replace('{platform}', 'linux-amd64')
-                  pkg_str = pkg_str.replace('${os}', 'linux')
-                  pkg_str = pkg_str.replace('{os}', 'linux')
-                  pkg_str = pkg_str.replace('${arch}', 'amd64')
-                  pkg_str = pkg_str.replace('{arch}', 'amd64')
-          
-                  ensure.append(f"@Subdir {path}")
-                  ensure.append(f"{pkg_str} {ver.group(1)}")
-          
-          with open("cipd_android.txt", "w") as f:
-              f.write("\n".join(ensure) + "\n")
-          EOF
-          
-          python3 parse_deps.py
-          echo "Executing CIPD ensure..."
-          ./cipd ensure -root . -ensure-file cipd_android.txt
       - run: ./build.sh
+      - name: Ensure chromium_base.jar via official Cronet artifact
+        run: |
+          if [ ! -f "out/Release/chromium_base.jar" ]; then
+            echo "Downloading official cronet.aar for version ${{ env.CHROMIUM_VERSION }}..."
+            mkdir -p out/Release/cronet_extracted
+            if curl -L -o out/Release/cronet.aar "https://storage.googleapis.com/chromium-cronet/android/${{ env.CHROMIUM_VERSION }}/Release/cronet/cronet.aar"; then
+              unzip -q -o out/Release/cronet.aar classes.jar -d out/Release/cronet_extracted/
+              mv out/Release/cronet_extracted/classes.jar out/Release/chromium_base.jar
+              rm -rf out/Release/cronet.aar out/Release/cronet_extracted
+              echo "Successfully provided chromium_base.jar!"
+            else
+              echo "Error: Failed to download official cronet.aar"
+              exit 1
+            fi
+          fi
       - name: Pack artifacts
         run: |
           mkdir ${{ env.BUNDLE }}
