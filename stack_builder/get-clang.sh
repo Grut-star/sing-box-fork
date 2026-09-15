@@ -144,14 +144,14 @@ if [ "$target_os" = android ]; then
 #      curl -L -o third_party/android_sdk/public/platforms/android-37.0/android.jar "https://github.com/Sable/android-platforms/raw/master/android-28/android.jar"
 #    fi
 #  fi
-  echo "Fetching genuine Android Java Toolchain (SDK, JDK, R8, android_deps) via CIPD..."
+  echo "Fetching genuine Android Java Toolchain via CIPD..."
   curl -L -s "https://chrome-infra-packages.appspot.com/client?platform=linux-amd64&version=latest" -o cipd
   chmod +x cipd
 
   cat << 'EOF' > parse_deps.py
 exec_locals = {}
-def Var(name):
-    return exec_locals.get('vars', {}).get(name, str(name))
+def Var(name): return exec_locals.get('vars', {}).get(name, str(name))
+
 with open("DEPS") as f:
     try:
         exec(f.read(), {'Var': Var, 'Str': str}, exec_locals)
@@ -164,14 +164,16 @@ deps.update(exec_locals.get('deps_os', {}).get('android', {}))
 
 for path, dep in deps.items():
     if isinstance(dep, dict) and 'packages' in dep:
-        if not any(k in path for k in ['android_deps', 'r8', 'jdk', 'android_sdk']):
+        # ИСПРАВЛЕНИЕ: Расширили список разрешенных директорий!
+        if not any(k in path for k in ['android_deps', 'android_sdk', 'r8', 'jdk', 'androidx', 'kotlin', 'jni_zero']):
             continue
+
         for pkg in dep['packages']:
             p = str(pkg.get('package', ''))
             v = str(pkg.get('version', ''))
+
             if not p or not v or '{' in p or '$' in p or '{' in v or '$' in v: continue
 
-            # Жестко фиксируем платформу под Linux-раннер GitHub Actions
             p = p.replace('${platform}', 'linux-amd64').replace('{platform}', 'linux-amd64')
             p = p.replace('${os}', 'linux').replace('{os}', 'linux')
             p = p.replace('${arch}', 'amd64').replace('{arch}', 'amd64')
