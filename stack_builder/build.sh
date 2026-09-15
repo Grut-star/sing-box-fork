@@ -60,6 +60,9 @@ case "$EXTRA_FLAGS" in
 esac
 if [ "$target_os" = "android" ]; then IS_ANDROID=true; fi
 
+echo "target_os = $target_os"
+echo "is android = $IS_ANDROID"
+
 if [ "$IS_ANDROID" = "true" ]; then
   echo "=> Configuring for Android (Cronet mode)"
   flags="$flags"'
