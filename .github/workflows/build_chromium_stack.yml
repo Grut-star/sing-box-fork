@@ -322,57 +322,80 @@ jobs:
           sudo apt update
           sudo apt install ninja-build pkg-config ccache
       - run: ./get-clang.sh
-      - name: Fetch ALL Android CIPD Dependencies
-        run: |
-          echo "Downloading CIPD client..."
-          curl -L "https://chrome-infra-packages.appspot.com/client?platform=linux-amd64&version=latest" -o cipd
-          chmod +x cipd
-          
-          echo "Parsing DEPS file natively..."
-          cat << 'EOF' > parse_deps.py
-          exec_locals = {}
-          def Var(name): return str(name)
-          
-          with open("DEPS") as f:
-              content = f.read()
-          
-          try:
-              exec(content, {'Var': Var, 'Str': str}, exec_locals)
-          except Exception:
-              pass
-          
-          ensure = []
-          all_deps = {}
-          all_deps.update(exec_locals.get('deps', {}))
-          all_deps.update(exec_locals.get('deps_os', {}).get('android', {}))
-          
-          for path, dep in all_deps.items():
-              if isinstance(dep, dict) and 'packages' in dep:
-                  # Строго ограничиваем область поиска нужными директориями
-                  if 'android_deps' not in path and 'r8' not in path:
-                      continue
-          
-                  for pkg in dep['packages']:
-                      pkg_name = str(pkg.get('package', ''))
-                      version = str(pkg.get('version', ''))
-          
-                      # ЖЕСТКИЙ ФИЛЬТР: Пропускаем всё, что требует вычисления переменных
-                      if not pkg_name or not version: continue
-                      if any(c in pkg_name for c in ['{', '}', '$']): continue
-                      if any(c in version for c in ['{', '}', '$']): continue
-          
-                      path_clean = path.replace('src/', '')
-                      ensure.append(f"@Subdir {path_clean}")
-                      ensure.append(f"{pkg_name} {version}")
-          
-          with open("cipd_android.txt", "w") as f:
-              f.write("\n".join(ensure) + "\n")
-          EOF
-          
-          python3 parse_deps.py
-          echo "Executing CIPD ensure..."
-          ./cipd ensure -root . -ensure-file cipd_android.txt
+#      - name: Fetch ALL Android CIPD Dependencies
+#        run: |
+#          echo "Downloading CIPD client..."
+#          curl -L "https://chrome-infra-packages.appspot.com/client?platform=linux-amd64&version=latest" -o cipd
+#          chmod +x cipd
+#
+#          echo "Parsing DEPS file natively..."
+#          cat << 'EOF' > parse_deps.py
+#          exec_locals = {}
+#          def Var(name): return str(name)
+#
+#          with open("DEPS") as f:
+#              content = f.read()
+#
+#          try:
+#              exec(content, {'Var': Var, 'Str': str}, exec_locals)
+#          except Exception:
+#              pass
+#
+#          ensure = []
+#          all_deps = {}
+#          all_deps.update(exec_locals.get('deps', {}))
+#          all_deps.update(exec_locals.get('deps_os', {}).get('android', {}))
+#
+#          for path, dep in all_deps.items():
+#              if isinstance(dep, dict) and 'packages' in dep:
+#                  # Строго ограничиваем область поиска нужными директориями
+#                  if 'android_deps' not in path and 'r8' not in path:
+#                      continue
+#
+#                  for pkg in dep['packages']:
+#                      pkg_name = str(pkg.get('package', ''))
+#                      version = str(pkg.get('version', ''))
+#
+#                      # ЖЕСТКИЙ ФИЛЬТР: Пропускаем всё, что требует вычисления переменных
+#                      if not pkg_name or not version: continue
+#                      if any(c in pkg_name for c in ['{', '}', '$']): continue
+#                      if any(c in version for c in ['{', '}', '$']): continue
+#
+#                      path_clean = path.replace('src/', '')
+#                      ensure.append(f"@Subdir {path_clean}")
+#                      ensure.append(f"{pkg_name} {version}")
+#
+#          with open("cipd_android.txt", "w") as f:
+#              f.write("\n".join(ensure) + "\n")
+#          EOF
+#
+#          python3 parse_deps.py
+#          echo "Executing CIPD ensure..."
+#          ./cipd ensure -root . -ensure-file cipd_android.txt
       - run: ./build.sh
+      - name: Generate chromium_base.jar from intermediates
+        run: |
+          echo "Collecting compiled Java classes..."
+          mkdir -p out/Release/java_extracted
+          
+          # Ищем все промежуточные JAR, которые УЖЕ сгенерировались при сборке C++ движка
+          find out/Release/obj -type f -name "*.jar" \( -name "*jni_zero*.jar" -o -name "*base_java*.jar" -o -name "*net_java*.jar" -o -name "*url_java*.jar" \) | while read jarfile; do
+              unzip -q -o "$jarfile" -d out/Release/java_extracted/ || true
+          done
+          
+          # Очищаем метаданные, чтобы избежать конфликтов подписей при слиянии
+          rm -rf out/Release/java_extracted/META-INF
+          
+          # Упаковываем извлеченные классы в единый архив
+          if [ "$(ls -A out/Release/java_extracted 2>/dev/null)" ]; then
+              cd out/Release/java_extracted
+              jar cvf ../chromium_base.jar .
+              cd ../../..
+              echo "Successfully generated chromium_base.jar!"
+          else
+              echo "Error: No intermediate Java classes found."
+              exit 1
+          fi
       - name: Pack artifacts
         run: |
           mkdir ${{ env.BUNDLE }}
