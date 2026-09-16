@@ -162,10 +162,12 @@ deps = {}
 deps.update(exec_locals.get('deps', {}))
 deps.update(exec_locals.get('deps_os', {}).get('android', {}))
 
+# РАСШИРЕННЫЙ ФИЛЬТР: Используем базовые корни слов
+allowed_keywords = ['android', 'r8', 'jdk', 'androidx', 'kotlin', 'jni', 'proto']
+
 for path, dep in deps.items():
     if isinstance(dep, dict) and 'packages' in dep:
-        # ИСПРАВЛЕНИЕ: Расширили список разрешенных директорий!
-        if not any(k in path for k in ['android_deps', 'android_sdk', 'r8', 'jdk', 'androidx', 'kotlin', 'jni_zero']):
+        if not any(k in path.lower() for k in allowed_keywords):
             continue
 
         for pkg in dep['packages']:
