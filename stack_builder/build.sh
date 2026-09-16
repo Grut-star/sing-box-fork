@@ -301,14 +301,29 @@ else
   echo "llvm-strip not found, skipping."
 fi
 if [ "$IS_ANDROID" = "true" ]; then
-  echo "Building cronet_package to generate Chromium Java classes..."
-  if ninja -C "$out" cronet_package; then
-    echo "Extracting classes.jar from cronet.aar..."
-    mkdir -p "$out/cronet_extracted"
-    unzip -q -o "$out/cronet/cronet.aar" classes.jar -d "$out/cronet_extracted/" || true
-    mv "$out/cronet_extracted/classes.jar" "$out/chromium_base.jar" || true
+  echo "Building clean Android Java libraries (skipping tests)..."
+
+  # Запускаем только non-test цель, чтобы отсечь netty и прочие тестовые зависимости
+  if ninja -C "$out" components/cronet/android:cronet_non_test_package; then
+    echo "Extracting and merging release Java classes..."
+    mkdir -p "$out/java_extracted"
+
+    # Извлекаем классы из сгенерированных релизных JAR-файлов
+    unzip -q -o "$out/cronet/cronet_impl_native_java.jar" -d "$out/java_extracted/" || true
+    unzip -q -o "$out/cronet/cronet_impl_common_java.jar" -d "$out/java_extracted/" || true
+    unzip -q -o "$out/cronet/cronet_shared_java.jar" -d "$out/java_extracted/" || true
+    unzip -q -o "$out/cronet/cronet_api.jar" -d "$out/java_extracted/" || true
+
+    # Удаляем метаданные, чтобы избежать конфликта подписей
+    rm -rf "$out/java_extracted/META-INF"
+
+    # Собираем единый chromium_base.jar
+    cd "$out/java_extracted"
+    jar cvf ../chromium_base.jar .
+    cd ../..
     echo "Generated $out/chromium_base.jar. This file must be added to your Android app's libs/ folder!"
   else
-    echo "Failed to build cronet_package. Make sure you don't have conflicting patches."
+    echo "Failed to build cronet_non_test_package."
+    exit 1
   fi
 fi
