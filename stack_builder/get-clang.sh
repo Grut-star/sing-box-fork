@@ -162,8 +162,8 @@ deps = {}
 deps.update(exec_locals.get('deps', {}))
 deps.update(exec_locals.get('deps_os', {}).get('android', {}))
 
-# РАСШИРЕННЫЙ ФИЛЬТР: Используем базовые корни слов
-allowed_keywords = ['android', 'r8', 'jdk', 'androidx', 'kotlin', 'jni', 'proto']
+# УЛЬТИМАТИВНЫЙ ФИЛЬТР: Включены все критичные узлы Java-компилятора
+allowed_keywords = ['android', 'r8', 'jdk', 'androidx', 'kotlin', 'jni', 'proto', 'turbine', 'dagger', 'guava', 'errorprone', 'auto']
 
 for path, dep in deps.items():
     if isinstance(dep, dict) and 'packages' in dep:
