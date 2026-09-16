@@ -163,7 +163,7 @@ deps.update(exec_locals.get('deps', {}))
 deps.update(exec_locals.get('deps_os', {}).get('android', {}))
 
 # УЛЬТИМАТИВНЫЙ ФИЛЬТР: Включены все критичные узлы Java-компилятора
-allowed_keywords = ['android', 'r8', 'jdk', 'androidx', 'kotlin', 'jni', 'proto', 'turbine', 'dagger', 'guava', 'errorprone', 'auto']
+allowed_keywords = ['android', 'r8', 'jdk', 'androidx', 'kotlin', 'jni', 'proto', 'turbine', 'dagger', 'guava', 'errorprone', 'auto', 'netty', 'bouncycastle', 'robolectric', 'sqlite', 'objenesis', 'byte_buddy']
 
 for path, dep in deps.items():
     if isinstance(dep, dict) and 'packages' in dep:
