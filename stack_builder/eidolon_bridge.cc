@@ -485,7 +485,6 @@ private:
     void Run() {
         net::URLRequestContextBuilder builder;
         builder.DisableHttpCache();
-        builder.DisableNetworkChangeNotifier();
 
         builder.set_proxy_config_service(
                 std::make_unique<net::ProxyConfigServiceFixed>(
@@ -625,7 +624,6 @@ private:
         // 1. Делегируем сборку всего стека (включая TransportSecurityState) билдеру
         net::URLRequestContextBuilder builder;
         builder.DisableHttpCache();
-        builder.DisableNetworkChangeNotifier();
 
         // Явно отключаем поиск системных прокси (PAC/WPAD)
         // Явно отключаем прокси через фиксированный конфиг, чтобы не падали DCHECK при ошибках SSL
