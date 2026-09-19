@@ -318,6 +318,23 @@ if [ "$IS_ANDROID" = "true" ]; then
     # Удаляем метаданные, чтобы избежать конфликта подписей
     rm -rf "$out/java_extracted/META-INF"
 
+    # === ДОБАВИТЬ ЭТОТ БЛОК ===
+        echo "Downgrading Java bytecode to v61 (Java 17) for R8 compatibility..."
+        python3 -c "
+    import os
+    for root, _, files in os.walk('$out/java_extracted'):
+        for file in files:
+            if file.endswith('.class'):
+                filepath = os.path.join(root, file)
+                with open(filepath, 'r+b') as f:
+                    f.seek(6) # Смещение до Major Version в .class файле
+                    major_version = int.from_bytes(f.read(2), byteorder='big')
+                    if major_version > 61:
+                        f.seek(6)
+                        f.write(b'\x00\x3D') # Принудительно ставим 61 (Java 17)
+    "
+        # ==========================
+
     # Собираем единый chromium_base.jar
     cd "$out/java_extracted"
     jar cvf ../chromium_base.jar .
