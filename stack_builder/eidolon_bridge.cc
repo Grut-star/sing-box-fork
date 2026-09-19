@@ -458,8 +458,8 @@ struct EidolonSession {
 // -------------------------------------------------------------------------
 class QUICDialHelper : public net::QuicSessionAttempt::Delegate {
 public:
-    static void Start(EidolonSession* sess, const std::string& host, uint16_t port, const std::vector<uint8_t>& token, base::WaitableEvent* event) {
-        auto* dialer = new QUICDialHelper(sess, host, port, token, event);
+    static void Start(EidolonSession* sess, const std::string& ip, const std::string& sni, uint16_t port, const std::vector<uint8_t>& token, base::WaitableEvent* event) {
+        auto* dialer = new QUICDialHelper(sess, ip, sni, port, token, event);
         dialer->Run();
     }
     net::QuicSessionPool* GetQuicSessionPool() override {
@@ -469,12 +469,11 @@ public:
     const net::NetLogWithSource& GetNetLog() override { return net_log_; }
 
 private:
-    QUICDialHelper(EidolonSession* sess, const std::string& host, uint16_t port, const std::vector<uint8_t>& token, base::WaitableEvent* event)
-            : sess_(sess), host_(host), port_(port), token_(token), event_(event), scheme_host_port_("https", host, port) {
-
+    QUICDialHelper(EidolonSession* sess, const std::string& ip, const std::string& sni, uint16_t port, const std::vector<uint8_t>& token, base::WaitableEvent* event)
+            : sess_(sess), ip_(ip), sni_(sni), port_(port), token_(token), event_(event), scheme_host_port_("https", sni, port) {
         // Создаем временный ключ сессии для инициализации QuicSessionAliasKey
         net::QuicSessionKey session_key(
-                net::HostPortPair(host, port), net::PRIVACY_MODE_DISABLED, net::ProxyChain::Direct(),
+                net::HostPortPair(sni, port), net::PRIVACY_MODE_DISABLED, net::ProxyChain::Direct(),
                 net::SessionUsage::kDestination, net::SocketTag(),
                 net::NetworkAnonymizationKey(), net::SecureDnsPolicy::kAllow,
                 false, false, net::handles::kInvalidNetworkHandle);
@@ -506,10 +505,10 @@ private:
         net::HttpNetworkSession* http_session = sess_->url_context->http_transaction_factory()->GetSession();
         net::QuicSessionPool* quic_pool = http_session->quic_session_pool();
 
-        net::HostPortPair host_port(host_, port_);
+        net::HostPortPair host_port(sni_, port_);
 
-        net::IPAddress ip;
-        if (!ip.AssignFromIPLiteral(host_)) { Finish(false); return; }
+        net::IPAddress ip_addr;
+        if (!ip_addr.AssignFromIPLiteral(ip_)) { Finish(false); return; }
 
         net::QuicSessionKey session_key(
                 host_port, net::PRIVACY_MODE_DISABLED, net::ProxyChain::Direct(),
@@ -519,7 +518,7 @@ private:
 
         net::QuicEndpoint quic_endpoint(
                 net::DefaultSupportedQuicVersions().front(),
-                net::IPEndPoint(ip, port_),
+                net::IPEndPoint(ip_addr, port_),
                 net::ConnectionEndpointMetadata());
 
         sess_->quic_attempt = quic_pool->CreateSessionAttempt(
@@ -564,7 +563,7 @@ private:
 
         quiche::HttpHeaderBlock headers;
         headers[":method"] = "CONNECT";
-        headers[":authority"] = host_ + ":" + std::to_string(port_);
+        headers[":authority"] = sni_ + ":" + std::to_string(port_);
         headers[":scheme"] = "https";
         headers["user-agent"] = version_info::GetProductNameAndVersionForUserAgent();
         headers["x-eidolon-token"] = base::HexEncode(token_);
@@ -586,7 +585,8 @@ private:
     }
 
     raw_ptr<EidolonSession> sess_;
-    std::string host_;
+    std::string ip_;
+    std::string sni_;
     uint16_t port_;
     std::vector<uint8_t> token_;
     raw_ptr<base::WaitableEvent> event_;
@@ -598,21 +598,21 @@ private:
 // -------------------------------------------------------------------------
 class TCPDialHelper {
 public:
-    static void Start(EidolonSession* sess, const std::string& host, uint16_t port, const std::vector<uint8_t>& token, base::WaitableEvent* event) {
-        auto* dialer = new TCPDialHelper(sess, host, port, token, event);
+    static void Start(EidolonSession* sess, const std::string& ip, const std::string& sni, uint16_t port, const std::vector<uint8_t>& token, base::WaitableEvent* event) {
+        auto* dialer = new TCPDialHelper(sess, ip, sni, port, token, event);
         dialer->Run();
     }
 
 private:
-    TCPDialHelper(EidolonSession* sess, const std::string& host, uint16_t port, const std::vector<uint8_t>& token, base::WaitableEvent* event)
-            : sess_(sess), host_(host), port_(port), token_(token), event_(event) {}
+    TCPDialHelper(EidolonSession* sess, const std::string& ip, const std::string& sni, uint16_t port, const std::vector<uint8_t>& token, base::WaitableEvent* event)
+            : sess_(sess), ip_(ip), sni_(sni), port_(port), token_(token), event_(event) {}
 
     void Run() {
-        net::IPAddress ip;
-        if (!ip.AssignFromIPLiteral(host_)) { Finish(false); return; }
+        net::IPAddress ip_addr;
+        if (!ip_addr.AssignFromIPLiteral(ip_)) { Finish(false); return; }
 
         raw_socket_ = std::make_unique<net::TCPClientSocket>(
-                net::AddressList(net::IPEndPoint(ip, port_)), nullptr, nullptr, nullptr, net::NetLogSource(), net::handles::kInvalidNetworkHandle);
+                net::AddressList(net::IPEndPoint(ip_addr, port_)), nullptr, nullptr, nullptr, net::NetLogSource(), net::handles::kInvalidNetworkHandle);
 
         int rv = raw_socket_->Connect(base::BindOnce(&TCPDialHelper::OnTcpConnected, base::Unretained(this)));
         if (rv != net::ERR_IO_PENDING) OnTcpConnected(rv);
@@ -659,7 +659,7 @@ private:
         // 5. Создаем SSLClientSocket штатным фабричным методом Chromium
         sess_->tcp_socket = ssl_context->CreateSSLClientSocket(
                 std::move(raw_socket_),
-                net::HostPortPair(host_, port_),
+                net::HostPortPair(sni_, port_),
                 ssl_config
         );
 
@@ -682,7 +682,8 @@ private:
     }
 
     raw_ptr<EidolonSession> sess_;
-    std::string host_;
+    std::string ip_;
+    std::string sni_;
     uint16_t port_;
     std::vector<uint8_t> token_;
     raw_ptr<base::WaitableEvent> event_;
@@ -1020,14 +1021,22 @@ EIDOLON_EXPORT EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, c
     EnsureChromiumIOThread();
     auto session = std::make_unique<EidolonSession>(data_fd, false);
     std::string target_host(host);
+    std::string target_ip = target_host;
+    std::string target_sni = target_host;
+    size_t sep = target_host.find('|');
+    if (sep != std::string::npos) {
+        target_ip = target_host.substr(0, sep);
+        target_sni = target_host.substr(sep + 1);
+    }
+
     auto safe_span = UNSAFE_BUFFERS(base::span<const uint8_t>(token, token_len));
     std::vector<uint8_t> token_vec(safe_span.begin(), safe_span.end());
     base::WaitableEvent connect_event(base::WaitableEvent::ResetPolicy::MANUAL, base::WaitableEvent::InitialState::NOT_SIGNALED);
 
     g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
-            EidolonSession* sess, std::string host_str, uint16_t port_num, std::vector<uint8_t> tok, base::WaitableEvent* event) {
-        TCPDialHelper::Start(sess, host_str, port_num, tok, event);
-    }, session.get(), target_host, port, token_vec, &connect_event));
+            EidolonSession* sess, std::string ip_str, std::string sni_str, uint16_t port_num, std::vector<uint8_t> tok, base::WaitableEvent* event) {
+        TCPDialHelper::Start(sess, ip_str, sni_str, port_num, tok, event);
+    }, session.get(), target_ip, target_sni, port, token_vec, &connect_event));
 
     connect_event.Wait();
     if (session->is_closed_) {
@@ -1042,6 +1051,13 @@ EIDOLON_EXPORT EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, 
     EnsureChromiumIOThread();
     auto session = std::make_unique<EidolonSession>(data_fd, true);
     std::string target_host(host);
+    std::string target_ip = target_host;
+    std::string target_sni = target_host;
+    size_t sep = target_host.find('|');
+    if (sep != std::string::npos) {
+        target_ip = target_host.substr(0, sep);
+        target_sni = target_host.substr(sep + 1);
+    }
 
     // ФИКС ВАРНИНГА: Используем безопасное копирование span
     auto safe_span = UNSAFE_BUFFERS(base::span<const uint8_t>(token, token_len));
@@ -1050,9 +1066,9 @@ EIDOLON_EXPORT EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, 
     base::WaitableEvent connect_event(base::WaitableEvent::ResetPolicy::MANUAL, base::WaitableEvent::InitialState::NOT_SIGNALED);
 
     g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
-            EidolonSession* sess, std::string host_str, uint16_t port_num, std::vector<uint8_t> tok, base::WaitableEvent* event) {
-        QUICDialHelper::Start(sess, host_str, port_num, tok, event);
-    }, session.get(), target_host, port, token_vec, &connect_event));
+            EidolonSession* sess, std::string ip_str, std::string sni_str, uint16_t port_num, std::vector<uint8_t> tok, base::WaitableEvent* event) {
+        QUICDialHelper::Start(sess, ip_str, sni_str, port_num, tok, event);
+    }, session.get(), target_ip, target_sni, port, token_vec, &connect_event));
 
     connect_event.Wait();
     if (session->is_closed_) {
