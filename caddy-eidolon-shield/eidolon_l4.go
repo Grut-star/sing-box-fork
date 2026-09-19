@@ -1,4 +1,4 @@
-package eidolon_l4
+package eidolon_shield
 
 import (
 	"bytes"
@@ -11,7 +11,7 @@ import (
 )
 
 func init() {
-	caddy.RegisterModule(EidolonL4{})
+	caddy.RegisterModule(&EidolonL4{})
 }
 
 type EidolonL4 struct {
@@ -25,7 +25,7 @@ type EidolonL4 struct {
 	wg           sync.WaitGroup
 }
 
-func (EidolonL4) CaddyModuleInfo() caddy.ModuleInfo {
+func (*EidolonL4) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "caddy.listeners.eidolon_l4",
 		New: func() caddy.Module { return new(EidolonL4) },
@@ -148,7 +148,7 @@ func (l *sniListener) Accept() (net.Conn, error) {
 
 // Строгий бинарный парсинг TLS ClientHello для извлечения SNI
 func extractSNI(data []byte) string {
-	if len(data) < 43 || data[0] != 0x16 { // 0x16 = Handshake
+	if len(data) <= 43 || data[0] != 0x16 { // 0x16 = Handshake
 		return ""
 	}
 
@@ -183,7 +183,7 @@ func extractSNI(data []byte) string {
 		extLength := int(binary.BigEndian.Uint16(exts[i+2 : i+4]))
 		i += 4
 
-		if extType == 0x00 && extLength > 5 { // Server Name Extension
+		if extType == 0x00 && extLength > 5 && i+5 <= len(exts) { // Server Name Extension
 			nameLen := int(binary.BigEndian.Uint16(exts[i+3 : i+5]))
 			if i+5+nameLen <= len(exts) {
 				return string(exts[i+5 : i+5+nameLen])
@@ -193,6 +193,12 @@ func extractSNI(data []byte) string {
 	}
 	return ""
 }
+
+// ExtractSNI exports extractSNI for testing
+func ExtractSNI(data []byte) string {
+	return extractSNI(data)
+}
+
 
 type bufferedConn struct {
 	net.Conn
