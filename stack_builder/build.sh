@@ -264,6 +264,39 @@ echo "Removing obsolete -latomic dependency globally..."
 find build/config -type f -name "*.gn" -exec sed -i 's/"atomic"/"c"/g' {} + || true
 find build/config -type f -name "*.gni" -exec sed -i 's/"atomic"/"c"/g' {} + || true
 
+# === Фикс линковки под Android: lld ищет compiler-rt builtins по триплету
+# с номером API (например i686-unknown-linux-android27/libclang_rt.builtins.a),
+# а встроенный clang держит их в per-target каталоге без API или в legacy linux/.
+# Раскладываем архив по ожидаемому пути для каждой арки и уровня API.
+# Источник: встроенный clang, иначе — NDK (та же разметка, что у хака -latomic). ===
+if [ "$IS_ANDROID" = "true" ]; then
+  echo "Staging compiler-rt builtins for Android lld..."
+  NDK_CLANG="third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/linux-x86_64"
+  for CLANG_LIB in third_party/llvm-build/Release+Asserts/lib/clang/*/lib; do
+    [ -d "$CLANG_LIB" ] || continue
+    for pair in \
+      "i686-unknown-linux-android:i686" \
+      "x86_64-unknown-linux-android:x86_64" \
+      "aarch64-unknown-linux-android:aarch64" \
+      "arm-unknown-linux-androideabi:arm"; do
+      triple="${pair%%:*}"; arch="${pair##*:}"
+      src=""
+      if [ -f "$CLANG_LIB/$triple/libclang_rt.builtins.a" ]; then
+        src="$CLANG_LIB/$triple/libclang_rt.builtins.a"
+      elif [ -f "$CLANG_LIB/linux/libclang_rt.builtins-$arch-android.a" ]; then
+        src="$CLANG_LIB/linux/libclang_rt.builtins-$arch-android.a"
+      else
+        src=$(ls "$NDK_CLANG"/lib/clang/*/lib/linux/libclang_rt.builtins-"$arch"-android.a 2>/dev/null | head -1 || true)
+      fi
+      [ -n "$src" ] && [ -f "$src" ] || continue
+      for api in 21 24 26 27 28; do
+        mkdir -p "$CLANG_LIB/${triple}${api}"
+        cp -f "$src" "$CLANG_LIB/${triple}${api}/libclang_rt.builtins.a" || true
+      done
+    done
+  done
+fi
+
 echo "Running GN..."
 ./gn/out/gn gen "$out" --args="$flags $EXTRA_FLAGS"
 
