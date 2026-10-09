@@ -33,26 +33,75 @@ def apply_patch(filepath, pattern, replacement, flags=0, replace_all=False):
 def main():
     print("=== Eidolon Chromium v152 Auto-Patcher ===")
 
-    # 1. SSLConfig: Добавляем поля сразу после ignore_certificate_errors
+    # 1. SSLConfig: секрет для HMAC. Токен (nonce||tag) считается внутри BoringSSL
+    #    над key_share, поэтому наверх отдаём только мастер-секрет.
     apply_patch(
         'net/ssl/ssl_config.h',
         r'(bool ignore_certificate_errors = false;)',
-        r'\1\n\n  // EIDOLON: Контейнер для Context-Bound TOTP токена\n'
+        r'\1\n\n  // EIDOLON: привязка токена к key_share\n'
         r'  bool eidolon_active = false;\n'
-        r'  std::array<uint8_t, 32> eidolon_token;\n'
+        r'  std::vector<uint8_t> eidolon_secret;\n'
     )
 
-    # 2. BoringSSL: Перехватываем новую логику ResizeForOverwrite в v152
+    # 2a. BoringSSL: заголовки для HMAC / time / vector
     apply_patch(
         'third_party/boringssl/src/ssl/handshake_client.cc',
-        r'(hs->session_id\.ResizeForOverwrite\(SSL_MAX_SSL_SESSION_ID_LENGTH\);\n\s*)(if \(!RAND_bytes\(hs->session_id\.data\(\), hs->session_id\.size\(\)\)\) \{)',
-        r'\1// EIDOLON HOOK: Подмена Session ID\n'
-        r'        void* eidolon_token = SSL_get_ex_data(ssl, 0);\n'
-        r'        if (eidolon_token != nullptr) {\n'
-        r'          OPENSSL_memcpy(hs->session_id.data(), eidolon_token, 32);\n'
-        r'        } else {\n'
-        r'          \2\n'
-        r'        }'
+        r'#include "internal.h"',
+        r'#include <time.h>\n'
+        r'#include <vector>\n'
+        r'#include <openssl/hmac.h>\n'
+        r'#include "internal.h"'
+    )
+
+    # 2b. BoringSSL: SessionID = nonce || HMAC(secret, window || nonce || key_share_bytes).
+    #     Инъекция ПОСЛЕ ssl_setup_key_shares (key_share_bytes уже готов) и ДО
+    #     ssl_add_client_hello (ClientHello ещё не сериализован). Это даёт реальную
+    #     привязку токена к эфемерному ключу клиента.
+    apply_patch(
+        'third_party/boringssl/src/ssl/handshake_client.cc',
+        r'if \(!ssl_setup_pre_shared_keys\(hs\) \|\|\s*//\s*'
+        r'!ssl_setup_key_shares\(hs, /\*override_group_id=\*/0\) \|\|\s*'
+        r'!ssl_setup_extension_permutation\(hs\) \|\|\s*'
+        r'!ssl_encrypt_client_hello\(hs, Span\(ech_enc, ech_enc_len\)\) \|\|\s*'
+        r'!ssl_add_client_hello\(hs\)\) \{\s*return ssl_hs_error;\s*\}',
+        r'if (!ssl_setup_pre_shared_keys(hs) ||\n'
+        r'      !ssl_setup_key_shares(hs, /*override_group_id=*/0)) {\n'
+        r'    return ssl_hs_error;\n'
+        r'  }\n'
+        r'\n'
+        r'  // EIDOLON key_share binding (eidolon_active)\n'
+        r'  {\n'
+        r'    const std::vector<uint8_t>* eidolon_secret =\n'
+        r'        static_cast<const std::vector<uint8_t>*>(SSL_get_ex_data(ssl, 0));\n'
+        r'    if (eidolon_secret != nullptr && !eidolon_secret->empty()) {\n'
+        r'      uint8_t eidolon_nonce[16];\n'
+        r'      RAND_bytes(eidolon_nonce, sizeof(eidolon_nonce));\n'
+        r'      uint64_t eidolon_window = (uint64_t)(time(nullptr) / 5);\n'
+        r'      std::vector<uint8_t> eidolon_input;\n'
+        r'      eidolon_input.reserve(8 + 16 + hs->key_share_bytes.size());\n'
+        r'      for (int i = 0; i < 8; i++) {\n'
+        r'        eidolon_input.push_back((uint8_t)((eidolon_window >> ((7 - i) * 8)) & 0xff));\n'
+        r'      }\n'
+        r'      eidolon_input.insert(eidolon_input.end(), eidolon_nonce, eidolon_nonce + 16);\n'
+        r'      eidolon_input.insert(eidolon_input.end(), hs->key_share_bytes.data(),\n'
+        r'                           hs->key_share_bytes.data() + hs->key_share_bytes.size());\n'
+        r'      uint8_t eidolon_mac[SHA256_DIGEST_LENGTH];\n'
+        r'      unsigned eidolon_mac_len = 0;\n'
+        r'      if (HMAC(EVP_sha256(), eidolon_secret->data(), eidolon_secret->size(),\n'
+        r'               eidolon_input.data(), eidolon_input.size(), eidolon_mac,\n'
+        r'               &eidolon_mac_len) != nullptr && eidolon_mac_len >= 16) {\n'
+        r'        hs->session_id.ResizeForOverwrite(32);\n'
+        r'        OPENSSL_memcpy(hs->session_id.data(), eidolon_nonce, 16);\n'
+        r'        OPENSSL_memcpy(hs->session_id.data() + 16, eidolon_mac, 16);\n'
+        r'      }\n'
+        r'    }\n'
+        r'  }\n'
+        r'\n'
+        r'  if (!ssl_setup_extension_permutation(hs) ||\n'
+        r'      !ssl_encrypt_client_hello(hs, Span(ech_enc, ech_enc_len)) ||\n'
+        r'      !ssl_add_client_hello(hs)) {\n'
+        r'    return ssl_hs_error;\n'
+        r'  }'
     )
 
     # 3. QUIC: Расширяем контекст
@@ -74,15 +123,15 @@ def main():
         replace_all=True
     )
 
-    # 5. TCP: Внедрение токена в SSL сокет (Обновлено под v152)
+    # 5. TCP: передаём СЕКРЕТ вниз в BoringSSL (токен считается там над key_share)
     apply_patch(
         'net/socket/ssl_client_socket_impl.cc',
         r'(if \(!ssl_ \|\| !context->SetClientSocketForSSL\(ssl_\.get\(\), this\)\)[\s\n]*return ERR_UNEXPECTED;)',
         r'\1\n\n'
-        r'  // EIDOLON: Передаем токен вниз в BoringSSL\n'
+        r'  // EIDOLON: передаём секрет в BoringSSL для привязки токена к key_share\n'
         r'  if (ssl_config_.eidolon_active) {\n'
         r'    ssl_config_.ignore_certificate_errors = true;\n'
-        r'    SSL_set_ex_data(ssl_.get(), 0, (void*)ssl_config_.eidolon_token.data());\n'
+        r'    SSL_set_ex_data(ssl_.get(), 0, (void*)&ssl_config_.eidolon_secret);\n'
         r'  }\n'
     )
 

@@ -2,7 +2,11 @@ package eidolon
 
 /*
 #cgo CFLAGS: -I${SRCDIR}
-#cgo LDFLAGS: -L${SRCDIR}/lib -leidolon -lstdc++
+#cgo android,arm64 LDFLAGS: -L${SRCDIR}/lib/arm64-v8a -leidolon -lstdc++ -lm
+#cgo android,arm LDFLAGS: -L${SRCDIR}/lib/armeabi-v7a -leidolon -lstdc++ -lm
+#cgo android,amd64 LDFLAGS: -L${SRCDIR}/lib/x86_64 -leidolon -lstdc++ -lm
+#cgo android,386 LDFLAGS: -L${SRCDIR}/lib/x86 -leidolon -lstdc++ -lm
+#cgo !android LDFLAGS: -L${SRCDIR}/lib -leidolon -lstdc++ -lm
 #include "bridge.h"
 #include <stdlib.h>
 #include <stdint.h>
@@ -191,7 +195,6 @@ func dialNative(ctx context.Context, host string, port int, token []byte, isQUIC
 
 	// 2. Готовим аргументы для CGO
 	cHost := C.CString(host)
-	defer C.free(unsafe.Pointer(cHost))
 
 	// CGO bridge bounds-checking:
 	// The BoringSSL TLS bridge requires a 32-byte session ID buffer.
@@ -218,9 +221,10 @@ func dialNative(ctx context.Context, host string, port int, token []byte, isQUIC
 		handle C.EidolonHandle
 		err    error
 	}
-	resCh := make(chan dialResult, 1)
+	resCh := make(chan dialResult)
 
 	go func() {
+		defer C.free(unsafe.Pointer(cHost))
 		var handle C.EidolonHandle
 		if isQUIC {
 			handle = C.eidolon_dial_quic(cHost, C.uint16_t(port), cToken, C.size_t(len(safeToken)), cFd)
@@ -229,28 +233,41 @@ func dialNative(ctx context.Context, host string, port int, token []byte, isQUIC
 		}
 
 		if handle == nil {
+			if ctx.Err() != nil {
+				return
+			}
 			select {
+			case <-ctx.Done():
 			case resCh <- dialResult{nil, errors.New("native stack: dial failed inside C++")}:
-			default:
 			}
 			return
 		}
 
 		registerActiveHandle(handle)
 
-		select {
-		case resCh <- dialResult{handle, nil}:
-		default:
-			// Context timed out or was cancelled before dial completed
+		if ctx.Err() != nil {
 			safeCloseHandle(handle)
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			safeCloseHandle(handle)
+		case resCh <- dialResult{handle, nil}:
 		}
 	}()
 
 	// 4. Ожидаем завершения с учетом контекста
 	select {
-	case <-ctx.Done():
-		// Если контекст отменен (таймаут/прерывание), жестко закрываем сокет.
-		// Это заставит C++ ядро получить ошибку записи/чтения и освободить ресурсы.
+	case <-ctx.Done(): 		// Если контекст отменен (таймаут/прерывание), жестко закрываем сокет.
+                       		// Это заставит C++ ядро получить ошибку записи/чтения и освободить ресурсы.
+		select {
+		case res := <-resCh:
+			if res.handle != nil {
+				safeCloseHandle(res.handle)
+			}
+		default:
+		}
 		dataConn.Close()
 		return nil, ctx.Err()
 	case res := <-resCh:

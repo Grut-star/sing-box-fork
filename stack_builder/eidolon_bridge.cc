@@ -23,6 +23,7 @@ typedef SSIZE_T ssize_t;
 #include "base/at_exit.h"
 #include "base/task/thread_pool/thread_pool_instance.h"
 #include "base/command_line.h"
+#include "base/logging.h"
 
 #include <vector>
 #include <string>
@@ -566,7 +567,8 @@ private:
         headers[":authority"] = sni_ + ":" + std::to_string(port_);
         headers[":scheme"] = "https";
         headers["user-agent"] = version_info::GetProductNameAndVersionForUserAgent();
-        headers["x-eidolon-token"] = base::HexEncode(token_);
+        // Токен теперь едет в теле потока (token||flowID||padLen), а не в заголовке.
+        (void)token_;
         headers["padding"] = std::string(32, '0');
 
         sess_->quic_stream_handle->WriteHeaders(std::move(headers), false, nullptr);
@@ -652,9 +654,9 @@ private:
         net::SSLConfig ssl_config;
         ssl_config.eidolon_active = true;
 
-        size_t copy_len = std::min(token_.size(), static_cast<size_t>(32));
-        UNSAFE_BUFFERS(base::span<uint8_t>(ssl_config.eidolon_token)).copy_from(
-                UNSAFE_BUFFERS(base::span<const uint8_t>(token_.data(), copy_len)));
+        // token_ теперь несёт мастер-секрет; сам токен (nonce||tag) BoringSSL
+        // считает над key_share уже внутри рукопожатия.
+        ssl_config.eidolon_secret.assign(token_.begin(), token_.end());
 
         // 5. Создаем SSLClientSocket штатным фабричным методом Chromium
         sess_->tcp_socket = ssl_context->CreateSSLClientSocket(
@@ -713,12 +715,20 @@ private:
     void OnTCPConnect(std::string token, std::string session_key, std::string flow_id, int rv);
     void PumpTCPToQUIC();
     void OnTCPRead(int rv);
+    // Все эти методы и поля живут на g_io_thread, поэтому блокировки им не нужны.
+    void TryFlushTCP();
+    void OnTCPWriteComplete(int rv);
+    void ResetQUIC();
 
     base::Lock quic_lock_;
     raw_ptr<EidolonServerStream> quic_stream_;
     scoped_refptr<base::SingleThreadTaskRunner> quic_runner_;
     std::unique_ptr<net::StreamSocket> tcp_socket_;
     scoped_refptr<net::IOBufferWithSize> read_buf_;
+    // Буфер исходящих в TCP данных и флаги — только g_io_thread.
+    bool tcp_connected_ = false;
+    bool tcp_write_pending_ = false;
+    std::string tcp_write_buf_;
 };
 
 class EidolonServerStream : public quic::QuicSpdyStream {
@@ -817,10 +827,11 @@ void BidirectionalPump::ConnectTCP(uint16_t cb_port, std::string token, std::str
 }
 
 void BidirectionalPump::WriteToTCP(std::string_view data) {
+    // Направление QUIC -> TCP. Буферизуем на g_io_thread; реальная запись — через
+    // TryFlushTCP, которая держит не более одной незавершённой записи за раз.
     g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](scoped_refptr<BidirectionalPump> self, std::string d) {
-        if (!self->tcp_socket_) return;
-        auto io_buf = base::MakeRefCounted<net::StringIOBuffer>(d);
-        self->tcp_socket_->Write(io_buf.get(), d.size(), base::BindOnce([](int){}), TRAFFIC_ANNOTATION_FOR_TESTS);
+        self->tcp_write_buf_.append(d);
+        self->TryFlushTCP();
     }, base::RetainedRef(this), std::string(data)));
 }
 
@@ -830,11 +841,50 @@ void BidirectionalPump::DetachQUIC() {
 }
 
 void BidirectionalPump::OnTCPConnect(std::string token, std::string session_key, std::string flow_id, int rv) {
-    if (rv != net::OK) return;
-    std::string meta = token + session_key + flow_id;
-    auto io_buf = base::MakeRefCounted<net::StringIOBuffer>(meta);
-    tcp_socket_->Write(io_buf.get(), meta.size(), base::BindOnce([](int){}), TRAFFIC_ANNOTATION_FOR_TESTS);
+    if (rv != net::OK) {
+        // Подключение к ядру не удалось — рвём QUIC-поток, иначе клиент висит.
+        tcp_socket_.reset();
+        ResetQUIC();
+        return;
+    }
+    tcp_connected_ = true;
+    // meta (token||session_key||flow_id) обязана уйти первой, до любых данных.
+    tcp_write_buf_.insert(0, token + session_key + flow_id);
+    TryFlushTCP();
     PumpTCPToQUIC();
+}
+
+void BidirectionalPump::TryFlushTCP() {
+    if (!tcp_connected_ || tcp_write_pending_ || tcp_write_buf_.empty() || !tcp_socket_) {
+        return;
+    }
+    tcp_write_pending_ = true;
+    auto io_buf = base::MakeRefCounted<net::StringIOBuffer>(tcp_write_buf_);
+    int rv = tcp_socket_->Write(io_buf.get(), static_cast<int>(tcp_write_buf_.size()),
+                                base::BindOnce(&BidirectionalPump::OnTCPWriteComplete, base::RetainedRef(this)),
+                                TRAFFIC_ANNOTATION_FOR_TESTS);
+    if (rv != net::ERR_IO_PENDING) OnTCPWriteComplete(rv);
+}
+
+void BidirectionalPump::OnTCPWriteComplete(int rv) {
+    tcp_write_pending_ = false;
+    if (rv <= 0) {
+        tcp_socket_.reset();
+        ResetQUIC();
+        return;
+    }
+    // Возможна частичная запись: убираем записанное и продолжаем с остатком.
+    tcp_write_buf_.erase(0, static_cast<size_t>(rv));
+    TryFlushTCP();
+}
+
+void BidirectionalPump::ResetQUIC() {
+    quic_runner_->PostTask(FROM_HERE, base::BindOnce([](scoped_refptr<BidirectionalPump> self) {
+        base::AutoLock lock(self->quic_lock_);
+        if (self->quic_stream_) {
+            self->quic_stream_->Reset(quic::QUIC_STREAM_CANCELLED);
+        }
+    }, base::RetainedRef(this)));
 }
 
 void BidirectionalPump::PumpTCPToQUIC() {
@@ -847,23 +897,23 @@ void BidirectionalPump::PumpTCPToQUIC() {
 void BidirectionalPump::OnTCPRead(int rv) {
     if (rv <= 0) {
         tcp_socket_.reset();
-        quic_runner_->PostTask(FROM_HERE, base::BindOnce([](scoped_refptr<BidirectionalPump> self) {
-            base::AutoLock lock(self->quic_lock_);
-            if (self->quic_stream_) {
-                self->quic_stream_->Reset(quic::QUIC_STREAM_CANCELLED);
-            }
-        }, base::RetainedRef(this)));
+        ResetQUIC();
         return;
     }
 
+    // Следующее чтение запускаем только ПОСЛЕ отдачи порции в QUIC (back-pressure):
+    // иначе при медленном QUIC-пире очередь задач с 64-КБ копиями росла бы без предела.
     quic_runner_->PostTask(FROM_HERE, base::BindOnce([](scoped_refptr<BidirectionalPump> self, std::string d) {
-        base::AutoLock lock(self->quic_lock_);
-        if (self->quic_stream_) {
+        {
+            base::AutoLock lock(self->quic_lock_);
+            if (self->quic_stream_ == nullptr) {
+                return; // поток уже отвалился — читать дальше незачем
+            }
             self->quic_stream_->WriteOrBufferBody(d, false);
         }
+        g_io_thread->task_runner()->PostTask(
+            FROM_HERE, base::BindOnce(&BidirectionalPump::PumpTCPToQUIC, self));
     }, base::RetainedRef(this), std::string(read_buf_->data(), rv)));
-
-    PumpTCPToQUIC();
 }
 
 class EidolonServerSession : public quic::QuicSimpleServerSession {
@@ -954,20 +1004,30 @@ private:
         backend_ = std::make_unique<quic::QuicMemoryCacheBackend>();
 
         auto proof_source = std::make_unique<net::ProofSourceChromium>();
-        // ВАЖНО: Инициализация сертификатов, иначе Chromium аппаратно сбросит ClientHello[cite: 5, 6]
-        proof_source->Initialize(
+        // ВАЖНО: Инициализация сертификатов, иначе Chromium аппаратно сбросит ClientHello
+        if (!proof_source->Initialize(
                 base::FilePath(FILE_PATH_LITERAL("cert.pem")),
                 base::FilePath(FILE_PATH_LITERAL("key.pem")),
-                base::FilePath(FILE_PATH_LITERAL("")));
+                base::FilePath(FILE_PATH_LITERAL("")))) {
+            LOG(ERROR) << "eidolon: QUIC proof source Initialize failed (cert.pem/key.pem not found or invalid)";
+            delete this;
+            return;
+        }
 
         server_ = std::make_unique<EidolonServer>(std::move(proof_source), backend_.get(), cb_port_);
 
         quic::QuicIpAddress ip;
-        ip.FromString(host_);
+        if (!ip.FromString(host_)) {
+            LOG(ERROR) << "eidolon: QUIC listen host parse failed: " << host_;
+            delete this;
+            return;
+        }
         quic::QuicSocketAddress address(ip, port_);
 
         if (server_->CreateUDPSocketAndListen(address)) {
             server_->HandleEventsForever();
+        } else {
+            LOG(ERROR) << "eidolon: QUIC CreateUDPSocketAndListen failed on " << host_ << ":" << port_;
         }
         delete this;
     }
