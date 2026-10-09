@@ -265,31 +265,60 @@ find build/config -type f -name "*.gn" -exec sed -i 's/"atomic"/"c"/g' {} + || t
 find build/config -type f -name "*.gni" -exec sed -i 's/"atomic"/"c"/g' {} + || true
 
 # === Фикс линковки под Android: lld ищет compiler-rt builtins по триплету
-# с номером API (например i686-unknown-linux-android27/libclang_rt.builtins.a),
-# а встроенный clang держит их в per-target каталоге без API или в legacy linux/.
-# Раскладываем архив по ожидаемому пути для каждой арки и уровня API.
-# Источник: встроенный clang, иначе — NDK (та же разметка, что у хака -latomic). ===
+# с номером API (например aarch64-unknown-linux-android27/libclang_rt.builtins.a)
+# внутри resource-каталога встроенного clang, но встроенный clang Chromium
+# НЕ поставляет Android-билтины вообще (только *-linux-gnu / *-fuchsia / cros).
+# Источник берём из android_toolchain (урезанный NDK, синкается gclient'ом):
+# ищем архив по всему дереву find'ом, т.к. точная раскладка CIPD-пакета
+# меняется между версиями. Найденный архив раскладываем в resource-каталог
+# встроенного clang по ожидаемому пути для каждой арки и уровня API. ===
 if [ "$IS_ANDROID" = "true" ]; then
   echo "Staging compiler-rt builtins for Android lld..."
-  NDK_CLANG="third_party/android_toolchain/ndk/toolchains/llvm/prebuilt/linux-x86_64"
+  # Диагностика (печатается ДО GN/ninja, ~секунды): показывает, какие архивы
+  # compiler-rt вообще есть в дереве и где. Если список пустой — значит ни
+  # встроенный clang, ни android_toolchain билтины не поставляют, и нужен
+  # другой путь (дотянуть android-рантаймы в clang-пакет). Если непустой —
+  # ниже find подхватит источник и разложит его.
+  echo "  [diag] compiler-rt builtins present in tree:"
+  find third_party/llvm-build third_party/android_toolchain \
+    -type f -name 'libclang_rt.builtins*' 2>/dev/null | head -60 \
+    | sed 's/^/    /' || true
+  echo "  [diag] end of list"
   for CLANG_LIB in third_party/llvm-build/Release+Asserts/lib/clang/*/lib; do
     [ -d "$CLANG_LIB" ] || continue
     for pair in \
       "i686-unknown-linux-android:i686" \
       "x86_64-unknown-linux-android:x86_64" \
       "aarch64-unknown-linux-android:aarch64" \
-      "arm-unknown-linux-androideabi:arm"; do
+      "arm-unknown-linux-android:arm"; do
       triple="${pair%%:*}"; arch="${pair##*:}"
       src=""
+      # 1. Уже лежит в resource-каталоге встроенного clang (per-target, без API)?
       if [ -f "$CLANG_LIB/$triple/libclang_rt.builtins.a" ]; then
         src="$CLANG_LIB/$triple/libclang_rt.builtins.a"
+      # 2. Legacy-раскладка linux/ с суффиксом арки.
       elif [ -f "$CLANG_LIB/linux/libclang_rt.builtins-$arch-android.a" ]; then
         src="$CLANG_LIB/linux/libclang_rt.builtins-$arch-android.a"
       else
-        src=$(ls "$NDK_CLANG"/lib/clang/*/lib/linux/libclang_rt.builtins-"$arch"-android.a 2>/dev/null | head -1 || true)
+        # 3. Ищем по всему дереву: сначала суффиксная linux/-раскладка
+        # (libclang_rt.builtins-<arch>-android.a), затем per-target каталог
+        # вида <arch>...-linux-android*/libclang_rt.builtins.a. Берём первый.
+        src=$(find third_party/android_toolchain third_party/llvm-build \
+                -type f -name "libclang_rt.builtins-$arch-android.a" 2>/dev/null \
+                | head -1 || true)
+        if [ -z "$src" ]; then
+          src=$(find third_party/android_toolchain third_party/llvm-build \
+                  -type f -path "*${arch}*-linux-android*/libclang_rt.builtins.a" \
+                  2>/dev/null | head -1 || true)
+        fi
       fi
-      [ -n "$src" ] && [ -f "$src" ] || continue
-      for api in 21 24 26 27 28; do
+      [ -n "$src" ] && [ -f "$src" ] || { echo "  WARN: no builtins for $arch"; continue; }
+      echo "  $arch <- $src"
+      # Кладём и в каталог без номера API (на случай, если драйвер ищет так),
+      # и во все уровни API, которые toolchain может подставить в триплет.
+      mkdir -p "$CLANG_LIB/${triple}"
+      cp -f "$src" "$CLANG_LIB/${triple}/libclang_rt.builtins.a" || true
+      for api in 19 21 23 24 26 27 28 29 30 31 33 34; do
         mkdir -p "$CLANG_LIB/${triple}${api}"
         cp -f "$src" "$CLANG_LIB/${triple}${api}/libclang_rt.builtins.a" || true
       done

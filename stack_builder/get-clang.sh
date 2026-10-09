@@ -70,7 +70,14 @@ if [ ! -f gn/out/gn ]; then
 fi
 
 if [ "$target_os" = android ]; then
-  if [ ! -d third_party/android_toolchain/ndk ]; then
+  # Пере-скачиваем NDK не только когда каталога нет, но и когда в нём отсутствуют
+  # compiler-rt builtins. Это чинит СТАРЫЙ кэш GitHub, запруненный прежней версией
+  # этого скрипта (там builtins уже вырезаны, а ветку скачивания cache-hit
+  # пропускал — из-за чего SOLINK и падал даже после правки keep-списка).
+  if [ ! -d third_party/android_toolchain/ndk ] || \
+     ! find third_party/android_toolchain/ndk -type f -name 'libclang_rt.builtins*' 2>/dev/null | grep -q .; then
+    echo "NDK missing or has no compiler-rt builtins -> (re)downloading..."
+    rm -rf third_party/android_toolchain/ndk
     android_ndk_version=r24
     curl -LO https://dl.google.com/android/repository/android-ndk-$android_ndk_version-linux.zip
     unzip -q android-ndk-$android_ndk_version-linux.zip
@@ -80,8 +87,12 @@ if [ "$target_os" = android ]; then
     cp -r --parents toolchains/llvm/prebuilt ../third_party/android_toolchain/ndk
     cd ..
     cd third_party/android_toolchain/ndk
+    # ВАЖНО: libclang_rt[^/]*\.a обязан быть в keep-списке — это compiler-rt
+    # builtins (libclang_rt.builtins-<arch>-android.a), которые линкер lld требует
+    # при сборке .so под Android. Без него прунинг вырезал их из NDK, и SOLINK
+    # падал с "cannot open .../<triple><api>/libclang_rt.builtins.a".
     find toolchains -type f -regextype egrep \! -regex \
-      '.*(lib(atomic|gcc|gcc_real|compiler_rt-extras|android_support|unwind).a|crt.*o|lib(android|c|dl|log|m).so|usr/local.*|usr/include.*)' -delete
+      '.*(lib(atomic|gcc|gcc_real|compiler_rt-extras|android_support|unwind).a|libclang_rt[^/]*\.a|crt.*o|lib(android|c|dl|log|m).so|usr/local.*|usr/include.*)' -delete
     sed -i 's/AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1UL /AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1ULL /' toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/android/hardware_buffer.h
     cd -
     rm -rf android-ndk-$android_ndk_version android-ndk-$android_ndk_version-linux.zip
