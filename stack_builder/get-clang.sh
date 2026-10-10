@@ -180,17 +180,31 @@ for path, dep in deps.items():
     if isinstance(dep, dict) and 'packages' in dep:
         if not any(k in path.lower() for k in allowed_keywords):
             continue
+        # android_toolchain/ndk ставится ВРУЧНУЮ выше (r24 + сохранение
+        # compiler-rt builtins). Не даём cipd затереть его пакетом android_toolchain,
+        # иначе builtins снова пропадут и SOLINK упадёт.
+        if 'android_toolchain' in path:
+            continue
 
         for pkg in dep['packages']:
             p = str(pkg.get('package', ''))
             v = str(pkg.get('version', ''))
 
-            if not p or not v or '{' in p or '$' in p or '{' in v or '$' in v: continue
+            if not p or not v: continue
 
-            p = p.replace('${platform}', 'linux-amd64').replace('{platform}', 'linux-amd64')
-            p = p.replace('${os}', 'linux').replace('{os}', 'linux')
-            p = p.replace('${arch}', 'amd64').replace('{arch}', 'amd64')
-            p = p.replace('$', '')
+            # Раскрываем плейсхолдеры ДО проверки на остаток шаблона. DEPS
+            # использует двойные скобки ${{platform}} (gclient-шаблон), поэтому
+            # обрабатываем и ${{x}}, и ${x}, и {x}. Раньше отсев '$'/'{' стоял
+            # до замены — и ВСЕ платформенные CIPD-пакеты (protoc и прочие
+            # нативные бинари android_build_tools) выбрасывались, из-за чего
+            # ninja падал на отсутствующем .../protoc/cipd/protoc.
+            for ph, val in (('platform', 'linux-amd64'), ('os', 'linux'), ('arch', 'amd64')):
+                for tok in ('${{%s}}' % ph, '${%s}' % ph, '{%s}' % ph):
+                    p = p.replace(tok, val)
+                    v = v.replace(tok, val)
+
+            # Остался нераскрытый шаблон — резолвить не умеем, пропускаем.
+            if '{' in p or '$' in p or '{' in v or '$' in v: continue
 
             ensure.append(f"@Subdir {path.replace('src/', '')}")
             ensure.append(f"{p} {v}")
