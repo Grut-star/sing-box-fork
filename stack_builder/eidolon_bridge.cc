@@ -509,7 +509,11 @@ private:
         net::HostPortPair host_port(sni_, port_);
 
         net::IPAddress ip_addr;
-        if (!ip_addr.AssignFromIPLiteral(ip_)) { Finish(false); return; }
+        if (!ip_addr.AssignFromIPLiteral(ip_)) {
+            LOG(ERROR) << "EIDOLON_DIAG: QUIC bad IP literal: '" << ip_ << "' sni=" << sni_;
+            Finish(false); return;
+        }
+        LOG(INFO) << "EIDOLON_DIAG: QUIC dialing " << ip_ << ":" << port_ << " sni=" << sni_;
 
         net::QuicSessionKey session_key(
                 host_port, net::PRIVACY_MODE_DISABLED, net::ProxyChain::Direct(),
@@ -538,11 +542,16 @@ private:
 
     void OnSessionAttemptComplete(int rv) {
         if (rv != net::OK || !sess_->quic_attempt->session()) {
+            LOG(ERROR) << "EIDOLON_DIAG: QUIC session attempt failed rv=" << rv << " ("
+                       << net::ErrorToString(rv) << ") has_session="
+                       << (sess_->quic_attempt->session() != nullptr) << " sni=" << sni_
+                       << " " << ip_ << ":" << port_;
             Finish(false); return;
         }
 
         sess_->quic_session_handle = sess_->quic_attempt->session()->CreateHandle(std::move(scheme_host_port_));
         if (!sess_->quic_session_handle || !sess_->quic_session_handle->IsConnected()) {
+            LOG(ERROR) << "EIDOLON_DIAG: QUIC session handle not connected sni=" << sni_;
             Finish(false); return;
         }
 
@@ -557,8 +566,11 @@ private:
 
     void OnStreamRequested(int rv) {
         if (rv != net::OK) {
+            LOG(ERROR) << "EIDOLON_DIAG: QUIC stream request failed rv=" << rv << " ("
+                       << net::ErrorToString(rv) << ") sni=" << sni_;
             Finish(false); return;
         }
+        LOG(INFO) << "EIDOLON_DIAG: QUIC stream established sni=" << sni_;
 
         sess_->quic_stream_handle = sess_->quic_session_handle->ReleaseStream();
 
@@ -611,8 +623,12 @@ private:
 
     void Run() {
         net::IPAddress ip_addr;
-        if (!ip_addr.AssignFromIPLiteral(ip_)) { Finish(false); return; }
+        if (!ip_addr.AssignFromIPLiteral(ip_)) {
+            LOG(ERROR) << "EIDOLON_DIAG: TCP bad IP literal: '" << ip_ << "' sni=" << sni_;
+            Finish(false); return;
+        }
 
+        LOG(INFO) << "EIDOLON_DIAG: TCP dialing " << ip_ << ":" << port_ << " sni=" << sni_;
         raw_socket_ = std::make_unique<net::TCPClientSocket>(
                 net::AddressList(net::IPEndPoint(ip_addr, port_)), nullptr, nullptr, nullptr, net::NetLogSource(), net::handles::kInvalidNetworkHandle);
 
@@ -621,7 +637,11 @@ private:
     }
 
     void OnTcpConnected(int rv) {
-        if (rv != net::OK) { Finish(false); return; }
+        if (rv != net::OK) {
+            LOG(ERROR) << "EIDOLON_DIAG: TCP connect failed rv=" << rv << " ("
+                       << net::ErrorToString(rv) << ") " << ip_ << ":" << port_;
+            Finish(false); return;
+        }
 
         // 1. Делегируем сборку всего стека (включая TransportSecurityState) билдеру
         net::URLRequestContextBuilder builder;
@@ -670,6 +690,12 @@ private:
     }
 
     void OnSslConnected(int rv) {
+        if (rv != net::OK) {
+            LOG(ERROR) << "EIDOLON_DIAG: TCP TLS handshake failed rv=" << rv << " ("
+                       << net::ErrorToString(rv) << ") sni=" << sni_ << " " << ip_ << ":" << port_;
+        } else {
+            LOG(INFO) << "EIDOLON_DIAG: TCP TLS handshake OK sni=" << sni_;
+        }
         Finish(rv == net::OK);
     }
 
@@ -1060,6 +1086,15 @@ EIDOLON_EXPORT void eidolon_init() {
         base::CommandLine::Init(0, nullptr);
     }
     if (!g_exit_manager) {
+        // EIDOLON_DIAG: направляем логи Chromium в системный журнал (logcat на Android,
+        // stderr на обычном POSIX), чтобы были видны причины отказов дозвона (net error codes).
+        {
+            logging::LoggingSettings log_settings;
+            log_settings.logging_dest = logging::LOG_TO_SYSTEM_DEBUG_LOG;
+            logging::InitLogging(log_settings);
+            logging::SetMinLogLevel(logging::LOGGING_INFO);
+            LOG(INFO) << "EIDOLON_DIAG: native logging initialized";
+        }
         g_exit_manager = new base::AtExitManager();
         base::ThreadPoolInstance::CreateAndStartWithDefaultParams("Eidolon_ThreadPool");
         g_io_thread = new base::Thread("EidolonIOThread");
