@@ -308,6 +308,7 @@ struct EidolonSession {
 
             int rv = 0;
             if (is_quic_) {
+                LOG(INFO) << "EIDOLON_DIAG: client QUIC pump -> WriteStreamData bytes=" << bytes_read;
                 std::string_view data_sv(write_buf->data(), bytes_read);
                 rv = quic_stream_handle->WriteStreamData(
                         data_sv, false,
@@ -328,6 +329,8 @@ struct EidolonSession {
     void OnSocketWriteComplete(int rv) {
         if (is_closed_) return;
         socket_write_pending_ = false;
+
+        if (is_quic_) LOG(INFO) << "EIDOLON_DIAG: client QUIC pump write complete rv=" << rv;
 
         if (rv < 0) {
             Close(); // Ошибка записи в сеть
@@ -372,6 +375,8 @@ struct EidolonSession {
     void OnSocketReadComplete(int rv) {
         if (is_closed_) return;
         socket_read_pending_ = false;
+
+        if (is_quic_) LOG(INFO) << "EIDOLON_DIAG: client QUIC pump ReadBody rv=" << rv;
 
         if (rv > 0) {
             // Данные получены, ставим в очередь на запись в Go
@@ -797,6 +802,7 @@ public:
 
     void OnInitialHeadersComplete(bool fin, size_t frame_len, const quic::QuicHeaderList& header_list) override {
         quic::QuicSpdyStream::OnInitialHeadersComplete(fin, frame_len, header_list);
+        LOG(INFO) << "EIDOLON_DIAG: QUIC server stream headers complete id=" << id() << " fin=" << fin;
         quiche::HttpHeaderBlock response_headers;
         response_headers[":status"] = "200";
         WriteHeaders(std::move(response_headers), false, nullptr);
@@ -811,6 +817,7 @@ public:
             if (!flow_id_read_) {
                 buffer_.append(data);
                 sequencer()->MarkConsumed(iov.iov_len);
+                LOG(INFO) << "EIDOLON_DIAG: QUIC server body chunk=" << iov.iov_len << " buffered=" << buffer_.size();
 
                 if (buffer_.size() >= 50) {
                     uint16_t pad_len = (static_cast<uint8_t>(buffer_[48]) << 8) | static_cast<uint8_t>(buffer_[49]);
@@ -849,6 +856,8 @@ public:
 
 private:
     void ForwardToGo(const std::string& token, const std::string& session_key, const std::string& flow_id) {
+        LOG(INFO) << "EIDOLON_DIAG: QUIC server ForwardToGo cb_port=" << cb_port_
+                  << " token_prefix=" << (token.size() >= 2 ? (int)(uint8_t)token[0] : -1);
         pump_ = base::MakeRefCounted<BidirectionalPump>(this, base::SingleThreadTaskRunner::GetCurrentDefault());
         g_io_thread->task_runner()->PostTask(FROM_HERE,
                                              base::BindOnce(&BidirectionalPump::ConnectTCP, pump_, cb_port_, token, session_key, flow_id));
@@ -874,6 +883,7 @@ void BidirectionalPump::ConnectTCP(uint16_t cb_port, std::string token, std::str
     net::IPAddress ip;
     (void)ip.AssignFromIPLiteral("127.0.0.1"); // <-- ИСПРАВЛЕН ВАРНИНГ [[nodiscard]]
 
+    LOG(INFO) << "EIDOLON_DIAG: QUIC server ConnectTCP -> 127.0.0.1:" << cb_port;
     tcp_socket_ = std::make_unique<net::TCPClientSocket>(
             net::AddressList(net::IPEndPoint(ip, cb_port)), nullptr, nullptr, nullptr, net::NetLogSource(), net::handles::kInvalidNetworkHandle);
 
@@ -896,6 +906,7 @@ void BidirectionalPump::DetachQUIC() {
 }
 
 void BidirectionalPump::OnTCPConnect(std::string token, std::string session_key, std::string flow_id, int rv) {
+    LOG(INFO) << "EIDOLON_DIAG: QUIC server cb_port connect rv=" << rv << " (" << net::ErrorToString(rv) << ")";
     if (rv != net::OK) {
         // Подключение к ядру не удалось — рвём QUIC-поток, иначе клиент висит.
         tcp_socket_.reset();
@@ -984,6 +995,7 @@ public:
 protected:
     quic::QuicSpdyStream* CreateIncomingStream(quic::QuicStreamId id) override {
         if (!ShouldCreateIncomingStream(id)) return nullptr;
+        LOG(INFO) << "EIDOLON_DIAG: QUIC server incoming stream id=" << id;
         auto* stream = new EidolonServerStream(id, this, cb_port_);
         ActivateStream(absl::WrapUnique(stream));
         return stream;
@@ -1010,6 +1022,9 @@ protected:
             const quic::QuicSocketAddress& peer_address, absl::string_view alpn,
             const quic::ParsedQuicVersion& version, const quic::ParsedClientHello& parsed_chlo,
             quic::ConnectionIdGeneratorInterface& connection_id_generator) override {
+
+        LOG(INFO) << "EIDOLON_DIAG: QUIC server session created peer=" << peer_address.ToString()
+                  << " alpn=" << std::string(alpn) << " version=" << version;
 
         quic::QuicConnection* connection = new quic::QuicConnection(
                 connection_id, self_address, peer_address, helper(), alarm_factory(), writer(),
