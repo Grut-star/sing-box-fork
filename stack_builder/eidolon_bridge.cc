@@ -24,6 +24,9 @@ typedef SSIZE_T ssize_t;
 #include "base/task/thread_pool/thread_pool_instance.h"
 #include "base/command_line.h"
 #include "base/logging.h"
+// EIDOLON_DIAG: полное определение LoggingSettings и констант LoggingDestination
+// (LOG_TO_SYSTEM_DEBUG_LOG) в Chromium 155+ вынесено из base/logging.h сюда.
+#include "base/logging/logging_settings.h"
 
 #include <vector>
 #include <string>
