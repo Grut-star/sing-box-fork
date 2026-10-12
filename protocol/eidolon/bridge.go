@@ -13,6 +13,11 @@ package eidolon
 
 extern void eidolon_init();
 
+// EIDOLON_DIAG: регистрируем Go-колбэк защиты сокета (определён через //export в protect_export.go).
+// Колбэк зовёт Android VpnService.protect на fd нативного сокета до connect.
+extern int eidolonProtectFd(int fd);
+static void eidolon_register_protect(void) { eidolon_set_protect(eidolonProtectFd); }
+
 // Модифицированные сигнатуры C для передачи data_fd как uintptr_t (безопасно для Windows SOCKET)
 // extern EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd);
 // extern EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd);
@@ -27,6 +32,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 )
@@ -152,6 +158,23 @@ func RawDialBoundaryStress(isQUIC bool, host string, port int, tokenPtr unsafe.P
 func init() {
     // Гарантирует, что среда Chromium инициализируется один раз при старте
     C.eidolon_init()
+    // Регистрируем нативный колбэк защиты сокета (сама функция protect ставится позже
+    // через SetProtectFunc, когда известен platform interface бокса).
+    C.eidolon_register_protect()
+}
+
+// globalProtect хранит функцию защиты сокета (Android VpnService.protect через platform interface).
+// Доступ из нативного колбэка eidolonProtectFd (protect_export.go).
+var globalProtect atomic.Pointer[func(fd int) error]
+
+// SetProtectFunc задаёт функцию защиты исходящих сокетов нативного стека.
+// Передай nil, чтобы снять (на платформах без VpnService protect не нужен).
+func SetProtectFunc(f func(fd int) error) {
+	if f == nil {
+		globalProtect.Store(nil)
+		return
+	}
+	globalProtect.Store(&f)
 }
 
 // NativeStackConn реализует стандартный интерфейс net.Conn,
@@ -196,17 +219,10 @@ func dialNative(ctx context.Context, host string, port int, token []byte, isQUIC
 	// 2. Готовим аргументы для CGO
 	cHost := C.CString(host)
 
-	// CGO bridge bounds-checking:
-	// The BoringSSL TLS bridge requires a 32-byte session ID buffer.
-	// For undersized tokens (< 32 bytes), zero-pad to 32 bytes to ensure safe copy_from
-	// semantics in Chromium base::span without assertion failure, preserving the prefix bytes.
-	// Oversized tokens (>= 32 bytes) are passed directly and clamped safely
-	// by std::min(token_.size(), 32) in C++.
+	// TCP: здесь теперь передаётся мастер-секрет (переменной длины), а сам токен
+	// nonce||tag считает BoringSSL над key_share. QUIC: 32-байтный токен nonce||tag.
+	// Дополнять нулями НЕЛЬЗЯ — это изменило бы секрет и сломало HMAC.
 	safeToken := token
-	if !isQUIC && len(safeToken) < 32 {
-		safeToken = make([]byte, 32)
-		copy(safeToken, token)
-	}
 
 	var cToken *C.uint8_t
 	if len(safeToken) > 0 {
@@ -221,7 +237,7 @@ func dialNative(ctx context.Context, host string, port int, token []byte, isQUIC
 		handle C.EidolonHandle
 		err    error
 	}
-	resCh := make(chan dialResult)
+	resCh := make(chan dialResult, 1)
 
 	go func() {
 		defer C.free(unsafe.Pointer(cHost))
@@ -259,8 +275,7 @@ func dialNative(ctx context.Context, host string, port int, token []byte, isQUIC
 
 	// 4. Ожидаем завершения с учетом контекста
 	select {
-	case <-ctx.Done(): 		// Если контекст отменен (таймаут/прерывание), жестко закрываем сокет.
-                       		// Это заставит C++ ядро получить ошибку записи/чтения и освободить ресурсы.
+	case <-ctx.Done():
 		select {
 		case res := <-resCh:
 			if res.handle != nil {

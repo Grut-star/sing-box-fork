@@ -102,6 +102,23 @@ typedef SSIZE_T ssize_t;
 static base::AtExitManager* g_exit_manager = nullptr;
 static base::Thread* g_io_thread = nullptr;
 
+// EIDOLON_DIAG: колбэк protect(fd) из Go (Android VpnService.protect). Без него сокет
+// нативного стека уходит обратно в TUN и дозвон падает (-102 ERR_CONNECTION_REFUSED).
+static EidolonProtectFunc g_protect_func = nullptr;
+
+// Защищает уже открытый сокет (fd) от захвата VpnService. Безопасно при nullptr-колбэке.
+static void EidolonProtectFd(int fd) {
+    if (g_protect_func == nullptr || fd < 0) {
+        return;
+    }
+    int rv = g_protect_func(fd);
+    if (rv != 0) {
+        LOG(ERROR) << "EIDOLON_DIAG: protect(fd) failed rv=" << rv << " fd=" << fd;
+    } else {
+        LOG(INFO) << "EIDOLON_DIAG: socket protected fd=" << fd;
+    }
+}
+
 class EidolonCertVerifier : public net::CertVerifier {
 public:
     explicit EidolonCertVerifier(std::unique_ptr<net::CertVerifier> default_verifier)
@@ -632,9 +649,18 @@ private:
         }
 
         LOG(INFO) << "EIDOLON_DIAG: TCP dialing " << ip_ << ":" << port_ << " sni=" << sni_;
-        raw_socket_ = std::make_unique<net::TCPClientSocket>(
+        auto tcp_socket = std::make_unique<net::TCPClientSocket>(
                 net::AddressList(net::IPEndPoint(ip_addr, port_)), nullptr, nullptr, nullptr, net::NetLogSource(), net::handles::kInvalidNetworkHandle);
 
+        // EIDOLON_DIAG: защищаем сокет от VpnService до connect. Колбэк вызывается
+        // уже после открытия fd (socket Open), но до connect(), поэтому fd валиден.
+        net::TCPClientSocket* tcp_ptr = tcp_socket.get();
+        tcp_ptr->SetBeforeConnectCallback(base::BindRepeating([](net::TCPClientSocket* s) -> int {
+            EidolonProtectFd(s->SocketDescriptorForTesting());
+            return net::OK;
+        }, base::Unretained(tcp_ptr)));
+
+        raw_socket_ = std::move(tcp_socket);
         int rv = raw_socket_->Connect(base::BindOnce(&TCPDialHelper::OnTcpConnected, base::Unretained(this)));
         if (rv != net::ERR_IO_PENDING) OnTcpConnected(rv);
     }
@@ -1083,6 +1109,10 @@ static base::NoDestructor<net::TransportSecurityState> g_transport_security_stat
 #if BUILDFLAG(IS_POSIX)
 static base::FileDescriptorWatcher* g_file_descriptor_watcher = nullptr;
 #endif
+
+EIDOLON_EXPORT void eidolon_set_protect(EidolonProtectFunc cb) {
+    g_protect_func = cb;
+}
 
 EIDOLON_EXPORT void eidolon_init() {
     if (!base::CommandLine::InitializedForCurrentProcess()) {

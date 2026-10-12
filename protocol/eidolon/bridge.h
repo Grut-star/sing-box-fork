@@ -17,6 +17,12 @@ extern "C" {
 
 typedef void* EidolonHandle;
 
+// Колбэк защиты сокета (Android VpnService.protect): получает fd, возвращает 0 при успехе.
+// Регистрируется один раз из Go; нативный стек зовёт его на свой сокет до connect,
+// иначе сокет ядра уходит обратно в TUN (см. диагностику -102 ERR_CONNECTION_REFUSED).
+typedef int (*EidolonProtectFunc)(int fd);
+EIDOLON_EXPORT void eidolon_set_protect(EidolonProtectFunc cb);
+
 // Инициализация TCP (TLS 1.3) и UDP (QUIC / HTTP3)
 // Функция возвращает управление сразу после инициализации асинхронной помпы данных.
 EIDOLON_EXPORT EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd);
