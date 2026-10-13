@@ -809,14 +809,19 @@ public:
     }
 
     void OnBodyAvailable() override {
-        while (sequencer()->HasBytesToRead()) {
+        // ВАЖНО: читаем ДЕКОДИРОВАННОЕ тело HTTP/3 через API QuicSpdyStream
+        // (HasBytesToRead/GetReadableRegions/MarkConsumed идут в body_manager_),
+        // а НЕ sequencer() напрямую. Для HTTP/3 сырой sequencer уже поглощён
+        // декодером кадров, поэтому sequencer()->HasBytesToRead() ложен и
+        // прежний цикл никогда не выполнялся → ForwardToGo не вызывался.
+        while (HasBytesToRead()) {
             struct iovec iov;
-            if (sequencer()->GetReadableRegions(&iov, 1) == 0) break;
+            if (GetReadableRegions(&iov, 1) == 0) break;
             std::string_view data(static_cast<const char*>(iov.iov_base), iov.iov_len);
 
             if (!flow_id_read_) {
                 buffer_.append(data);
-                sequencer()->MarkConsumed(iov.iov_len);
+                MarkConsumed(iov.iov_len);
                 LOG(INFO) << "EIDOLON_DIAG: QUIC server body chunk=" << iov.iov_len << " buffered=" << buffer_.size();
 
                 if (buffer_.size() >= 50) {
@@ -848,7 +853,7 @@ public:
             } else {
                 if (pump_) pump_->WriteToTCP(data);
                 else leftover_data_.append(data);
-                sequencer()->MarkConsumed(iov.iov_len);
+                MarkConsumed(iov.iov_len);
             }
         }
         if (sequencer()->IsClosed()) OnFinRead();
@@ -1134,11 +1139,14 @@ EIDOLON_EXPORT void eidolon_init() {
         base::CommandLine::Init(0, nullptr);
     }
     if (!g_exit_manager) {
-        // EIDOLON_DIAG: направляем логи Chromium в системный журнал (logcat на Android,
-        // stderr на обычном POSIX), чтобы были видны причины отказов дозвона (net error codes).
+        // EIDOLON_DIAG: направляем логи Chromium и в системный журнал (logcat на Android),
+        // и в stderr. На Linux у LOG_TO_SYSTEM_DEBUG_LOG нет ветки вывода (base/logging.cc
+        // обрабатывает только Win/Apple/Android/Fuchsia), а ShouldLogToStderr пропускает лишь
+        // ERROR/FATAL — поэтому INFO/WARNING на сервере терялись. LOG_TO_STDERR это чинит,
+        // не ломая logcat на клиенте.
         {
             logging::LoggingSettings log_settings;
-            log_settings.logging_dest = logging::LOG_TO_SYSTEM_DEBUG_LOG;
+            log_settings.logging_dest = logging::LOG_TO_SYSTEM_DEBUG_LOG | logging::LOG_TO_STDERR;
             logging::InitLogging(log_settings);
             logging::SetMinLogLevel(logging::LOGGING_INFO);
             LOG(INFO) << "EIDOLON_DIAG: native logging initialized";
