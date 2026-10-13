@@ -101,6 +101,12 @@ typedef SSIZE_T ssize_t;
 
 static base::AtExitManager* g_exit_manager = nullptr;
 static base::Thread* g_io_thread = nullptr;
+// Выделенный поток для нативного QUIC-сервера. Нужен, чтобы серверный event loop
+// жил на потоке с Chromium SingleThreadTaskRunner (ForwardToGo/ResetQUIC/
+// WriteOrBufferBody постят задачи на него), и при этом НЕ блокировался бесконечно
+// (HandleEventsForever) — вместо этого прокачиваем event loop самоперепостящейся
+// задачей WaitForEvents, так поток успевает исполнять и постленные задачи.
+static base::Thread* g_quic_thread = nullptr;
 
 // EIDOLON_DIAG: колбэк protect(fd) из Go (Android VpnService.protect). Без него сокет
 // нативного стека уходит обратно в TUN и дозвон падает (-102 ERR_CONNECTION_REFUSED).
@@ -755,6 +761,17 @@ private:
 // === СЕРВЕРНАЯ ЧАСТЬ QUIC СТРОГО ПОД ЛИНУКС ===
 #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
 
+// Указатель на серверный QUIC event loop для кросс-потокового WakeUp:
+// когда g_io_thread постит задачу на g_quic_thread (WriteOrBufferBody/ResetQUIC),
+// будим RunEventLoopOnce, чтобы задача исполнилась без ожидания таймаута (50 мс).
+static quic::QuicEventLoop* g_quic_event_loop = nullptr;
+
+static void WakeQuicLoop() {
+    if (g_quic_event_loop && g_quic_event_loop->SupportsWakeUp()) {
+        g_quic_event_loop->WakeUp();
+    }
+}
+
 class EidolonServerStream;
 
 class BidirectionalPump : public base::RefCountedThreadSafe<BidirectionalPump> {
@@ -969,6 +986,7 @@ void BidirectionalPump::ResetQUIC() {
             self->quic_stream_->Reset(quic::QUIC_STREAM_CANCELLED);
         }
     }, base::RetainedRef(this)));
+    WakeQuicLoop();
 }
 
 void BidirectionalPump::PumpTCPToQUIC() {
@@ -998,6 +1016,7 @@ void BidirectionalPump::OnTCPRead(int rv) {
         g_io_thread->task_runner()->PostTask(
             FROM_HERE, base::BindOnce(&BidirectionalPump::PumpTCPToQUIC, self));
     }, base::RetainedRef(this), std::string(read_buf_->data(), rv)));
+    WakeQuicLoop();
 }
 
 class EidolonServerSession : public quic::QuicSimpleServerSession {
@@ -1080,8 +1099,12 @@ class QUICListenHelper {
 public:
     static void Start(const std::string& host, uint16_t port, uint16_t cb_port) {
         auto* listener = new QUICListenHelper(host, port, cb_port);
-        base::ThreadPool::PostTask(FROM_HERE, {base::MayBlock()},
-                                   base::BindOnce(&QUICListenHelper::Run, base::Unretained(listener)));
+        // Запускаем серверный QUIC на выделенном потоке с SingleThreadTaskRunner,
+        // а НЕ на ThreadPool: иначе OnBodyAvailable/ForwardToGo падают на
+        // SingleThreadTaskRunner::GetCurrentDefault(), а постленные на QUIC-поток
+        // задачи (запись в стрим) некому исполнять.
+        g_quic_thread->task_runner()->PostTask(
+                FROM_HERE, base::BindOnce(&QUICListenHelper::Run, base::Unretained(listener)));
     }
 
 private:
@@ -1112,12 +1135,25 @@ private:
         }
         quic::QuicSocketAddress address(ip, port_);
 
-        if (server_->CreateUDPSocketAndListen(address)) {
-            server_->HandleEventsForever();
-        } else {
+        if (!server_->CreateUDPSocketAndListen(address)) {
             LOG(ERROR) << "eidolon: QUIC CreateUDPSocketAndListen failed on " << host_ << ":" << port_;
+            delete this;
+            return;
         }
-        delete this;
+        LOG(INFO) << "EIDOLON_DIAG: QUIC server listening (pumped) on " << host_ << ":" << port_;
+        g_quic_event_loop = server_->event_loop();
+        // Вместо блокирующего HandleEventsForever крутим event loop самоперепостящейся
+        // задачей: WaitForEvents = RunEventLoopOnce(50мс), между итерациями g_quic_thread
+        // исполняет постленные задачи (запись в QUIC-стрим, reset). Объект живёт, пока
+        // крутится помпа (не delete this).
+        PumpOnce();
+    }
+
+    void PumpOnce() {
+        if (!server_) return;
+        server_->WaitForEvents();
+        g_quic_thread->task_runner()->PostTask(
+                FROM_HERE, base::BindOnce(&QUICListenHelper::PumpOnce, base::Unretained(this)));
     }
 
     std::unique_ptr<quic::QuicMemoryCacheBackend> backend_;
@@ -1173,6 +1209,16 @@ EIDOLON_EXPORT void eidolon_init() {
 
 #if BUILDFLAG(IS_POSIX)
         g_file_descriptor_watcher = new base::FileDescriptorWatcher(g_io_thread->task_runner());
+#endif
+
+        // Отдельный поток под серверный QUIC event loop (см. g_quic_thread выше).
+        // Только там, где компилируется серверный QUIC (Linux/ChromeOS); на клиенте
+        // (Android) QUICListenHelper не собирается, лишний поток не нужен.
+#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
+        g_quic_thread = new base::Thread("EidolonQuicThread");
+        base::Thread::Options quic_options;
+        quic_options.message_pump_type = base::MessagePumpType::IO;
+        g_quic_thread->StartWithOptions(std::move(quic_options));
 #endif
     }
 }
