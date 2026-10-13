@@ -222,6 +222,9 @@ struct EidolonSession {
     bool socket_write_pending_ = false;
     bool socket_read_pending_ = false;
     std::vector<std::string> pending_fd_writes_;
+    // Заголовки ответа HTTP/3 (:status). ReadInitialHeaders ДОЛЖЕН их прочитать,
+    // иначе QuicChromiumClientStream::OnBodyAvailable не отдаёт тело в ReadBody.
+    quiche::HttpHeaderBlock quic_response_headers_;
 
     EidolonSession(uintptr_t fd, bool quic) : data_fd_(fd), is_quic_(quic) {
         // Переводим FD от Go в неблокирующий режим (Non-Blocking)
@@ -282,7 +285,32 @@ struct EidolonSession {
         socket_watcher_.StartWatchingOnce(socket_event_, this);
 #endif
 
-        // Запускаем первичное чтение из Chromium сокета
+        // Запускаем первичное чтение из Chromium сокета.
+        if (is_quic_) {
+            // HTTP/3: СНАЧАЛА читаем initial headers (:status 200) ответа. Пока
+            // приложение их не прочитает, QuicChromiumClientStream::OnBodyAvailable
+            // (quic_chromium_client_stream.cc:666) видит headers_delivered_==false
+            // и буферизует тело, не уведомляя Handle → ReadBody висит в ERR_IO_PENDING
+            // вечно (симптом: нисходящие QUIC-пакеты приходят, но "ReadBody rv=" не
+            // логируется, запрос таймаутит). ReadBody запускаем ТОЛЬКО из колбэка,
+            // чтобы headers_delivered_ уже был true и забуференное тело отдалось.
+            int rv = quic_stream_handle->ReadInitialHeaders(
+                    &quic_response_headers_,
+                    base::BindOnce(&EidolonSession::OnQuicInitialHeadersRead, base::Unretained(this)));
+            if (rv != net::ERR_IO_PENDING) OnQuicInitialHeadersRead(rv);
+        } else {
+            DoSocketRead();
+        }
+    }
+
+    void OnQuicInitialHeadersRead(int rv) {
+        if (is_closed_) return;
+        LOG(INFO) << "EIDOLON_DIAG: client QUIC initial headers rv=" << rv;
+        if (rv < 0) {
+            Close();
+            return;
+        }
+        // headers_delivered_ теперь true — тело разблокировано; запускаем ReadBody.
         DoSocketRead();
     }
 
