@@ -806,6 +806,11 @@ public:
         quiche::HttpHeaderBlock response_headers;
         response_headers[":status"] = "200";
         WriteHeaders(std::move(response_headers), false, nullptr);
+        // КЛЮЧЕВОЕ: очищаем header_list_, иначе FinishedReadingHeaders()
+        // (== headers_decompressed_ && header_list_.empty()) навсегда ложно, и
+        // QuicSpdyStream::OnDataAvailable блокирует доставку тела (OnBodyAvailable
+        // не вызывается) — DATA-кадры декодируются, но тело не отдаётся приложению.
+        ConsumeHeaderList();
     }
 
     // EIDOLON_DIAG: виден ли вообще входящий DATA-кадр HTTP/3 на этом стриме.
