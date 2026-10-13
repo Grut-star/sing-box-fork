@@ -808,7 +808,15 @@ public:
         WriteHeaders(std::move(response_headers), false, nullptr);
     }
 
+    // EIDOLON_DIAG: виден ли вообще входящий DATA-кадр HTTP/3 на этом стриме.
+    bool OnDataFrameStart(quic::QuicByteCount header_length, quic::QuicByteCount payload_length) override {
+        LOG(INFO) << "EIDOLON_DIAG: QUIC server OnDataFrameStart hdr=" << header_length
+                  << " payload=" << payload_length << " id=" << id();
+        return quic::QuicSpdyStream::OnDataFrameStart(header_length, payload_length);
+    }
+
     void OnBodyAvailable() override {
+        LOG(INFO) << "EIDOLON_DIAG: QUIC server OnBodyAvailable entry HasBytesToRead=" << HasBytesToRead();
         // ВАЖНО: читаем ДЕКОДИРОВАННОЕ тело HTTP/3 через API QuicSpdyStream
         // (HasBytesToRead/GetReadableRegions/MarkConsumed идут в body_manager_),
         // а НЕ sequencer() напрямую. Для HTTP/3 сырой sequencer уже поглощён
