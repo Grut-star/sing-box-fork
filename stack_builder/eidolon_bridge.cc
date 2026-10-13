@@ -787,7 +787,20 @@ public:
 
 private:
     friend class base::RefCountedThreadSafe<BidirectionalPump>;
-    ~BidirectionalPump() = default;
+    ~BidirectionalPump() {
+        // tcp_socket_ создан и обслуживается ТОЛЬКО на g_io_thread, поэтому его
+        // thread_checker привязан к этому потоку. Последняя ссылка на pump может
+        // упасть на g_quic_thread (стрим закрылся/сбросился раньше, чем завершился
+        // TCP — напр. клиент отвалился по таймауту): тогда дефолтный деструктор
+        // уничтожил бы tcp_socket_ здесь же и вызвал SocketPosix::Close() на чужом
+        // потоке → DCHECK(thread_checker_.CalledOnValidThread()) FATAL
+        // (socket_posix.cc:432). Поэтому передаём владение сокетом на g_io_thread,
+        // где он и будет корректно закрыт. release() не трогает сам сокет (только
+        // внутренний указатель unique_ptr), поэтому безопасен на любом потоке.
+        if (tcp_socket_ && g_io_thread) {
+            g_io_thread->task_runner()->DeleteSoon(FROM_HERE, tcp_socket_.release());
+        }
+    }
 
     void OnTCPConnect(std::string token, std::string session_key, std::string flow_id, int rv);
     void PumpTCPToQUIC();
@@ -997,6 +1010,9 @@ void BidirectionalPump::PumpTCPToQUIC() {
 }
 
 void BidirectionalPump::OnTCPRead(int rv) {
+    // EIDOLON_DIAG: обратный путь Go -> cb_port -> QUIC. rv>0 = байты ответа ядра.
+    LOG(INFO) << "EIDOLON_DIAG: QUIC server OnTCPRead rv=" << rv
+              << (rv > 0 ? std::string() : (" (" + net::ErrorToString(rv) + ")"));
     if (rv <= 0) {
         tcp_socket_.reset();
         ResetQUIC();
@@ -1009,8 +1025,10 @@ void BidirectionalPump::OnTCPRead(int rv) {
         {
             base::AutoLock lock(self->quic_lock_);
             if (self->quic_stream_ == nullptr) {
+                LOG(INFO) << "EIDOLON_DIAG: QUIC server WriteOrBufferBody SKIPPED (stream gone) bytes=" << d.size();
                 return; // поток уже отвалился — читать дальше незачем
             }
+            LOG(INFO) << "EIDOLON_DIAG: QUIC server WriteOrBufferBody -> client bytes=" << d.size();
             self->quic_stream_->WriteOrBufferBody(d, false);
         }
         g_io_thread->task_runner()->PostTask(
