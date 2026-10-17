@@ -177,6 +177,40 @@ def main():
         r'    }\n'
     )
 
+    # 10. MoQT (Фаза 0 перехода на MoQ): quiche содержит реализацию Media over QUIC
+    #     Transport (src/quiche/quic/moqt/*), но Chromium НЕ собирает её ни в один
+    #     GN-таргет (списки moqt_srcs/moqt_hdrs из source_list.gni нигде не исполь-
+    #     зуются). Инъектируем source_set("moqt") перед component("quiche"), чтобы
+    #     libeidolon мог на него залинковаться. Пока БЕЗ tools/ (moqt_server/relay/
+    #     client/chat) — они тянут event-loop и CLI-флаги; серверные tools подключим
+    #     на Фазе 6 отдельным таргетом. WebTransport-over-H3 уже в ядре quiche
+    #     (web_transport_http3.cc в quiche_core_srcs), отдельной правки не требует.
+    apply_patch(
+        'net/third_party/quiche/BUILD.gn',
+        r'component\("quiche"\) \{',
+        r'source_set("moqt") {\n'
+        r'  testonly = true\n'
+        r'  sources = moqt_srcs + moqt_hdrs\n'
+        r'  sources -= [\n'
+        r'    "src/quiche/quic/moqt/tools/chat_client.cc",\n'
+        r'    "src/quiche/quic/moqt/tools/moq_chat.cc",\n'
+        r'    "src/quiche/quic/moqt/tools/moqt_client.cc",\n'
+        r'    "src/quiche/quic/moqt/tools/moqt_relay.cc",\n'
+        r'    "src/quiche/quic/moqt/tools/moqt_server.cc",\n'
+        r'  ]\n'
+        r'  configs += [ ":quiche_internal_config" ]\n'
+        r'  public_configs = [ ":quiche_config" ]\n'
+        r'  deps = [\n'
+        r'    "//base",\n'
+        r'    "//net",\n'
+        r'    "//url",\n'
+        r'    ":quiche",\n'
+        r'  ]\n'
+        r'}\n'
+        r'\n'
+        r'component("quiche") {'
+    )
+
 
 #     apply_patch(
 #         'third_party/abseil-cpp/absl/base/internal/spinlock_win32.inc',

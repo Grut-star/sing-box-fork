@@ -169,7 +169,8 @@ shared_library("libeidolon") {
     "//third_party/boringssl:boringssl",
     "//components/version_info",
     "//net/third_party/quiche:quiche_tool_support",
-    "//net/third_party/quiche:quic_server_core"
+    "//net/third_party/quiche:quic_server_core",
+    "//net/third_party/quiche:moqt"
   ]
 
   if (is_linux || is_chromeos) {

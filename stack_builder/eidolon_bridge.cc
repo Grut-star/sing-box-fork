@@ -83,6 +83,21 @@ typedef SSIZE_T ssize_t;
 #include "net/cert/cert_verify_proc.h"
 #include <optional>
 
+// --- MoQT / WebTransport (Фаза 1 перехода на MoQ) ---
+// Клиент WebTransport-over-H3 из Chromium net (сохраняет наш URLRequestContext с
+// EidolonCertVerifier и protect-хуки), отдаёт quic::WebTransportSession* (==
+// webtransport::Session*), на который садится quiche MoqtSession.
+#include "net/quic/web_transport_client.h"
+#include "net/quic/quic_chromium_alarm_factory.h"
+#include "net/quic/platform/impl/quic_chromium_clock.h"
+#include "net/http/http_response_headers.h"
+#include "net/base/network_anonymization_key.h"
+#include "net/dns/host_resolver.h"
+#include "net/dns/mapped_host_resolver.h"
+#include "url/gurl.h"
+#include "url/origin.h"
+#include "quiche/quic/moqt/moqt_session.h"
+
 // === ЗАЩИТА СЕРВЕРНЫХ ЗАВИСИМОСТЕЙ QUIC ===
 #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
 #include "quiche/quic/tools/quic_simple_server_backend.h"
@@ -207,6 +222,17 @@ struct EidolonSession {
     uintptr_t data_fd_ = 0;
     bool is_quic_ = false;
     bool is_closed_ = false;
+
+    // --- MoQT / WebTransport (Фаза 1) ---
+    // Порядок объявления важен: разрушаются в обратном порядке, поэтому
+    // moqt_session_ (держит webtransport::Session*, владеемый wt_client_) объявлен
+    // ПОСЛЕ wt_client_ → уничтожается ПЕРВЫМ; wt_visitor_ объявлен раньше клиента →
+    // переживает его (клиент держит на visitor сырой указатель).
+    bool is_moqt_ = false;
+    std::vector<uint8_t> moqt_token_;  // токен для гейтинга namespace (Фаза 2)
+    std::unique_ptr<net::WebTransportClientVisitor> wt_visitor_;
+    std::unique_ptr<net::WebTransportClient> wt_client_;
+    std::unique_ptr<moqt::MoqtSession> moqt_session_;
 
     // Инструменты асинхронного I/O
     scoped_refptr<net::IOBufferWithSize> read_buf_;
@@ -501,6 +527,12 @@ struct EidolonSession {
         }
 #endif
 
+        // MoQT teardown: сессию первой (она держит webtransport::Session*,
+        // владеемый wt_client_), затем клиент, затем visitor.
+        moqt_session_.reset();
+        wt_client_.reset();
+        wt_visitor_.reset();
+
         if (is_quic_) {
             quic_stream_handle.reset();
             quic_session_handle.reset();
@@ -664,6 +696,155 @@ private:
     std::vector<uint8_t> token_;
     raw_ptr<base::WaitableEvent> event_;
     url::SchemeHostPort scheme_host_port_;
+};
+
+// -------------------------------------------------------------------------
+// MoQT / WebTransport-over-H3 (Фаза 1): visitor + dial helper
+// -------------------------------------------------------------------------
+// net::WebTransportClient уведомляет наш visitor; мы форвардим события 1:1 в
+// quiche MoqtSession (он — webtransport::SessionVisitor). Набор методов совпадает.
+class EidolonWtVisitor : public net::WebTransportClientVisitor {
+public:
+    EidolonWtVisitor(EidolonSession* sess, std::vector<uint8_t> token, base::WaitableEvent* event)
+            : sess_(sess), event_(event) {
+        sess_->moqt_token_ = std::move(token);
+    }
+
+    // Local Network Access: разрешаем (мы подключаемся к своему серверу).
+    void OnLocalNetworkAccessCheck(const net::IPEndPoint& /*server_address*/,
+                                   const net::NetLogWithSource& /*net_log*/,
+                                   net::CompletionOnceCallback callback) override {
+        std::move(callback).Run(net::OK);
+    }
+    void OnBeforeConnect(const net::IPEndPoint& /*server_address*/) override {}
+
+    void OnConnected(scoped_refptr<net::HttpResponseHeaders> /*response_headers*/) override {
+        if (sess_->is_closed_) { SignalOnce(false); return; }
+        quic::WebTransportSession* wt = sess_->wt_client_->session();
+        if (!wt) {
+            LOG(ERROR) << "EIDOLON_DIAG: MoQT OnConnected but session()==null";
+            // НЕ зовём Close() здесь: мы внутри колбэка wt_client_, а Close()
+            // сбросил бы wt_client_ (delete-during-callback). Ставим только флаг —
+            // teardown произойдёт при удалении EidolonSession (деструкторы членов).
+            sess_->is_closed_ = true; SignalOnce(false); return;
+        }
+        // Отдельная alarm-factory под таймеры MoqtSession (goaway и т.п.). Мы на
+        // g_io_thread — берём его task runner и Chromium-часы.
+        auto alarm_factory = std::make_unique<net::QuicChromiumAlarmFactory>(
+                base::SingleThreadTaskRunner::GetCurrentDefault().get(),
+                quic::QuicChromiumClock::GetInstance());
+
+        moqt::MoqtSessionCallbacks callbacks;
+        callbacks.session_established_callback =
+                +[] { LOG(INFO) << "EIDOLON_DIAG: MoQT session established (peer SETUP ok)"; };
+        callbacks.session_terminated_callback =
+                +[](absl::string_view e) { LOG(ERROR) << "EIDOLON_DIAG: MoQT terminated: " << e; };
+
+        sess_->moqt_session_ = std::make_unique<moqt::MoqtSession>(
+                wt, moqt::MoqtSessionParameters(quic::Perspective::IS_CLIENT),
+                std::move(alarm_factory), std::move(callbacks));
+
+        // WebTransport готов → запускаем MoQT (клиент шлёт свой SETUP).
+        sess_->moqt_session_->OnSessionReady();
+        LOG(INFO) << "EIDOLON_DIAG: WebTransport connected, MoQT client session created";
+
+        // TODO (Фаза 2): замапить Go-FD <-> MoQT. Приватный токен-гейтед namespace
+        //   (moqt_token_), Subscribe/Publish; TCP-флоу -> reliable track objects,
+        //   UDP -> датаграммы. Пока только установление сессии (control-plane).
+        SignalOnce(true);
+    }
+
+    void OnConnectionFailed(const net::WebTransportError& error) override {
+        LOG(ERROR) << "EIDOLON_DIAG: WebTransport connect failed: " << error.details;
+        sess_->is_closed_ = true; SignalOnce(false);  // не Close() внутри колбэка wt_client_
+    }
+    void OnDraining() override {}
+    void OnClosed(const std::optional<net::WebTransportCloseInfo>& close_info) override {
+        if (sess_->moqt_session_) {
+            sess_->moqt_session_->OnSessionClosed(
+                    close_info ? close_info->code : 0,
+                    close_info ? close_info->reason : std::string());
+        }
+        sess_->is_closed_ = true; SignalOnce(false);
+    }
+    void OnError(const net::WebTransportError& error) override {
+        LOG(ERROR) << "EIDOLON_DIAG: WebTransport error: " << error.details;
+        if (sess_->moqt_session_) sess_->moqt_session_->OnSessionClosed(0, error.details);
+        sess_->is_closed_ = true; SignalOnce(false);
+    }
+
+    // Форвардинг в MoqtSession (webtransport::SessionVisitor).
+    void OnIncomingBidirectionalStreamAvailable() override {
+        if (sess_->moqt_session_) sess_->moqt_session_->OnIncomingBidirectionalStreamAvailable();
+    }
+    void OnIncomingUnidirectionalStreamAvailable() override {
+        if (sess_->moqt_session_) sess_->moqt_session_->OnIncomingUnidirectionalStreamAvailable();
+    }
+    void OnDatagramReceived(std::string_view datagram) override {
+        if (sess_->moqt_session_) sess_->moqt_session_->OnDatagramReceived(datagram);
+    }
+    void OnCanCreateNewOutgoingBidirectionalStream() override {
+        if (sess_->moqt_session_) sess_->moqt_session_->OnCanCreateNewOutgoingBidirectionalStream();
+    }
+    void OnCanCreateNewOutgoingUnidirectionalStream() override {
+        if (sess_->moqt_session_) sess_->moqt_session_->OnCanCreateNewOutgoingUnidirectionalStream();
+    }
+    void OnDatagramProcessed(std::optional<quic::DatagramStatus> /*status*/) override {}
+
+private:
+    void SignalOnce(bool /*success*/) {
+        if (signaled_) return;
+        signaled_ = true;
+        if (event_) event_->Signal();
+    }
+    raw_ptr<EidolonSession> sess_;
+    raw_ptr<base::WaitableEvent> event_;
+    bool signaled_ = false;
+};
+
+class MoQTDialHelper {
+public:
+    static void Start(EidolonSession* sess, const std::string& ip, const std::string& sni,
+                      uint16_t port, const std::vector<uint8_t>& token, base::WaitableEvent* event) {
+        net::URLRequestContextBuilder builder;
+        builder.DisableHttpCache();
+        builder.set_proxy_config_service(
+                std::make_unique<net::ProxyConfigServiceFixed>(
+                        net::ProxyConfigWithAnnotation::CreateDirect()));
+        builder.SetCertVerifier(
+                std::make_unique<EidolonCertVerifier>(net::CertVerifier::CreateDefault(nullptr)));
+
+        // Пин IP (анти-DNS-poisoning): authority = sni, но резолвим sni -> ip статически.
+        auto base_resolver = net::HostResolver::CreateStandaloneResolver(nullptr);
+        auto mapped_resolver = std::make_unique<net::MappedHostResolver>(std::move(base_resolver));
+        mapped_resolver->AddRuleFromString("MAP " + sni + " " + ip);
+        builder.set_host_resolver(std::move(mapped_resolver));
+
+        auto quic_context = std::make_unique<net::QuicContext>();
+        quic_context->params()->supported_versions = net::DefaultSupportedQuicVersions();
+        builder.SetSpdyAndQuicEnabled(false, true);
+        builder.set_quic_context(std::move(quic_context));
+        sess->url_context = builder.Build();
+
+        GURL url("https://" + sni + ":" + std::to_string(port) + "/eidolon");
+        url::Origin origin = url::Origin::Create(url);
+
+        net::WebTransportParameters params;
+        params.enable_web_transport_http3 = true;
+        // TODO (Фаза 1, функционально): подтвердить обход проверки сертификата для
+        //   WT-клиента. DedicatedWebTransportHttp3Client держит собственный
+        //   crypto_config_; надо убедиться, что EidolonCertVerifier из контекста
+        //   реально применяется, иначе — server_certificate_fingerprints или
+        //   отдельный патч proof_verifier под WT. Проверяется при e2e с сервером.
+
+        sess->wt_visitor_ = std::make_unique<EidolonWtVisitor>(sess, token, event);
+        sess->wt_client_ = net::CreateWebTransportClient(
+                url, origin, sess->wt_visitor_.get(), net::NetworkAnonymizationKey(),
+                net::handles::kInvalidNetworkHandle, sess->url_context.get(), params);
+        LOG(INFO) << "EIDOLON_DIAG: MoQT dialing " << ip << ":" << port << " sni=" << sni;
+        // Connect асинхронный: event просигналит visitor из OnConnected/OnConnectionFailed.
+        sess->wt_client_->Connect();
+    }
 };
 
 // -------------------------------------------------------------------------
@@ -1324,6 +1505,41 @@ EIDOLON_EXPORT EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, 
     g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
             EidolonSession* sess, std::string ip_str, std::string sni_str, uint16_t port_num, std::vector<uint8_t> tok, base::WaitableEvent* event) {
         QUICDialHelper::Start(sess, ip_str, sni_str, port_num, tok, event);
+    }, session.get(), target_ip, target_sni, port, token_vec, &connect_event));
+
+    connect_event.Wait();
+    if (session->is_closed_) {
+        auto* s_ptr = session.release();
+        g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](EidolonSession* s) { delete s; }, s_ptr));
+        return nullptr;
+    }
+    return session.release();
+}
+
+// Фаза 1: дозвон по MoQT (WebTransport-over-H3). Сигнатура как у dial_quic.
+// Data-plane (Go-FD <-> MoQT объекты/датаграммы) — Фаза 2; пока устанавливаем
+// только WebTransport + MoQT-сессию (control-plane) и валидируем линковку.
+EIDOLON_EXPORT EidolonHandle eidolon_dial_moqt(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd) {
+    EnsureChromiumIOThread();
+    auto session = std::make_unique<EidolonSession>(data_fd, false);
+    session->is_moqt_ = true;
+    std::string target_host(host);
+    std::string target_ip = target_host;
+    std::string target_sni = target_host;
+    size_t sep = target_host.find('|');
+    if (sep != std::string::npos) {
+        target_ip = target_host.substr(0, sep);
+        target_sni = target_host.substr(sep + 1);
+    }
+
+    auto safe_span = UNSAFE_BUFFERS(base::span<const uint8_t>(token, token_len));
+    std::vector<uint8_t> token_vec(safe_span.begin(), safe_span.end());
+
+    base::WaitableEvent connect_event(base::WaitableEvent::ResetPolicy::MANUAL, base::WaitableEvent::InitialState::NOT_SIGNALED);
+
+    g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
+            EidolonSession* sess, std::string ip_str, std::string sni_str, uint16_t port_num, std::vector<uint8_t> tok, base::WaitableEvent* event) {
+        MoQTDialHelper::Start(sess, ip_str, sni_str, port_num, tok, event);
     }, session.get(), target_ip, target_sni, port, token_vec, &connect_event));
 
     connect_event.Wait();
