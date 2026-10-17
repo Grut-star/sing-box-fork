@@ -200,6 +200,8 @@ def main():
         r'  ]\n'
         r'  configs += [ ":quiche_internal_config" ]\n'
         r'  public_configs = [ ":quiche_config" ]\n'
+        r'  # Шим operator<< для AbslStringify-типов moqt (пишется build.sh).\n'
+        r'  cflags = [ "-include", rebase_path("//net/eidolon/moqt_ostream_shims.h", root_build_dir) ]\n'
         r'  deps = [\n'
         r'    "//base",\n'
         r'    "//net",\n'

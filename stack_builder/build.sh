@@ -144,6 +144,37 @@ cat << 'EOF' > net/eidolon/eidolon.map
 EOF
 # =================================================
 
+# === Шим operator<< для moqt-типов с AbslStringify (ConnectionQualityLevel,
+#     FullTrackName, TrackNamespace, Location). Платформа quiche в Chromium гонит
+#     QUICHE_(D)LOG через std::ostream, которому нужен operator<<, а эти типы
+#     определяют только AbslStringify → под Chromium moqt не компилировался.
+#     Форс-инклюдим этот хедер в компиляцию moqt (см. cflags -include в
+#     source_set("moqt"), добавляется patch_chromium_v152.py). ===
+cat << 'EOF' > net/eidolon/moqt_ostream_shims.h
+#ifndef EIDOLON_MOQT_OSTREAM_SHIMS_H_
+#define EIDOLON_MOQT_OSTREAM_SHIMS_H_
+#include <ostream>
+#include "absl/strings/str_cat.h"
+#include "quiche/quic/moqt/moqt_bitrate_adjuster.h"
+#include "quiche/quic/moqt/moqt_names.h"
+#include "quiche/quic/moqt/moqt_types.h"
+namespace moqt {
+inline std::ostream& operator<<(std::ostream& os, ConnectionQualityLevel v) {
+  return os << absl::StrCat(v);
+}
+inline std::ostream& operator<<(std::ostream& os, const FullTrackName& v) {
+  return os << absl::StrCat(v);
+}
+inline std::ostream& operator<<(std::ostream& os, const TrackNamespace& v) {
+  return os << absl::StrCat(v);
+}
+inline std::ostream& operator<<(std::ostream& os, const Location& v) {
+  return os << absl::StrCat(v);
+}
+}  // namespace moqt
+#endif  // EIDOLON_MOQT_OSTREAM_SHIMS_H_
+EOF
+
 # 3. Подготавливаем CGO-мост, который требует bridge.h
 cp ../protocol/eidolon/bridge.h net/eidolon/
 
