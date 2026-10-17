@@ -34,6 +34,8 @@ jobs:
     outputs:
       chromium_version: ${{ steps.get_version.outputs.VERSION }}
       should_build: ${{ steps.check.outputs.SHOULD_BUILD }}
+      android_matrix: ${{ steps.matrix.outputs.ANDROID }}
+      linux_matrix: ${{ steps.matrix.outputs.LINUX }}
     steps:
       - name: Fetch Latest Chromium Version
         id: get_version
@@ -53,6 +55,16 @@ jobs:
           else
             echo "New version v$VERSION found. Proceeding with build."
             echo "SHOULD_BUILD=true" >> $GITHUB_OUTPUT
+          fi
+      - name: Build job matrices (quick vs full)
+        id: matrix
+        run: |
+          if [ "${{ inputs.mode }}" = "full" ]; then
+            echo 'ANDROID=[{"arch":"x64","abi":"x86_64"},{"arch":"x86","abi":"x86"},{"arch":"arm64","abi":"arm64-v8a"},{"arch":"arm","abi":"armeabi-v7a"}]' >> $GITHUB_OUTPUT
+            echo 'LINUX=["x64","arm64","arm"]' >> $GITHUB_OUTPUT
+          else
+            echo 'ANDROID=[{"arch":"x64","abi":"x86_64"},{"arch":"arm64","abi":"arm64-v8a"}]' >> $GITHUB_OUTPUT
+            echo 'LINUX=["x64"]' >> $GITHUB_OUTPUT
           fi
 
   cache-toolchains-posix:
@@ -185,14 +197,12 @@ jobs:
 
   linux:
     needs: [prepare, cache-toolchains-posix]
-    if: >-
-      needs.prepare.outputs.should_build == 'true' &&
-      (inputs.mode == 'full' || matrix.arch == 'x64')
+    if: needs.prepare.outputs.should_build == 'true'
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
-        arch: [x64, arm64, arm]
+        arch: ${{ fromJSON(needs.prepare.outputs.linux_matrix) }}
     env:
       CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
       EXTRA_FLAGS: 'target_cpu="${{ matrix.arch }}"'
@@ -250,22 +260,12 @@ jobs:
 
   android:
     needs: [prepare, cache-toolchains-posix]
-    if: >-
-      needs.prepare.outputs.should_build == 'true' &&
-      (inputs.mode == 'full' || matrix.abi == 'arm64-v8a' || matrix.abi == 'x86_64')
+    if: needs.prepare.outputs.should_build == 'true'
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: x64
-            abi: x86_64
-          - arch: x86
-            abi: x86
-          - arch: arm64
-            abi: arm64-v8a
-          - arch: arm
-            abi: armeabi-v7a
+        include: ${{ fromJSON(needs.prepare.outputs.android_matrix) }}
     env:
       CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
       EXTRA_FLAGS: 'target_cpu="${{ matrix.arch }}" target_os="android"'
