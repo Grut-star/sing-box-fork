@@ -268,7 +268,7 @@ struct EidolonSession {
     // сессия (держащая на них сырые указатели) к моменту их разрушения уже мертва.
     std::unique_ptr<moqt::MoqtKnownTrackPublisher> moqt_known_publisher_;  // отдаётся сессии как publisher()
     std::shared_ptr<moqt::MoqtTrackPublisher> moqt_local_pub_;             // наш продюсер (владение)
-    EidolonTrackPublisher* moqt_local_pub_raw_ = nullptr;                  // типизированный доступ (не владеет)
+    raw_ptr<EidolonTrackPublisher> moqt_local_pub_raw_ = nullptr;          // типизированный доступ (не владеет)
     std::unique_ptr<moqt::SubscribeVisitor> moqt_sub_visitor_;             // нисходящий потребитель -> FD
     bool moqt_upstream_paused_ = false;                                    // backpressure FD-ридера
 
@@ -739,7 +739,7 @@ public:
 
 private:
     moqt::FullTrackName track_;
-    const quic::QuicClock* clock_;
+    raw_ptr<const quic::QuicClock> clock_;
     std::function<void()> on_resumable_;
     moqt::TrackExtensions extensions_;
     mutable std::map<uint64_t, std::shared_ptr<moqt::CachedObject>> window_;
@@ -1926,7 +1926,8 @@ public:
 
 private:
     EidolonMoqtListenHelper(const std::string& host, uint16_t port, uint16_t cb_port)
-            : host_(host), port_(port), cb_port_(cb_port) {}
+            : host_(host), port_(port), cb_port_(cb_port),
+              config_(moqt::GenerateQuicConfig()) {}  // QuicConfig не копируется присваиванием
 
     void Run() {
         auto proof_source = std::make_unique<net::ProofSourceChromium>();
@@ -1939,7 +1940,7 @@ private:
 
         char secret[32];
         quic::QuicRandom::GetInstance()->RandBytes(secret, sizeof(secret));
-        config_ = moqt::GenerateQuicConfig();
+        // config_ инициализирован в init-list (GenerateQuicConfig): присваивать нельзя.
         crypto_config_ = std::make_unique<quic::QuicCryptoServerConfig>(
                 std::string(secret, sizeof(secret)), quic::QuicRandom::GetInstance(),
                 std::move(proof_source), quic::KeyExchangeSource::Default());
