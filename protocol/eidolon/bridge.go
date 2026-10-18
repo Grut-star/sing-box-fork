@@ -198,20 +198,34 @@ func (c *NativeStackConn) RawHandle() unsafe.Pointer {
 	return unsafe.Pointer(c.handle)
 }
 
+// nativeTransport выбирает несущий транспорт нативного стека.
+type nativeTransport int
+
+const (
+	transportTCP nativeTransport = iota
+	transportQUIC
+	transportMoQT
+)
+
 // DialNativeTCP устанавливает TLS 1.3 соединение через стек Chromium.
 func DialNativeTCP(ctx context.Context, host string, port int, token []byte) (*NativeStackConn, error) {
-	return dialNative(ctx, host, port, token, false)
+	return dialNative(ctx, host, port, token, transportTCP)
 }
 
 // DialNativeQUIC устанавливает HTTP/3 QUIC соединение через стек Chromium.
 func DialNativeQUIC(ctx context.Context, host string, port int, token []byte) (*NativeStackConn, error) {
-	return dialNative(ctx, host, port, token, true)
+	return dialNative(ctx, host, port, token, transportQUIC)
+}
+
+// DialNativeMoQT устанавливает MoQT (WebTransport-over-H3) соединение через стек Chromium.
+func DialNativeMoQT(ctx context.Context, host string, port int, token []byte) (*NativeStackConn, error) {
+	return dialNative(ctx, host, port, token, transportMoQT)
 }
 
 // Главная фабрика соединений
-func dialNative(ctx context.Context, host string, port int, token []byte, isQUIC bool) (*NativeStackConn, error) {
+func dialNative(ctx context.Context, host string, port int, token []byte, transport nativeTransport) (*NativeStackConn, error) {
 	// 1. Создаем платформозависимый канал связи (Socketpair для POSIX, Loopback TCP для Windows)
-	dataConn, cFdPtr, err := createNativePipe(isQUIC)
+	dataConn, cFdPtr, err := createNativePipe(transport != transportTCP)
 	if err != nil {
 		return nil, fmt.Errorf("eidolon bridge: failed to create native pipe: %w", err)
 	}
@@ -242,9 +256,12 @@ func dialNative(ctx context.Context, host string, port int, token []byte, isQUIC
 	go func() {
 		defer C.free(unsafe.Pointer(cHost))
 		var handle C.EidolonHandle
-		if isQUIC {
+		switch transport {
+		case transportMoQT:
+			handle = C.eidolon_dial_moqt(cHost, C.uint16_t(port), cToken, C.size_t(len(safeToken)), cFd)
+		case transportQUIC:
 			handle = C.eidolon_dial_quic(cHost, C.uint16_t(port), cToken, C.size_t(len(safeToken)), cFd)
-		} else {
+		default:
 			handle = C.eidolon_dial_tcp(cHost, C.uint16_t(port), cToken, C.size_t(len(safeToken)), cFd)
 		}
 
@@ -302,6 +319,16 @@ func dialNative(ctx context.Context, host string, port int, token []byte, isQUIC
 }
 
 func ListenNativeQUIC(ctx context.Context, host string, port int, secret []byte, onAccept func(net.Conn, []byte, []byte)) error {
+	return listenNative(ctx, host, port, secret, onAccept, transportQUIC)
+}
+
+// ListenNativeMoQT поднимает серверный MoQT (WebTransport-over-H3) слушатель через стек
+// Chromium. Мост к локальному ядру и валидация токена идентичны QUIC-пути (80-байтовая meta).
+func ListenNativeMoQT(ctx context.Context, host string, port int, secret []byte, onAccept func(net.Conn, []byte, []byte)) error {
+	return listenNative(ctx, host, port, secret, onAccept, transportMoQT)
+}
+
+func listenNative(ctx context.Context, host string, port int, secret []byte, onAccept func(net.Conn, []byte, []byte), transport nativeTransport) error {
 	localListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return err
@@ -321,14 +348,19 @@ func ListenNativeQUIC(ctx context.Context, host string, port int, secret []byte,
 				sessionKey := meta[32:64]
 				flowID := meta[64:]
 
+				fmt.Printf("EIDOLON_QUIC_DIAG: meta received token=%x flowID=%x keyPrefix=%x secretLen=%d\n", token, flowID, sessionKey[:4], len(secret))
+
 				// БЕСКОМПРОМИССНАЯ БЕЗОПАСНОСТЬ: Проверяем токен в Go
 				if !ValidateTokenConstantTime(string(secret), token, nil) {
+					fmt.Println("EIDOLON_QUIC_DIAG: token validation FAILED -> closing")
 					conn.Close() // C++ мост поймает разрыв TCP и аппаратно сбросит QUIC Stream
 					continue
 				}
 
+				fmt.Println("EIDOLON_QUIC_DIAG: token OK -> onAccept")
 				go onAccept(conn, sessionKey, flowID)
 			} else {
+				fmt.Printf("EIDOLON_QUIC_DIAG: meta read failed: %v\n", err)
 				conn.Close()
 			}
 		}
@@ -339,10 +371,15 @@ func ListenNativeQUIC(ctx context.Context, host string, port int, secret []byte,
 	defer C.free(unsafe.Pointer(cHost))
 	cSecret := (*C.uint8_t)(unsafe.Pointer(&secret[0]))
 
-	handle := C.eidolon_listen_quic(cHost, C.uint16_t(port), cSecret, C.size_t(len(secret)), C.uintptr_t(localPort))
+	var handle C.EidolonHandle
+	if transport == transportMoQT {
+		handle = C.eidolon_listen_moqt(cHost, C.uint16_t(port), cSecret, C.size_t(len(secret)), C.uintptr_t(localPort))
+	} else {
+		handle = C.eidolon_listen_quic(cHost, C.uint16_t(port), cSecret, C.size_t(len(secret)), C.uintptr_t(localPort))
+	}
 	if handle == nil {
 		localListener.Close()
-		return errors.New("failed to start native QUIC listener in C++")
+		return errors.New("failed to start native listener in C++")
 	}
 	registerActiveHandle(handle)
 

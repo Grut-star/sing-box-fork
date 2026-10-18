@@ -97,6 +97,31 @@ typedef SSIZE_T ssize_t;
 #include "url/gurl.h"
 #include "url/origin.h"
 #include "quiche/quic/moqt/moqt_session.h"
+#include "quiche/quic/moqt/moqt_known_track_publisher.h"
+#include "quiche/quic/moqt/moqt_publisher.h"
+#include "quiche/quic/moqt/moqt_object.h"
+#include "quiche/quic/moqt/moqt_fetch_task.h"
+#include "quiche/common/quiche_mem_slice.h"
+#include <map>
+#include <functional>
+// WebTransportHttp3 — конкретный тип webtransport::Session* на H3 (и клиент, и сервер).
+// Пропатчен аксессором eidolon_quic_session() -> доступ к QUIC-крипто для ExportKeyingMaterial.
+#include "quiche/quic/core/http/web_transport_http3.h"
+// Серверная обвязка MoQT (линкуется только на linux; на android код под #if не инстанцируется).
+#include "quiche/quic/core/http/web_transport_only_dispatcher.h"
+#include "quiche/quic/core/io/quic_server_io_harness.h"
+#include "quiche/quic/core/io/socket.h"
+#include "quiche/quic/core/io/quic_default_event_loop.h"
+#include "quiche/quic/core/quic_default_clock.h"
+#include "quiche/quic/core/quic_default_connection_helper.h"
+#include "quiche/quic/core/quic_version_manager.h"
+#include "quiche/quic/core/deterministic_connection_id_generator.h"
+#include "quiche/quic/core/crypto/quic_crypto_server_config.h"
+#include "quiche/quic/core/crypto/quic_random.h"
+#include "quiche/quic/core/crypto/key_exchange.h"
+#include "quiche/quic/moqt/moqt_quic_config.h"
+#include "quiche/quic/tools/quic_simple_crypto_server_stream_helper.h"
+#include "absl/types/span.h"
 
 // === ЗАЩИТА СЕРВЕРНЫХ ЗАВИСИМОСТЕЙ QUIC ===
 #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
@@ -207,6 +232,10 @@ private:
 // АСИНХРОННАЯ СЕССИЯ (DATA PUMP)
 // -------------------------------------------------------------------------
 
+// Кастомный MoQT-паблишер туннеля (Фаза 2); определён ниже EidolonSession,
+// т.к. держит на неё указатель. Члены сессии хранят его через базовый тип.
+class EidolonTrackPublisher;
+
 #if BUILDFLAG(IS_WIN)
 struct EidolonSession : public base::win::ObjectWatcher::Delegate {
 #else
@@ -233,6 +262,15 @@ struct EidolonSession {
     std::unique_ptr<net::WebTransportClientVisitor> wt_visitor_;
     std::unique_ptr<net::WebTransportClient> wt_client_;
     std::unique_ptr<moqt::MoqtSession> moqt_session_;
+
+    // --- MoQT data-plane (Фаза 2): двунаправленный туннель на объектах ---
+    // Все эти члены сбрасываются в Close() ПОСЛЕ moqt_session_.reset(), поэтому
+    // сессия (держащая на них сырые указатели) к моменту их разрушения уже мертва.
+    std::unique_ptr<moqt::MoqtKnownTrackPublisher> moqt_known_publisher_;  // отдаётся сессии как publisher()
+    std::shared_ptr<moqt::MoqtTrackPublisher> moqt_local_pub_;             // наш продюсер (владение)
+    EidolonTrackPublisher* moqt_local_pub_raw_ = nullptr;                  // типизированный доступ (не владеет)
+    std::unique_ptr<moqt::SubscribeVisitor> moqt_sub_visitor_;             // нисходящий потребитель -> FD
+    bool moqt_upstream_paused_ = false;                                    // backpressure FD-ридера
 
     // Инструменты асинхронного I/O
     scoped_refptr<net::IOBufferWithSize> read_buf_;
@@ -312,7 +350,11 @@ struct EidolonSession {
 #endif
 
         // Запускаем первичное чтение из Chromium сокета.
-        if (is_quic_) {
+        if (is_moqt_) {
+            // MoQT: восходящее уже обслуживается watcher'ом FD (выше) -> объекты;
+            // нисходящее приходит асинхронно через EidolonSubscribeVisitor. Здесь
+            // нечего инициировать — нет Chromium-сокета для чтения.
+        } else if (is_quic_) {
             // HTTP/3: СНАЧАЛА читаем initial headers (:status 200) ответа. Пока
             // приложение их не прочитает, QuicChromiumClientStream::OnBodyAvailable
             // (quic_chromium_client_stream.cc:666) видит headers_delivered_==false
@@ -355,6 +397,19 @@ struct EidolonSession {
         bool is_eagain = (bytes_read == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK);
         if (bytes_read == SOCKET_ERROR) bytes_read = -1;
 #endif
+
+        // MoQT: байты из Go-FD -> объекты нашего восходящего трека (без Chromium-сокета).
+        if (is_moqt_) {
+            if (bytes_read > 0) {
+                PublishUpstreamBytes(std::string_view(reinterpret_cast<char*>(temp_buf.data()),
+                                                      static_cast<size_t>(bytes_read)));
+            } else if (bytes_read == 0 || (bytes_read < 0 && !is_eagain)) {
+                CloseUpstream();
+                Close();
+            }
+            // is_eagain (<0) — просто ждём следующего события watcher'а.
+            return;
+        }
 
         if (bytes_read > 0) {
             auto write_buf = base::MakeRefCounted<net::StringIOBuffer>(
@@ -488,20 +543,47 @@ struct EidolonSession {
         } else {
             // Всё записано, выключаем watcher записи и продолжаем читать сеть
             fd_write_controller_.reset();
-            // PREVENT STACK OVERFLOW: Разрываем синхронную рекурсию через очередь задач
-            if (!socket_read_pending_) {
+            // PREVENT STACK OVERFLOW: Разрываем синхронную рекурсию через очередь задач.
+            // Для MoQT нет Chromium-сокета (нисходящее идёт через visitor) — не постим.
+            if (!is_moqt_ && !socket_read_pending_) {
                 base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
                     FROM_HERE, base::BindOnce(&EidolonSession::DoSocketRead, base::Unretained(this)));
             }
         }
 #elif BUILDFLAG(IS_WIN)
         // Для Windows событие FD_WRITE сработает автоматически (edge-triggered)
-        if (pending_fd_writes_.empty() && !socket_read_pending_) {
+        if (!is_moqt_ && pending_fd_writes_.empty() && !socket_read_pending_) {
             base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
                 FROM_HERE, base::BindOnce(&EidolonSession::DoSocketRead, base::Unretained(this)));
         }
 #endif
     }
+
+    // --- MoQT data-plane helpers (Фаза 2), всё на g_io_thread ---
+
+    // Нисходящее: байты из объекта подписки -> очередь записи в Go-FD.
+    void EnqueueFdWrite(absl::string_view data) {
+        if (is_closed_ || data.empty()) return;
+        pending_fd_writes_.push_back(std::string(data));
+        TryWriteToFd();
+    }
+
+    // Снять backpressure восходящего потока: заново встать на чтение FD.
+    void ResumeMoqtUpstream() {
+        if (is_closed_ || !moqt_upstream_paused_) return;
+        moqt_upstream_paused_ = false;
+#if BUILDFLAG(IS_POSIX)
+        if (!fd_read_controller_) {
+            fd_read_controller_ = base::FileDescriptorWatcher::WatchReadable(
+                    static_cast<int>(data_fd_),
+                    base::BindRepeating(&EidolonSession::OnFdReadable, base::Unretained(this)));
+        }
+#endif
+    }
+
+    // Восходящее: добавить байты как объект + применить backpressure по watermark.
+    void PublishUpstreamBytes(std::string_view data);  // тело после EidolonTrackPublisher
+    void CloseUpstream();                              // тело после EidolonTrackPublisher
 
     void Close() {
         if (is_closed_) return;
@@ -530,6 +612,11 @@ struct EidolonSession {
         // MoQT teardown: сессию первой (она держит webtransport::Session*,
         // владеемый wt_client_), затем клиент, затем visitor.
         moqt_session_.reset();
+        // Data-plane после сессии: сессия держала на них сырые указатели.
+        moqt_sub_visitor_.reset();
+        moqt_known_publisher_.reset();
+        moqt_local_pub_raw_ = nullptr;
+        moqt_local_pub_.reset();
         wt_client_.reset();
         wt_visitor_.reset();
 
@@ -544,6 +631,170 @@ struct EidolonSession {
         }
     }
 };
+
+// -------------------------------------------------------------------------
+// MoQT data-plane (Фаза 2): кастомный надёжный паблишер + подписчик туннеля
+// -------------------------------------------------------------------------
+// Watermark'и backpressure восходящего потока (байты недоставленных объектов в окне).
+static constexpr uint64_t kMoqtUpstreamHighWatermark = 1u << 20;       // 1 MiB -> пауза чтения FD
+static constexpr uint64_t kMoqtUpstreamLowWatermark  = 256u * 1024;    // 256 KiB -> возобновление
+
+// EidolonTrackPublisher: байтопоток туннеля -> MoQT-объекты в group 0 / subgroup 0 с
+// возрастающим object_id. Один subgroup = один надёжный WT-стрим, поэтому порядок и
+// целостность байтов сохранены (под туннелем в Go идёт smux/AEAD, которым нужен lossless).
+// В отличие от MoqtOutgoingQueue НЕ вытесняем недоставленные объекты: освобождаем только
+// то, что сессия уже вытянула (object_id < highest_pulled_), и так же снимаем backpressure.
+class EidolonTrackPublisher : public moqt::MoqtTrackPublisher {
+public:
+    // on_resumable вызывается (на потоке сессии), когда доставленное освобождено и окно
+    // опустилось ниже low-watermark — хост может возобновить своего продюсера. Может быть пуст.
+    EidolonTrackPublisher(moqt::FullTrackName track, const quic::QuicClock* clock,
+                          std::function<void()> on_resumable = {})
+            : track_(std::move(track)), clock_(clock), on_resumable_(std::move(on_resumable)) {}
+
+    // --- Продюсер (поток сессии) ---
+    void AddBytes(std::string_view data) {
+        if (closed_ || data.empty()) return;
+        uint64_t id = next_object_id_++;
+        moqt::Location loc(0, id);
+        moqt::PublishedObjectMetadata md;
+        md.location = loc;
+        md.subgroup = 0;
+        md.extensions = "";
+        md.status = moqt::MoqtObjectStatus::kNormal;
+        md.publisher_priority = moqt::kDefaultPublisherPriority;
+        md.first_object_in_subgroup = (id == 0);
+        md.payload_length = data.size();
+        md.arrival_time = clock_->ApproximateNow();
+        window_.emplace(id, std::make_shared<moqt::CachedObject>(
+                md, quiche::QuicheMemSlice::Copy(data), /*fin_after_this=*/false));
+        bytes_in_window_ += data.size();
+        for (moqt::MoqtObjectListener* l : listeners_) {
+            l->OnNewObjectAvailable(loc, /*subgroup=*/0, moqt::kDefaultPublisherPriority);
+        }
+    }
+
+    void CloseStream() {
+        if (closed_) return;
+        closed_ = true;
+        moqt::Location last(0, next_object_id_ == 0 ? 0 : next_object_id_ - 1);
+        for (moqt::MoqtObjectListener* l : listeners_) {
+            l->OnNewFinAvailable(last, /*subgroup_id=*/0);
+        }
+    }
+
+    uint64_t BytesInWindow() const { return bytes_in_window_; }
+    // Переустановить resume-колбэк после конструирования (нужно, когда продюсер
+    // создаётся позже паблишера — серверный "d"-трек).
+    void SetOnResumable(std::function<void()> f) { on_resumable_ = std::move(f); }
+
+    // --- MoqtTrackPublisher ---
+    const moqt::FullTrackName& GetTrackName() const override { return track_; }
+
+    std::optional<moqt::PublishedObject> GetCachedObject(
+            uint64_t group, std::optional<uint64_t> subgroup, uint64_t min_object,
+            uint64_t offset) const override {
+        if (group != 0) return std::nullopt;
+        auto it = window_.lower_bound(min_object);
+        if (it == window_.end()) return std::nullopt;  // ещё не произведён — ждём OnNewObjectAvailable
+        if (min_object > highest_pulled_) {
+            highest_pulled_ = min_object;               // всё < min_object доставлено -> эвикт
+            while (!window_.empty() && window_.begin()->first < highest_pulled_) {
+                bytes_in_window_ -= window_.begin()->second->metadata().payload_length;
+                window_.erase(window_.begin());
+            }
+            if (on_resumable_ && bytes_in_window_ <= kMoqtUpstreamLowWatermark) on_resumable_();
+        }
+        return it->second->ToPublishedObject(offset);
+    }
+
+    void AddObjectListener(moqt::MoqtObjectListener* listener) override {
+        listeners_.insert(listener);
+        listener->OnSubscribeAccepted();
+    }
+    void RemoveObjectListener(moqt::MoqtObjectListener* listener) override {
+        listeners_.erase(listener);
+    }
+    std::optional<moqt::Location> largest_location() const override {
+        if (window_.empty()) return std::nullopt;
+        return moqt::Location(0, window_.rbegin()->first);
+    }
+    std::optional<quic::QuicTimeDelta> expiration() const override {
+        return quic::QuicTimeDelta::Zero();
+    }
+    const moqt::TrackExtensions& extensions() const override { return extensions_; }
+    std::unique_ptr<moqt::MoqtFetchTask> StandaloneFetch(
+            moqt::Location, moqt::Location, moqt::MoqtDeliveryOrder) override {
+        return std::make_unique<moqt::MoqtFailedFetch>(
+                absl::UnimplementedError("eidolon tunnel: fetch unsupported"));
+    }
+    std::unique_ptr<moqt::MoqtFetchTask> RelativeFetch(uint64_t, moqt::MoqtDeliveryOrder) override {
+        return std::make_unique<moqt::MoqtFailedFetch>(
+                absl::UnimplementedError("eidolon tunnel: fetch unsupported"));
+    }
+    std::unique_ptr<moqt::MoqtFetchTask> AbsoluteFetch(uint64_t, moqt::MoqtDeliveryOrder) override {
+        return std::make_unique<moqt::MoqtFailedFetch>(
+                absl::UnimplementedError("eidolon tunnel: fetch unsupported"));
+    }
+
+private:
+    moqt::FullTrackName track_;
+    const quic::QuicClock* clock_;
+    std::function<void()> on_resumable_;
+    moqt::TrackExtensions extensions_;
+    mutable std::map<uint64_t, std::shared_ptr<moqt::CachedObject>> window_;
+    uint64_t next_object_id_ = 0;
+    mutable uint64_t bytes_in_window_ = 0;
+    mutable uint64_t highest_pulled_ = 0;
+    bool closed_ = false;
+    absl::flat_hash_set<moqt::MoqtObjectListener*> listeners_;
+};
+
+// EidolonSubscribeVisitor: объекты нисходящего трека -> байты в Go-FD.
+class EidolonSubscribeVisitor : public moqt::SubscribeVisitor {
+public:
+    explicit EidolonSubscribeVisitor(EidolonSession* sess) : sess_(sess) {}
+
+    void OnReply(const moqt::FullTrackName& ftn,
+                 std::variant<moqt::SubscribeOkData, moqt::MoqtRequestErrorInfo> response) override {
+        if (std::holds_alternative<moqt::MoqtRequestErrorInfo>(response)) {
+            LOG(ERROR) << "EIDOLON_DIAG: MoQT subscribe REJECTED track=" << ftn.ToString();
+            sess_->Close();
+        } else {
+            LOG(INFO) << "EIDOLON_DIAG: MoQT subscribe OK track=" << ftn.ToString();
+        }
+    }
+    void OnCanAckObjects(moqt::MoqtObjectAckFunction) override {}
+    void OnObjectFragment(const moqt::FullTrackName& /*ftn*/,
+                          const moqt::PublishedObjectMetadata& /*metadata*/,
+                          absl::string_view object, uint64_t /*offset*/) override {
+        // Один subgroup -> фрагменты приходят по порядку; конкатенация = байтопоток.
+        sess_->EnqueueFdWrite(object);
+    }
+    void OnPublishDone(moqt::FullTrackName) override { sess_->Close(); }
+    void OnMalformedTrack(const moqt::FullTrackName&) override { sess_->Close(); }
+    void OnStreamFin(const moqt::FullTrackName&, moqt::DataStreamIndex) override {}
+    void OnStreamReset(const moqt::FullTrackName&, moqt::DataStreamIndex) override {}
+
+private:
+    raw_ptr<EidolonSession> sess_;
+};
+
+// Out-of-line методы EidolonSession, которым нужен полный тип EidolonTrackPublisher.
+void EidolonSession::PublishUpstreamBytes(std::string_view data) {
+    if (!moqt_local_pub_raw_) return;
+    moqt_local_pub_raw_->AddBytes(data);
+#if BUILDFLAG(IS_POSIX)
+    if (moqt_local_pub_raw_->BytesInWindow() > kMoqtUpstreamHighWatermark) {
+        fd_read_controller_.reset();   // backpressure: пауза чтения FD
+        moqt_upstream_paused_ = true;
+    }
+#endif
+}
+
+void EidolonSession::CloseUpstream() {
+    if (moqt_local_pub_raw_) moqt_local_pub_raw_->CloseStream();
+}
 
 // -------------------------------------------------------------------------
 // ХЕЛПЕР ДЛЯ АСИНХРОННОГО ДОЗВОНА QUIC (Без блокировок)
@@ -735,8 +986,54 @@ public:
                 quic::QuicChromiumClock::GetInstance());
 
         moqt::MoqtSessionCallbacks callbacks;
-        callbacks.session_established_callback =
-                +[] { LOG(INFO) << "EIDOLON_DIAG: MoQT session established (peer SETUP ok)"; };
+        EidolonSession* sess = sess_;
+        callbacks.session_established_callback = [sess] {
+            LOG(INFO) << "EIDOLON_DIAG: MoQT session established (peer SETUP ok)";
+            if (sess->is_closed_ || !sess->moqt_session_) return;
+
+            // --- Фаза 2: двунаправленный туннель на объектах (реактивная модель) ---
+            // namespace {"eidolon"}; "u" — публикуем (вверх), "d" — подписываемся (вниз).
+            // Нативный слой прозрачен: Go кладёт в FD преамбулу token‖flowID‖pad + данные,
+            // мы гоняем их как объекты. Протокол/ключи/паддинг — в Go и парсере сервера.
+            moqt::TrackNamespace ns({"eidolon"});
+            moqt::FullTrackName up_track(ns, "u");
+            moqt::FullTrackName down_track(ns, "d");
+            absl::string_view tok_sv(reinterpret_cast<const char*>(sess->moqt_token_.data()),
+                                     sess->moqt_token_.size());
+
+            // 1. Публикуем восходящий трек: продюсер -> known-publisher -> сессии.
+            auto up_pub = std::make_shared<EidolonTrackPublisher>(
+                    up_track, quic::QuicChromiumClock::GetInstance(),
+                    [sess] { sess->ResumeMoqtUpstream(); });
+            sess->moqt_local_pub_raw_ = up_pub.get();
+            sess->moqt_local_pub_ = up_pub;
+            sess->moqt_known_publisher_ = std::make_unique<moqt::MoqtKnownTrackPublisher>();
+            sess->moqt_known_publisher_->Add(up_pub);
+            sess->moqt_session_->set_publisher(sess->moqt_known_publisher_.get());
+
+            // Анонсируем namespace с auth-токеном -> сервер валидирует гейт и подпишется на "u".
+            moqt::MessageParameters pub_params;
+            pub_params.authorization_tokens.push_back(
+                    moqt::AuthToken(moqt::AuthTokenType::kOutOfBand, tok_sv));
+            sess->moqt_session_->PublishNamespace(
+                    ns, pub_params,
+                    [](std::variant<moqt::MessageParameters, moqt::MoqtRequestErrorInfo> r) {
+                        LOG(INFO) << "EIDOLON_DIAG: MoQT PublishNamespace reply ok="
+                                  << std::holds_alternative<moqt::MessageParameters>(r);
+                    },
+                    [] { LOG(INFO) << "EIDOLON_DIAG: MoQT namespace cancelled by peer"; });
+
+            // 2. Подписка на "d": абсолютный старт (0,0) -> все байты с начала.
+            sess->moqt_sub_visitor_ = std::make_unique<EidolonSubscribeVisitor>(sess);
+            moqt::MessageParameters sub_params((moqt::Location(0, 0)));  // AbsoluteStart
+            sub_params.set_forward(true);
+            sub_params.authorization_tokens.push_back(
+                    moqt::AuthToken(moqt::AuthTokenType::kOutOfBand, tok_sv));
+            sess->moqt_session_->Subscribe(down_track, sess->moqt_sub_visitor_.get(), sub_params);
+
+            // 3. Запускаем FD-насос (восходящее: FD -> объекты трека "u").
+            sess->StartPump();
+        };
         callbacks.session_terminated_callback =
                 +[](absl::string_view e) { LOG(ERROR) << "EIDOLON_DIAG: MoQT terminated: " << e; };
 
@@ -744,13 +1041,11 @@ public:
                 wt, moqt::MoqtSessionParameters(quic::Perspective::IS_CLIENT),
                 std::move(alarm_factory), std::move(callbacks));
 
-        // WebTransport готов → запускаем MoQT (клиент шлёт свой SETUP).
+        // WebTransport готов → запускаем MoQT (клиент шлёт свой SETUP). Данные-план
+        // (publish/subscribe + FD-насос) поднимается в session_established_callback,
+        // т.е. ПОСЛЕ обмена SETUP — иначе SUBSCRIBE уйдёт раньше рукопожатия MoQT.
         sess_->moqt_session_->OnSessionReady();
         LOG(INFO) << "EIDOLON_DIAG: WebTransport connected, MoQT client session created";
-
-        // TODO (Фаза 2): замапить Go-FD <-> MoQT. Приватный токен-гейтед namespace
-        //   (moqt_token_), Subscribe/Publish; TCP-флоу -> reliable track objects,
-        //   UDP -> датаграммы. Пока только установление сессии (control-plane).
         SignalOnce(true);
     }
 
@@ -1390,6 +1685,343 @@ private:
     uint16_t cb_port_;
 };
 
+// =====================================================================
+// MoQT-СЕРВЕР (Фаза 2): WebTransport-over-H3 + MoQT, мост к cb_port
+// =====================================================================
+// Зеркалит QUIC-путь (EidolonServerStream + BidirectionalPump), но несущая —
+// WebTransport/MoQT. Одна MoqtSession = один flow. Натив прозрачен: преамбулу
+// token‖flowID‖padLen‖pad читаем из первых байт восходящего трека "u" (её
+// авторитетно валидирует Go по 80-байтовой meta). sessionKey = TLS-экспортер
+// несущей QUIC-сессии ("eidolon-traffic-key"), как в QUIC/TCP-путях.
+
+// Мост одной сессии: "u" объекты -> cb_port TCP; cb_port TCP -> "d" объекты.
+// down_pub_/session_ трогаем только на g_quic_thread; tcp_* — только на g_io_thread.
+class EidolonMoqtFlow : public base::RefCountedThreadSafe<EidolonMoqtFlow> {
+public:
+    EidolonMoqtFlow(uint16_t cb_port, EidolonTrackPublisher* down_pub, moqt::MoqtSession* session)
+            : cb_port_(cb_port), down_pub_(down_pub), session_(session),
+              read_buf_(base::MakeRefCounted<net::IOBufferWithSize>(65536)) {}
+
+    // [g_quic_thread] Байты восходящего трека "u".
+    void OnUpstreamBytes(std::string_view data) {
+        if (!preamble_done_) {
+            buffer_.append(data);
+            if (buffer_.size() >= 50) {
+                uint16_t pad_len = (static_cast<uint8_t>(buffer_[48]) << 8) |
+                                   static_cast<uint8_t>(buffer_[49]);
+                if (buffer_.size() >= 50u + pad_len) {
+                    std::string token = buffer_.substr(0, 32);
+                    std::string flow_id = buffer_.substr(32, 16);
+                    std::string key = ExportKey();                 // sessionKey (TLS-экспортер)
+                    std::string rest = buffer_.substr(50 + pad_len);
+                    preamble_done_ = true;
+                    buffer_.clear();
+                    LOG(INFO) << "EIDOLON_DIAG: MoQT server preamble ok -> cb_port=" << cb_port_;
+                    g_io_thread->task_runner()->PostTask(
+                            FROM_HERE, base::BindOnce(&EidolonMoqtFlow::ConnectTCP,
+                                                      base::RetainedRef(this), token, key, flow_id, rest));
+                }
+            }
+            return;
+        }
+        g_io_thread->task_runner()->PostTask(
+                FROM_HERE, base::BindOnce(&EidolonMoqtFlow::WriteToTCP,
+                                          base::RetainedRef(this), std::string(data)));
+    }
+    void OnUpstreamFin() {}
+
+    // [g_quic_thread] "d"-паблишер освободил доставленное (окно ниже low) -> снова читаем cb_port.
+    void ResumeDownstream() {
+        if (!downstream_paused_) return;
+        downstream_paused_ = false;
+        g_io_thread->task_runner()->PostTask(
+                FROM_HERE, base::BindOnce(&EidolonMoqtFlow::PumpTCPToDownstream, base::RetainedRef(this)));
+    }
+
+    // [g_quic_thread] Сессия уходит: больше не трогаем down_pub_/session_.
+    void Detach() { down_pub_ = nullptr; session_ = nullptr; }
+
+private:
+    friend class base::RefCountedThreadSafe<EidolonMoqtFlow>;
+    ~EidolonMoqtFlow() {
+        // tcp_socket_ создаётся/живёт на g_io_thread — закрываем его там же.
+        if (tcp_socket_ && g_io_thread) {
+            g_io_thread->task_runner()->DeleteSoon(FROM_HERE, tcp_socket_.release());
+        }
+    }
+
+    // [g_quic_thread] Экспорт keying material несущей QUIC-сессии под WebTransport.
+    std::string ExportKey() {
+        std::string out;
+        if (!session_ || !session_->session()) return out;
+        auto* wt = static_cast<quic::WebTransportHttp3*>(session_->session());
+        quic::QuicSpdySession* qs = wt->eidolon_quic_session();
+        const quic::QuicCryptoStream* cs = qs ? qs->GetCryptoStream() : nullptr;
+        if (cs) {
+            const_cast<quic::QuicCryptoStream*>(cs)->ExportKeyingMaterial(
+                    "eidolon-traffic-key", "", 32, &out);
+        }
+        return out;
+    }
+
+    // [g_io_thread]
+    void ConnectTCP(std::string token, std::string key, std::string flow_id, std::string rest) {
+        net::IPAddress ip;
+        (void)ip.AssignFromIPLiteral("127.0.0.1");
+        tcp_socket_ = std::make_unique<net::TCPClientSocket>(
+                net::AddressList(net::IPEndPoint(ip, cb_port_)), nullptr, nullptr, nullptr,
+                net::NetLogSource(), net::handles::kInvalidNetworkHandle);
+        tcp_write_buf_ = token + key + flow_id + rest;  // meta(80) первой, затем данные
+        int rv = tcp_socket_->Connect(
+                base::BindOnce(&EidolonMoqtFlow::OnTCPConnect, base::RetainedRef(this)));
+        if (rv != net::ERR_IO_PENDING) OnTCPConnect(rv);
+    }
+    void OnTCPConnect(int rv) {
+        LOG(INFO) << "EIDOLON_DIAG: MoQT server cb_port connect rv=" << rv;
+        if (rv != net::OK) { tcp_socket_.reset(); return; }
+        tcp_connected_ = true;
+        TryFlushTCP();
+        PumpTCPToDownstream();
+    }
+    void WriteToTCP(std::string data) {
+        tcp_write_buf_.append(data);
+        TryFlushTCP();
+    }
+    void TryFlushTCP() {
+        if (!tcp_connected_ || tcp_write_pending_ || tcp_write_buf_.empty() || !tcp_socket_) return;
+        tcp_write_pending_ = true;
+        auto io_buf = base::MakeRefCounted<net::StringIOBuffer>(tcp_write_buf_);
+        int rv = tcp_socket_->Write(io_buf.get(), static_cast<int>(tcp_write_buf_.size()),
+                base::BindOnce(&EidolonMoqtFlow::OnTCPWriteComplete, base::RetainedRef(this)),
+                TRAFFIC_ANNOTATION_FOR_TESTS);
+        if (rv != net::ERR_IO_PENDING) OnTCPWriteComplete(rv);
+    }
+    void OnTCPWriteComplete(int rv) {
+        tcp_write_pending_ = false;
+        if (rv <= 0) { tcp_socket_.reset(); return; }
+        tcp_write_buf_.erase(0, static_cast<size_t>(rv));
+        TryFlushTCP();
+    }
+    void PumpTCPToDownstream() {
+        if (!tcp_socket_) return;
+        int rv = tcp_socket_->Read(read_buf_.get(), read_buf_->size(),
+                base::BindOnce(&EidolonMoqtFlow::OnTCPRead, base::RetainedRef(this)));
+        if (rv != net::ERR_IO_PENDING) OnTCPRead(rv);
+    }
+    void OnTCPRead(int rv) {
+        if (rv <= 0) { tcp_socket_.reset(); return; }
+        // Отдаём порцию в "d"-паблишер на g_quic_thread, затем читаем дальше (back-pressure).
+        g_quic_thread->task_runner()->PostTask(
+                FROM_HERE, base::BindOnce([](scoped_refptr<EidolonMoqtFlow> self, std::string d) {
+                    if (self->down_pub_) self->down_pub_->AddBytes(d);
+                    // Backpressure: если окно "d" переполнено (медленный клиент) — не читаем
+                    // cb_port дальше; ResumeDownstream возобновит после слива ниже low-watermark.
+                    if (self->down_pub_ && self->down_pub_->BytesInWindow() > kMoqtUpstreamHighWatermark) {
+                        self->downstream_paused_ = true;
+                    } else {
+                        g_io_thread->task_runner()->PostTask(
+                                FROM_HERE, base::BindOnce(&EidolonMoqtFlow::PumpTCPToDownstream, self));
+                    }
+                }, base::RetainedRef(this), std::string(read_buf_->data(), rv)));
+        WakeQuicLoop();
+    }
+
+    uint16_t cb_port_;
+    raw_ptr<EidolonTrackPublisher> down_pub_;  // g_quic_thread
+    raw_ptr<moqt::MoqtSession> session_;        // g_quic_thread
+    scoped_refptr<net::IOBufferWithSize> read_buf_;
+    bool preamble_done_ = false;                // g_quic_thread
+    bool downstream_paused_ = false;            // g_quic_thread (backpressure cb_port->"d")
+    std::string buffer_;                        // g_quic_thread
+    std::unique_ptr<net::StreamSocket> tcp_socket_;  // g_io_thread
+    bool tcp_connected_ = false;                // g_io_thread
+    bool tcp_write_pending_ = false;            // g_io_thread
+    std::string tcp_write_buf_;                 // g_io_thread
+};
+
+// Подписчик восходящего трека "u" на сервере -> байты в мост.
+class EidolonMoqtUpstreamVisitor : public moqt::SubscribeVisitor {
+public:
+    explicit EidolonMoqtUpstreamVisitor(scoped_refptr<EidolonMoqtFlow> flow) : flow_(std::move(flow)) {}
+    void OnReply(const moqt::FullTrackName& ftn,
+                 std::variant<moqt::SubscribeOkData, moqt::MoqtRequestErrorInfo> r) override {
+        LOG(INFO) << "EIDOLON_DIAG: MoQT server subscribe(u) reply ok="
+                  << std::holds_alternative<moqt::SubscribeOkData>(r) << " track=" << ftn.ToString();
+    }
+    void OnCanAckObjects(moqt::MoqtObjectAckFunction) override {}
+    void OnObjectFragment(const moqt::FullTrackName&, const moqt::PublishedObjectMetadata&,
+                          absl::string_view object, uint64_t) override {
+        flow_->OnUpstreamBytes(object);
+    }
+    void OnPublishDone(moqt::FullTrackName) override { flow_->OnUpstreamFin(); }
+    void OnMalformedTrack(const moqt::FullTrackName&) override {}
+    void OnStreamFin(const moqt::FullTrackName&, moqt::DataStreamIndex) override {}
+    void OnStreamReset(const moqt::FullTrackName&, moqt::DataStreamIndex) override {}
+private:
+    scoped_refptr<EidolonMoqtFlow> flow_;
+};
+
+// Всё состояние одной MoQT-сессии; живёт, пока жива MoqtSession (держим в
+// session_deleted_callback). Сессия ссылается на publisher/visitor сырыми указателями.
+struct EidolonMoqtPeer {
+    uint16_t cb_port = 0;
+    std::shared_ptr<EidolonTrackPublisher> down_pub;          // "d" (сервер->клиент)
+    std::unique_ptr<moqt::MoqtKnownTrackPublisher> known_publisher;
+    std::unique_ptr<moqt::SubscribeVisitor> up_visitor;       // "u" (клиент->сервер)
+    scoped_refptr<EidolonMoqtFlow> flow;
+    bool subscribed_up = false;
+};
+
+// Конфигурируем только что созданную серверную MoqtSession (вызывается из handler_factory;
+// session() трогать здесь НЕЛЬЗЯ — он ещё не готов, только сохраняем).
+static void ConfigureEidolonMoqtSession(moqt::MoqtSession* session, uint16_t cb_port) {
+    auto peer = std::make_shared<EidolonMoqtPeer>();
+    peer->cb_port = cb_port;
+
+    moqt::TrackNamespace ns({"eidolon"});
+    moqt::FullTrackName up_track(ns, "u");
+    moqt::FullTrackName down_track(ns, "d");
+
+    peer->down_pub = std::make_shared<EidolonTrackPublisher>(
+            down_track, quic::QuicDefaultClock::Get());
+    peer->known_publisher = std::make_unique<moqt::MoqtKnownTrackPublisher>();
+    peer->known_publisher->Add(peer->down_pub);
+    session->set_publisher(peer->known_publisher.get());
+
+    peer->flow = base::MakeRefCounted<EidolonMoqtFlow>(cb_port, peer->down_pub.get(), session);
+    peer->up_visitor = std::make_unique<EidolonMoqtUpstreamVisitor>(peer->flow);
+    // Backpressure cb_port->"d": возобновляем чтение cb_port, когда окно "d" слилось.
+    peer->down_pub->SetOnResumable([f = peer->flow.get()] { f->ResumeDownstream(); });
+
+    EidolonMoqtPeer* peer_raw = peer.get();
+    // Клиент анонсирует namespace -> принимаем и подписываемся на "u".
+    session->callbacks().incoming_publish_namespace_callback =
+            [session, peer_raw, up_track](const moqt::TrackNamespace& /*tns*/,
+                                          const moqt::MessageParameters* params,
+                                          moqt::MoqtResponseCallback cb) {
+                if (cb) std::move(cb)(moqt::MessageParameters{});  // accept
+                if (params == nullptr || peer_raw->subscribed_up) return;  // DONE или дубль
+                peer_raw->subscribed_up = true;
+                moqt::MessageParameters sub((moqt::Location(0, 0)));  // AbsoluteStart
+                sub.set_forward(true);
+                session->Subscribe(up_track, peer_raw->up_visitor.get(), sub);
+                LOG(INFO) << "EIDOLON_DIAG: MoQT server accepted namespace, subscribed(u)";
+            };
+
+    // Держим peer живым до конца сессии; затем отвязываем мост.
+    session->callbacks().session_deleted_callback = [peer]() mutable {
+        if (peer->flow) peer->flow->Detach();
+    };
+}
+
+// Серверный listen MoQT: инлайн-аналог moqt::MoqtServer (чтобы eidolon_bridge.cc,
+// видящий quic/tools, собрал всё сам — без линковки tools/moqt_server.cc в moqt source_set).
+class EidolonMoqtListenHelper {
+public:
+    static void Start(const std::string& host, uint16_t port, uint16_t cb_port) {
+        auto* self = new EidolonMoqtListenHelper(host, port, cb_port);
+        g_quic_thread->task_runner()->PostTask(
+                FROM_HERE, base::BindOnce(&EidolonMoqtListenHelper::Run, base::Unretained(self)));
+    }
+
+private:
+    EidolonMoqtListenHelper(const std::string& host, uint16_t port, uint16_t cb_port)
+            : host_(host), port_(port), cb_port_(cb_port) {}
+
+    void Run() {
+        auto proof_source = std::make_unique<net::ProofSourceChromium>();
+        if (!proof_source->Initialize(base::FilePath(FILE_PATH_LITERAL("cert.pem")),
+                                      base::FilePath(FILE_PATH_LITERAL("key.pem")),
+                                      base::FilePath(FILE_PATH_LITERAL("")))) {
+            LOG(ERROR) << "eidolon: MoQT proof source Initialize failed (cert.pem/key.pem)";
+            delete this; return;
+        }
+
+        char secret[32];
+        quic::QuicRandom::GetInstance()->RandBytes(secret, sizeof(secret));
+        config_ = moqt::GenerateQuicConfig();
+        crypto_config_ = std::make_unique<quic::QuicCryptoServerConfig>(
+                std::string(secret, sizeof(secret)), quic::QuicRandom::GetInstance(),
+                std::move(proof_source), quic::KeyExchangeSource::Default());
+        version_manager_ = std::make_unique<quic::QuicVersionManager>(
+                quic::CurrentSupportedVersionsWithTls());
+        conn_id_gen_ = std::make_unique<quic::DeterministicConnectionIdGenerator>(
+                quic::kQuicDefaultConnectionIdLength);
+        event_loop_ = quic::GetDefaultEventLoop()->Create(quic::QuicDefaultClock::Get());
+
+        dispatcher_ = std::make_unique<quic::WebTransportOnlyDispatcher>(
+                &config_, crypto_config_.get(), version_manager_.get(),
+                std::make_unique<quic::QuicDefaultConnectionHelper>(),
+                std::make_unique<quic::QuicSimpleCryptoServerStreamHelper>(),
+                event_loop_->CreateAlarmFactory(), quic::kQuicDefaultConnectionIdLength,
+                *conn_id_gen_);
+
+        uint16_t cb_port = cb_port_;
+        quic::QuicEventLoop* loop = event_loop_.get();
+        dispatcher_->parameters().handler_factory =
+                [cb_port, loop](webtransport::Session* session,
+                                const quic::WebTransportIncomingRequestDetails& /*details*/)
+                        -> absl::StatusOr<quic::WebTransportConnectResponse> {
+                    auto moqt_session = std::make_unique<moqt::MoqtSession>(
+                            session, moqt::MoqtSessionParameters(quic::Perspective::IS_SERVER),
+                            loop->CreateAlarmFactory());
+                    ConfigureEidolonMoqtSession(moqt_session.get(), cb_port);
+                    quic::WebTransportConnectResponse response;
+                    response.visitor = std::move(moqt_session);
+                    return response;
+                };
+        dispatcher_->parameters().subprotocol_callback =
+                +[](absl::Span<const absl::string_view> subs) -> int {
+                    for (size_t i = 0; i < subs.size(); ++i) {
+                        if (subs[i] == moqt::kDefaultMoqtVersion) return static_cast<int>(i);
+                    }
+                    return -1;
+                };
+
+        quic::QuicIpAddress ip;
+        if (!ip.FromString(host_)) {
+            LOG(ERROR) << "eidolon: MoQT listen host parse failed: " << host_;
+            delete this; return;
+        }
+        quic::QuicSocketAddress address(ip, port_);
+        auto fd = quic::CreateAndBindServerSocket(address);
+        if (!fd.ok()) {
+            LOG(ERROR) << "eidolon: MoQT CreateAndBindServerSocket failed: " << fd.status();
+            delete this; return;
+        }
+        fd_ = *std::move(fd);
+        auto io = quic::QuicServerIoHarness::Create(event_loop_.get(), dispatcher_.get(), *fd_);
+        if (!io.ok()) {
+            LOG(ERROR) << "eidolon: MoQT QuicServerIoHarness::Create failed: " << io.status();
+            delete this; return;
+        }
+        io_ = *std::move(io);
+        io_->InitializeWriter();
+        LOG(INFO) << "EIDOLON_DIAG: MoQT server listening on " << host_ << ":" << port_;
+        g_quic_event_loop = event_loop_.get();
+        PumpOnce();
+    }
+
+    void PumpOnce() {
+        if (!event_loop_) return;
+        event_loop_->RunEventLoopOnce(quic::QuicTime::Delta::FromMilliseconds(50));
+        g_quic_thread->task_runner()->PostTask(
+                FROM_HERE, base::BindOnce(&EidolonMoqtListenHelper::PumpOnce, base::Unretained(this)));
+    }
+
+    std::string host_;
+    uint16_t port_;
+    uint16_t cb_port_;
+    quic::QuicConfig config_;
+    std::unique_ptr<quic::QuicCryptoServerConfig> crypto_config_;
+    std::unique_ptr<quic::QuicVersionManager> version_manager_;
+    std::unique_ptr<quic::DeterministicConnectionIdGenerator> conn_id_gen_;
+    std::unique_ptr<quic::QuicEventLoop> event_loop_;
+    std::unique_ptr<quic::WebTransportOnlyDispatcher> dispatcher_;
+    quic::OwnedSocketFd fd_;
+    std::unique_ptr<quic::QuicServerIoHarness> io_;
+};
+
 #endif // BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
 // ===============================================================
 
@@ -1559,7 +2191,20 @@ base::WaitableEvent event(base::WaitableEvent::ResetPolicy::MANUAL, base::Waitab
 
 g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
         EidolonSession* s, uint8_t* key, size_t len, int* res, base::WaitableEvent* ev) {
-    if (s->is_quic_) {
+    if (s->is_moqt_) {
+        // MoQT: экспортируем keying material из несущей QUIC-сессии под WebTransport.
+        if (s->wt_client_ && s->wt_client_->session()) {
+            auto* wt = static_cast<quic::WebTransportHttp3*>(s->wt_client_->session());
+            quic::QuicSpdySession* qs = wt->eidolon_quic_session();
+            const quic::QuicCryptoStream* cs = qs ? qs->GetCryptoStream() : nullptr;
+            std::string exported;
+            if (cs && const_cast<quic::QuicCryptoStream*>(cs)->ExportKeyingMaterial(
+                    "eidolon-traffic-key", "", len, &exported) && exported.size() == len) {
+                memcpy(key, exported.data(), len);
+                *res = 0;
+            }
+        }
+    } else if (s->is_quic_) {
         if (s->quic_session_handle && s->quic_session_handle->ExportKeyingMaterial("eidolon-traffic-key", "", key, len)) {
             *res = 0;
         }
@@ -1609,6 +2254,24 @@ EIDOLON_EXPORT EidolonHandle eidolon_listen_quic(const char* host, uint16_t port
 
     return session.release();
 #else
+    return nullptr;
+#endif
+}
+
+// Серверный listen по MoQT (WebTransport-over-H3). Сигнатура как у eidolon_listen_quic.
+// secret сейчас не используется для ключей (sessionKey = TLS-экспортер несущей сессии);
+// токен авторитетно валидирует Go по 80-байтовой meta, как в QUIC-пути.
+EIDOLON_EXPORT EidolonHandle eidolon_listen_moqt(const char* host, uint16_t port, const uint8_t* secret, size_t secret_len, uintptr_t cb_port) {
+#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
+    (void)secret; (void)secret_len;
+    EnsureChromiumIOThread();
+    auto session = std::make_unique<EidolonSession>(0, false);
+    session->is_moqt_ = true;
+    std::string target_host(host);
+    EidolonMoqtListenHelper::Start(target_host, port, static_cast<uint16_t>(cb_port));
+    return session.release();
+#else
+    (void)secret; (void)secret_len;
     return nullptr;
 #endif
 }

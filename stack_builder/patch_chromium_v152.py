@@ -200,8 +200,16 @@ def main():
         r'  ]\n'
         r'  configs += [ ":quiche_internal_config" ]\n'
         r'  public_configs = [ ":quiche_config" ]\n'
-        r'  # Шим operator<< для AbslStringify-типов moqt (пишется build.sh).\n'
-        r'  cflags = [ "-include", rebase_path("//net/eidolon/moqt_ostream_shims.h", root_build_dir) ]\n'
+        r'  cflags = [\n'
+        r'    # Шим operator<< для AbslStringify-типов moqt (пишется build.sh).\n'
+        r'    "-include", rebase_path("//net/eidolon/moqt_ostream_shims.h", root_build_dir),\n'
+        r'    # Глушим style-варнинги апстрим-кода quiche moqt (не наш код): он\n'
+        r'    # никогда не собирался под строгие флаги Chromium, отсюда ~2000 строк шума.\n'
+        r'    "-Wno-inconsistent-missing-override",\n'
+        r'    "-Wno-extra-semi",\n'
+        r'    "-Wno-deprecated-copy",\n'
+        r'    "-Wno-unused-private-field",\n'
+        r'  ]\n'
         r'  deps = [\n'
         r'    "//base",\n'
         r'    "//net",\n'
@@ -211,6 +219,23 @@ def main():
         r'}\n'
         r'\n'
         r'component("quiche") {'
+    )
+
+    # 11. MoQT keying material (Фаза 2): AEAD-ключ туннеля берём из TLS-экспортера
+    #     несущего WebTransport/QUIC-соединения (channel binding), а НЕ из master_secret.
+    #     webtransport::Session на H3 — это quic::WebTransportHttp3, который держит
+    #     приватный QuicSpdySession* session_. Экспонируем его публичным аксессором,
+    #     чтобы eidolon_bridge.cc (и клиент, и сервер) мог вызвать
+    #     GetCryptoStream()->ExportKeyingMaterial("eidolon-traffic-key", ...).
+    #     Один патч покрывает оба конца: тип WebTransportHttp3 одинаков на client/server.
+    apply_patch(
+        'net/third_party/quiche/src/quiche/quic/core/http/web_transport_http3.h',
+        r'(WebTransportHttp3\(QuicSpdySession\* session, QuicSpdyStream\* connect_stream,\s*\n\s*WebTransportSessionId id\);)',
+        r'\1\n'
+        r'\n'
+        r'  // [EIDOLON] Доступ к несущей QUIC-сессии для экспорта keying material\n'
+        r'  // (channel-bound AEAD-ключ туннеля поверх WebTransport/MoQT).\n'
+        r'  QuicSpdySession* eidolon_quic_session() { return session_; }'
     )
 
 

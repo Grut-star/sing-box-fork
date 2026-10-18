@@ -27,6 +27,8 @@ EIDOLON_EXPORT void eidolon_set_protect(EidolonProtectFunc cb);
 // Функция возвращает управление сразу после инициализации асинхронной помпы данных.
 EIDOLON_EXPORT EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd);
 EIDOLON_EXPORT EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd);
+// Фаза 2 перехода на MoQ: дозвон/listen по MoQT (WebTransport-over-H3).
+EIDOLON_EXPORT EidolonHandle eidolon_dial_moqt(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd);
 
 // Экспорт TLS-ключа (RFC 5705) для нашего внутреннего AEAD
 EIDOLON_EXPORT int eidolon_export_key(EidolonHandle handle, uint8_t* out_key, size_t key_len);
@@ -38,6 +40,7 @@ EIDOLON_EXPORT int eidolon_write(EidolonHandle handle, const uint8_t* buffer, si
 EIDOLON_EXPORT void eidolon_close(EidolonHandle handle);
 
 EIDOLON_EXPORT EidolonHandle eidolon_listen_quic(const char* host, uint16_t port, const uint8_t* secret, size_t secret_len, uintptr_t go_callback_port);
+EIDOLON_EXPORT EidolonHandle eidolon_listen_moqt(const char* host, uint16_t port, const uint8_t* secret, size_t secret_len, uintptr_t go_callback_port);
 
 EIDOLON_EXPORT void eidolon_init();
 
