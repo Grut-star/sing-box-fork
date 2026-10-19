@@ -1101,6 +1101,9 @@ class MoQTDialHelper {
 public:
     static void Start(EidolonSession* sess, const std::string& ip, const std::string& sni,
                       uint16_t port, const std::vector<uint8_t>& token, base::WaitableEvent* event) {
+        LOG(INFO) << "EIDOLON_DIAG: MoQTDialHelper::Start ENTER ip=" << ip
+                  << " sni=" << sni << " port=" << port
+                  << " on_io_thread=" << (base::SingleThreadTaskRunner::GetCurrentDefault() != nullptr);
         net::URLRequestContextBuilder builder;
         builder.DisableHttpCache();
         builder.set_proxy_config_service(
@@ -1108,24 +1111,37 @@ public:
                         net::ProxyConfigWithAnnotation::CreateDirect()));
         builder.SetCertVerifier(
                 std::make_unique<EidolonCertVerifier>(net::CertVerifier::CreateDefault(nullptr)));
+        LOG(INFO) << "EIDOLON_DIAG: Start step1 cert_verifier+proxy set";
 
         // Пин IP (анти-DNS-poisoning): authority = sni, но резолвим sni -> ip статически.
         auto base_resolver = net::HostResolver::CreateStandaloneResolver(nullptr);
+        LOG(INFO) << "EIDOLON_DIAG: Start step2 standalone resolver created";
         auto mapped_resolver = std::make_unique<net::MappedHostResolver>(std::move(base_resolver));
         mapped_resolver->AddRuleFromString("MAP " + sni + " " + ip);
         builder.set_host_resolver(std::move(mapped_resolver));
+        LOG(INFO) << "EIDOLON_DIAG: Start step3 mapped resolver set (MAP " << sni << " " << ip << ")";
 
         auto quic_context = std::make_unique<net::QuicContext>();
         quic_context->params()->supported_versions = net::DefaultSupportedQuicVersions();
         builder.SetSpdyAndQuicEnabled(false, true);
         builder.set_quic_context(std::move(quic_context));
+        LOG(INFO) << "EIDOLON_DIAG: Start step4 quic context set, calling builder.Build()";
         sess->url_context = builder.Build();
+        LOG(INFO) << "EIDOLON_DIAG: Start step5 URLRequestContext built ok=" << (sess->url_context != nullptr);
 
         GURL url("https://" + sni + ":" + std::to_string(port) + "/eidolon");
         url::Origin origin = url::Origin::Create(url);
+        LOG(INFO) << "EIDOLON_DIAG: Start step6 url=" << url.spec();
 
         net::WebTransportParameters params;
         params.enable_web_transport_http3 = true;
+        // MoQT согласует WebTransport-subprotocol = строка версии MoQT. Клиент ОБЯЗАН
+        // предложить kDefaultMoqtVersion (draft16) в application_protocols, иначе WT
+        // согласует пустой subprotocol и клиентская MoqtSession рвёт сессию в
+        // OnSessionReady: GetNegotiatedSubprotocol() != parameters_.version ->
+        // "MOQT peer chose wrong subprotocol" (quiche moqt_session.cc:125-131).
+        // Сервер выбирает ровно этот subprotocol в subprotocol_callback.
+        params.application_protocols.push_back(std::string(moqt::kDefaultMoqtVersion));
         // TODO (Фаза 1, функционально): подтвердить обход проверки сертификата для
         //   WT-клиента. DedicatedWebTransportHttp3Client держит собственный
         //   crypto_config_; надо убедиться, что EidolonCertVerifier из контекста
@@ -1133,12 +1149,15 @@ public:
         //   отдельный патч proof_verifier под WT. Проверяется при e2e с сервером.
 
         sess->wt_visitor_ = std::make_unique<EidolonWtVisitor>(sess, token, event);
+        LOG(INFO) << "EIDOLON_DIAG: Start step7 visitor created, calling CreateWebTransportClient";
         sess->wt_client_ = net::CreateWebTransportClient(
                 url, origin, sess->wt_visitor_.get(), net::NetworkAnonymizationKey(),
                 net::handles::kInvalidNetworkHandle, sess->url_context.get(), params);
+        LOG(INFO) << "EIDOLON_DIAG: Start step8 WebTransport client created ok=" << (sess->wt_client_ != nullptr);
         LOG(INFO) << "EIDOLON_DIAG: MoQT dialing " << ip << ":" << port << " sni=" << sni;
         // Connect асинхронный: event просигналит visitor из OnConnected/OnConnectionFailed.
         sess->wt_client_->Connect();
+        LOG(INFO) << "EIDOLON_DIAG: Start step9 Connect() returned (async, awaiting visitor callback)";
     }
 };
 
@@ -2153,7 +2172,11 @@ EIDOLON_EXPORT EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, 
 // Data-plane (Go-FD <-> MoQT объекты/датаграммы) — Фаза 2; пока устанавливаем
 // только WebTransport + MoQT-сессию (control-plane) и валидируем линковку.
 EIDOLON_EXPORT EidolonHandle eidolon_dial_moqt(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd) {
+    LOG(INFO) << "EIDOLON_DIAG: eidolon_dial_moqt ENTRY host=" << (host ? host : "(null)")
+              << " port=" << port << " token_len=" << token_len << " data_fd=" << data_fd;
     EnsureChromiumIOThread();
+    LOG(INFO) << "EIDOLON_DIAG: eidolon_dial_moqt io-thread ready (running="
+              << (g_io_thread && g_io_thread->IsRunning()) << ")";
     auto session = std::make_unique<EidolonSession>(data_fd, false);
     session->is_moqt_ = true;
     std::string target_host(host);
@@ -2164,23 +2187,31 @@ EIDOLON_EXPORT EidolonHandle eidolon_dial_moqt(const char* host, uint16_t port, 
         target_ip = target_host.substr(0, sep);
         target_sni = target_host.substr(sep + 1);
     }
+    LOG(INFO) << "EIDOLON_DIAG: eidolon_dial_moqt parsed ip=" << target_ip
+              << " sni=" << target_sni;
 
     auto safe_span = UNSAFE_BUFFERS(base::span<const uint8_t>(token, token_len));
     std::vector<uint8_t> token_vec(safe_span.begin(), safe_span.end());
 
     base::WaitableEvent connect_event(base::WaitableEvent::ResetPolicy::MANUAL, base::WaitableEvent::InitialState::NOT_SIGNALED);
 
+    LOG(INFO) << "EIDOLON_DIAG: eidolon_dial_moqt posting MoQTDialHelper::Start to io-thread";
     g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
             EidolonSession* sess, std::string ip_str, std::string sni_str, uint16_t port_num, std::vector<uint8_t> tok, base::WaitableEvent* event) {
         MoQTDialHelper::Start(sess, ip_str, sni_str, port_num, tok, event);
     }, session.get(), target_ip, target_sni, port, token_vec, &connect_event));
 
+    LOG(INFO) << "EIDOLON_DIAG: eidolon_dial_moqt waiting on connect_event";
     connect_event.Wait();
+    LOG(INFO) << "EIDOLON_DIAG: eidolon_dial_moqt connect_event signaled, is_closed="
+              << session->is_closed_;
     if (session->is_closed_) {
+        LOG(ERROR) << "EIDOLON_DIAG: eidolon_dial_moqt FAILED (session closed) -> returning null";
         auto* s_ptr = session.release();
         g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](EidolonSession* s) { delete s; }, s_ptr));
         return nullptr;
     }
+    LOG(INFO) << "EIDOLON_DIAG: eidolon_dial_moqt SUCCESS -> returning handle";
     return session.release();
 }
 
