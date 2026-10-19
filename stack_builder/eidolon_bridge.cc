@@ -722,6 +722,35 @@ public:
                   << "] AddObjectListener -> listeners=" << listeners_.size()
                   << " window_objs=" << window_.size();
         listener->OnSubscribeAccepted();
+        // ФИКС гонки publish-before-subscribe: продюсер (Go-FD pump) начинает
+        // публиковать объекты сразу после dial, ДО того как пир пришлёт SUBSCRIBE.
+        // Без реплея forward-доставка сессии стартует с хвоста окна (следующего
+        // OnNewObjectAvailable), безвозвратно теряя всё, что было опубликовано до
+        // подписки — в т.ч. 50-байтный преамбул (token‖flowID‖padLen) объекта 0 на
+        // треке "u", без которого сервер не открывает cb_port. Подписка у нас всегда
+        // AbsoluteStart(0,0)+forward(true), поэтому все кэшированные объекты в окне.
+        // Проигрываем их новому подписчику по возрастанию id (window_ — std::map);
+        // сессия вытянет их через GetCachedObject в правильном порядке. Симметрично
+        // чинит и обратный трек "d" (сервер->клиент).
+        //
+        // Guard: backlog реплеим РОВНО ОДИН РАЗ за жизнь паблишера. У туннеля один
+        // логический подписчик-пир (сессия ↔ клиент 1:1), и преамбул/ранние байты
+        // нужны только самой первой подписке — дальше всё идёт живой доставкой через
+        // AddBytes→OnNewObjectAvailable. При повторном SUBSCRIBE (UNSUBSCRIBE→SUBSCRIBE)
+        // окно уже частично эвикнуто по highest_pulled_, и повторный дамп хвоста
+        // задвоил бы уже доставленные объекты — поэтому второй раз не реплеим.
+        if (backlog_replayed_) return;
+        backlog_replayed_ = true;
+        // Снапшот id до нотификаций: OnNewObjectAvailable синхронно дёргает
+        // GetCachedObject, который эвиктит доставленное из window_, поэтому
+        // итерировать сам контейнер во время реплея нельзя (инвалидация).
+        std::vector<uint64_t> replay_ids;
+        replay_ids.reserve(window_.size());
+        for (const auto& entry : window_) replay_ids.push_back(entry.first);
+        for (uint64_t id : replay_ids) {
+            listener->OnNewObjectAvailable(moqt::Location(0, id), /*subgroup=*/0,
+                                           moqt::kDefaultPublisherPriority);
+        }
     }
     void RemoveObjectListener(moqt::MoqtObjectListener* listener) override {
         listeners_.erase(listener);
@@ -758,6 +787,7 @@ private:
     mutable uint64_t bytes_in_window_ = 0;
     mutable uint64_t highest_pulled_ = 0;
     bool closed_ = false;
+    bool backlog_replayed_ = false;  // backlog реплеится один раз (первой подписке)
     absl::flat_hash_set<moqt::MoqtObjectListener*> listeners_;
 };
 
