@@ -400,6 +400,8 @@ struct EidolonSession {
 
         // MoQT: байты из Go-FD -> объекты нашего восходящего трека (без Chromium-сокета).
         if (is_moqt_) {
+            LOG(INFO) << "EIDOLON_DIAG: OnFdReadable(MoQT) bytes_read=" << bytes_read
+                      << " eagain=" << is_eagain;
             if (bytes_read > 0) {
                 PublishUpstreamBytes(std::string_view(reinterpret_cast<char*>(temp_buf.data()),
                                                       static_cast<size_t>(bytes_read)));
@@ -669,6 +671,9 @@ public:
         window_.emplace(id, std::make_shared<moqt::CachedObject>(
                 md, quiche::QuicheMemSlice::Copy(data), /*fin_after_this=*/false));
         bytes_in_window_ += data.size();
+        LOG(INFO) << "EIDOLON_DIAG: TrackPublisher[" << track_.ToString() << "] AddBytes id="
+                  << id << " size=" << data.size() << " listeners=" << listeners_.size()
+                  << " window=" << bytes_in_window_;
         for (moqt::MoqtObjectListener* l : listeners_) {
             l->OnNewObjectAvailable(loc, /*subgroup=*/0, moqt::kDefaultPublisherPriority);
         }
@@ -694,6 +699,9 @@ public:
     std::optional<moqt::PublishedObject> GetCachedObject(
             uint64_t group, std::optional<uint64_t> subgroup, uint64_t min_object,
             uint64_t offset) const override {
+        LOG(INFO) << "EIDOLON_DIAG: TrackPublisher[" << track_.ToString() << "] GetCachedObject group="
+                  << group << " min_object=" << min_object << " offset=" << offset
+                  << " window_objs=" << window_.size();
         if (group != 0) return std::nullopt;
         auto it = window_.lower_bound(min_object);
         if (it == window_.end()) return std::nullopt;  // ещё не произведён — ждём OnNewObjectAvailable
@@ -710,6 +718,9 @@ public:
 
     void AddObjectListener(moqt::MoqtObjectListener* listener) override {
         listeners_.insert(listener);
+        LOG(INFO) << "EIDOLON_DIAG: TrackPublisher[" << track_.ToString()
+                  << "] AddObjectListener -> listeners=" << listeners_.size()
+                  << " window_objs=" << window_.size();
         listener->OnSubscribeAccepted();
     }
     void RemoveObjectListener(moqt::MoqtObjectListener* listener) override {
@@ -769,6 +780,7 @@ public:
                           const moqt::PublishedObjectMetadata& /*metadata*/,
                           absl::string_view object, uint64_t /*offset*/) override {
         // Один subgroup -> фрагменты приходят по порядку; конкатенация = байтопоток.
+        LOG(INFO) << "EIDOLON_DIAG: client downstream OnObjectFragment size=" << object.size();
         sess_->EnqueueFdWrite(object);
     }
     void OnPublishDone(moqt::FullTrackName) override { sess_->Close(); }
@@ -1142,11 +1154,17 @@ public:
         // "MOQT peer chose wrong subprotocol" (quiche moqt_session.cc:125-131).
         // Сервер выбирает ровно этот subprotocol в subprotocol_callback.
         params.application_protocols.push_back(std::string(moqt::kDefaultMoqtVersion));
-        // TODO (Фаза 1, функционально): подтвердить обход проверки сертификата для
-        //   WT-клиента. DedicatedWebTransportHttp3Client держит собственный
-        //   crypto_config_; надо убедиться, что EidolonCertVerifier из контекста
-        //   реально применяется, иначе — server_certificate_fingerprints или
-        //   отдельный патч proof_verifier под WT. Проверяется при e2e с сервером.
+        // Проверка сертификата WT-клиента ПОДТВЕРЖДЕНА (chromium-155
+        // net/quic/dedicated_web_transport_http3_client.cc CreateProofVerifier):
+        // при пустом server_certificate_fingerprints клиент строит
+        // ProofVerifierChromium(context->cert_verifier(), ...) — т.е. использует
+        // НАШ EidolonCertVerifier из url_context. Его override-ветка ставит
+        // is_issued_by_known_root=true + cert_status=0, что удовлетворяет
+        // known-root-требование ProofVerifierChromium (работает и для self-signed
+        // cover). e2e подтвердил happy-path (валидный ACME-серт): "WebTransport
+        // connected". Поэтому fingerprints/отдельный proof-патч НЕ нужны.
+        // (Рантайм override-ветки для self-signed серта пока не прогонялся —
+        // проверить, если сервер когда-нибудь отдаёт не-публичный серт.)
 
         sess->wt_visitor_ = std::make_unique<EidolonWtVisitor>(sess, token, event);
         LOG(INFO) << "EIDOLON_DIAG: Start step7 visitor created, calling CreateWebTransportClient";
@@ -1870,6 +1888,7 @@ public:
     void OnCanAckObjects(moqt::MoqtObjectAckFunction) override {}
     void OnObjectFragment(const moqt::FullTrackName&, const moqt::PublishedObjectMetadata&,
                           absl::string_view object, uint64_t) override {
+        LOG(INFO) << "EIDOLON_DIAG: MoQT server upstream OnObjectFragment size=" << object.size();
         flow_->OnUpstreamBytes(object);
     }
     void OnPublishDone(moqt::FullTrackName) override { flow_->OnUpstreamFin(); }
