@@ -2590,7 +2590,7 @@ namespace {
         quic::QuicPacketWriter* WriterToUse() override { return writer_; }
 
     private:
-        quic::QuicPacketWriter* writer_;  // не владеет (владеет клиент до коммита)
+        raw_ptr<quic::QuicPacketWriter> writer_;  // не владеет (владеет клиент до коммита)
     };
 
 // Result-delegate: на успехе валидации коммитим миграцию, иначе отменяем.
@@ -2613,7 +2613,7 @@ namespace {
         }
 
     private:
-        net::DedicatedWebTransportHttp3Client* client_;
+        raw_ptr<net::DedicatedWebTransportHttp3Client> client_;
     };
 
 }  // namespace
