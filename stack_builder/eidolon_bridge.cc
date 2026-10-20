@@ -88,6 +88,16 @@ typedef SSIZE_T ssize_t;
 // EidolonCertVerifier и protect-хуки), отдаёт quic::WebTransportSession* (==
 // webtransport::Session*), на который садится quiche MoqtSession.
 #include "net/quic/web_transport_client.h"
+// Фаза 3 Этап C — Connection Migration: прямой доступ к клиенту WT-over-H3,
+// его пакетному reader/writer, сокет-фабрике и path-валидатору QUIC.
+#include "net/quic/dedicated_web_transport_http3_client.h"
+#include "net/quic/quic_chromium_packet_reader.h"
+#include "net/quic/quic_chromium_packet_writer.h"
+#include "net/quic/address_utils.h"
+#include "net/socket/datagram_client_socket.h"
+#include "net/socket/client_socket_factory.h"
+#include "net/http/http_network_session.h"
+#include "quiche/quic/core/quic_path_validator.h"
 #include "net/quic/quic_chromium_alarm_factory.h"
 #include "net/quic/platform/impl/quic_chromium_clock.h"
 #include "net/http/http_response_headers.h"
@@ -2094,6 +2104,150 @@ private:
 #endif // BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
 // ===============================================================
 
+// =========================================================================
+// Фаза 3 Этап C — Connection Migration (Wi-Fi<->сота) для WT-over-H3 клиента.
+// Validate-then-migrate: валидируем новый путь (PATH_CHALLENGE/RESPONSE), затем
+// переносим QUIC-соединение на свежий сокет новой сети. Сессия MoQT и все стримы
+// переживают переход прозрачно (тот же connection ID, ниже уровня приложения).
+// Реализуем прямо на клиенте (методы объявлены патчем item 12): он владеет
+// connection_/socket/reader и даёт к ним приватный доступ (static-линк).
+// =========================================================================
+namespace {
+
+// Контекст валидации пути: отдаёт writer пробного (нового) сокета.
+    class EidolonMigrationPathContext : public quic::QuicPathValidationContext {
+    public:
+        EidolonMigrationPathContext(const quic::QuicSocketAddress& self,
+                                    const quic::QuicSocketAddress& peer,
+                                    quic::QuicPacketWriter* writer)
+                : quic::QuicPathValidationContext(self, peer), writer_(writer) {}
+        quic::QuicPacketWriter* WriterToUse() override { return writer_; }
+
+    private:
+        quic::QuicPacketWriter* writer_;  // не владеет (владеет клиент до коммита)
+    };
+
+// Result-delegate: на успехе валидации коммитим миграцию, иначе отменяем.
+    class EidolonMigrationResultDelegate
+            : public quic::QuicPathValidator::ResultDelegate {
+    public:
+        explicit EidolonMigrationResultDelegate(
+                net::DedicatedWebTransportHttp3Client* client)
+                : client_(client) {}
+        void OnPathValidationSuccess(
+                std::unique_ptr<quic::QuicPathValidationContext> context,
+                quic::QuicTime /*start_time*/) override {
+            LOG(INFO) << "EIDOLON_DIAG: migration path validated OK";
+            client_->EidolonCommitMigration(std::move(context));
+        }
+        void OnPathValidationFailure(
+                std::unique_ptr<quic::QuicPathValidationContext> /*context*/) override {
+            LOG(INFO) << "EIDOLON_DIAG: migration path validation FAILED";
+            client_->EidolonAbortMigration();
+        }
+
+    private:
+        net::DedicatedWebTransportHttp3Client* client_;
+    };
+
+}  // namespace
+
+void net::DedicatedWebTransportHttp3Client::EidolonMigrateToNetwork(
+        net::handles::NetworkHandle network) {
+    if (!connection_ || !connection_->connected()) {
+        LOG(INFO) << "EIDOLON_DIAG: migrate skipped (connection not ready)";
+        return;
+    }
+    if (eidolon_probe_socket_ || eidolon_probe_reader_) {
+        LOG(INFO) << "EIDOLON_DIAG: migrate already in progress, ignoring";
+        return;
+    }
+    LOG(INFO) << "EIDOLON_DIAG: EidolonMigrateToNetwork network=" << network;
+
+    // Пробный сокет на новой сети. Привязка к NetworkHandle сама маршрутизирует в
+    // неё и обходит VPN-TUN на Android.
+    eidolon_probe_socket_ =
+            context_->GetNetworkSessionContext()
+                    ->client_socket_factory->CreateDatagramClientSocket(
+                            net::DatagramSocket::DEFAULT_BIND, network, net_log_.net_log(),
+                            net_log_.source());
+    if (quic_context_->params()->enable_socket_recv_optimization)
+        eidolon_probe_socket_->EnableRecvOptimization();
+    eidolon_probe_socket_->UseNonBlockingIO();
+
+    net::IPEndPoint peer_ip = net::ToIPEndPoint(connection_->peer_address());
+    int rv = eidolon_probe_socket_->ConnectAsync(
+            peer_ip,
+            base::BindOnce(
+                    &net::DedicatedWebTransportHttp3Client::EidolonOnProbeConnected,
+                    base::Unretained(this), connection_->peer_address()));
+    if (rv != net::ERR_IO_PENDING)
+        EidolonOnProbeConnected(connection_->peer_address(), rv);
+}
+
+void net::DedicatedWebTransportHttp3Client::EidolonOnProbeConnected(
+        quic::QuicSocketAddress peer, int rv) {
+    if (rv != net::OK || !eidolon_probe_socket_) {
+        LOG(INFO) << "EIDOLON_DIAG: migrate probe connect failed rv=" << rv;
+        EidolonAbortMigration();
+        return;
+    }
+    eidolon_probe_socket_->SetReceiveBufferSize(net::kQuicSocketReceiveBufferSize);
+    int dnf = eidolon_probe_socket_->SetDoNotFragment();
+    (void)dnf;  // ERR_NOT_IMPLEMENTED допустимо (как в DoConnectConfigure)
+    eidolon_probe_socket_->SetSendBufferSize(quic::kMaxOutgoingPacketSize * 20);
+
+    eidolon_probe_writer_ = std::make_unique<net::QuicChromiumPacketWriter>(
+            eidolon_probe_socket_.get(), task_runner_);
+    eidolon_probe_reader_ = std::make_unique<net::QuicChromiumPacketReader>(
+            std::move(eidolon_probe_socket_), quic_context_->clock(), this,
+            net::kQuicYieldAfterPacketsRead,
+            quic::QuicTime::Delta::FromMilliseconds(
+                    net::kQuicYieldAfterDurationMilliseconds),
+            net_log_);
+    eidolon_probe_reader_->StartReading();
+
+    net::IPEndPoint local;
+    eidolon_probe_reader_->socket()->GetLocalAddress(&local);
+    quic::QuicSocketAddress self = net::ToQuicSocketAddress(local);
+
+    LOG(INFO) << "EIDOLON_DIAG: migrate validating path self=" << self.ToString()
+              << " peer=" << peer.ToString();
+    connection_->ValidatePath(
+            std::make_unique<EidolonMigrationPathContext>(self, peer,
+                                                          eidolon_probe_writer_.get()),
+            std::make_unique<EidolonMigrationResultDelegate>(this),
+            quic::PathValidationReason::kConnectionMigration);
+}
+
+void net::DedicatedWebTransportHttp3Client::EidolonCommitMigration(
+        std::unique_ptr<quic::QuicPathValidationContext> context) {
+    if (!eidolon_probe_writer_ || !eidolon_probe_reader_) {
+        LOG(INFO) << "EIDOLON_DIAG: migrate commit without probe, aborting";
+        EidolonAbortMigration();
+        return;
+    }
+    quic::QuicSocketAddress self = context->self_address();
+    quic::QuicSocketAddress peer = context->peer_address();
+    // Write-ошибки нового пути обрабатываем мы (как и для исходного writer).
+    eidolon_probe_writer_->set_delegate(this);
+    bool ok = connection_->MigratePath(self, peer, eidolon_probe_writer_.release(),
+            /*owns_writer=*/true);
+    LOG(INFO) << "EIDOLON_DIAG: migrate MigratePath ok=" << ok;
+    if (!ok) {
+        EidolonAbortMigration();
+        return;
+    }
+    // Старый reader (и его сокет) уничтожается — трафик идёт с нового сокета.
+    packet_reader_ = std::move(eidolon_probe_reader_);
+}
+
+void net::DedicatedWebTransportHttp3Client::EidolonAbortMigration() {
+    eidolon_probe_reader_.reset();
+    eidolon_probe_writer_.reset();
+    eidolon_probe_socket_.reset();
+}
+
 // -------------------------------------------------------------------------
 // C-API (ДЛЯ GOLANG)
 // -------------------------------------------------------------------------
@@ -2320,6 +2474,21 @@ g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](EidolonSession
 } else {
 delete session;
 }
+}
+
+// Фаза 3 Этап C — мигрировать несущее QUIC-соединение сессии на другую сеть
+// Android (Wi-Fi<->сота) без разрыва туннеля. network_handle — NetworkHandle из
+// ConnectivityManager (Network.getNetworkHandle()). Только для MoQT/QUIC-несущей
+// (wt_client_); TCP-линии не мигрируют (перехиливаются пулом в Go).
+EIDOLON_EXPORT void eidolon_migrate(EidolonHandle handle, int64_t network_handle) {
+if (!handle || !g_io_thread) return;
+auto* session = static_cast<EidolonSession*>(handle);
+g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
+        EidolonSession* s, net::handles::NetworkHandle net_handle) {
+    if (s->is_closed_ || !s->wt_client_) return;
+    auto* wt = static_cast<net::DedicatedWebTransportHttp3Client*>(s->wt_client_.get());
+    wt->EidolonMigrateToNetwork(net_handle);
+}, session, static_cast<net::handles::NetworkHandle>(network_handle)));
 }
 
 EIDOLON_EXPORT EidolonHandle eidolon_listen_quic(const char* host, uint16_t port, const uint8_t* secret, size_t secret_len, uintptr_t cb_port) {

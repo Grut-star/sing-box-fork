@@ -221,6 +221,49 @@ def main():
         r'component("quiche") {'
     )
 
+    # 12. Connection Migration (Фаза 3, Этап C): Wi-Fi<->сота без teardown туннеля.
+    #     DedicatedWebTransportHttp3Client владеет своим QUIC-соединением, сокетом и
+    #     reader'ом, но НЕ использует QuicChromiumClientSession (её миграционный
+    #     менеджер недоступен). Добавляем сфокусированный validate-then-migrate прямо
+    #     на клиенте: объявляем метод+поля здесь, реализуем в eidolon_bridge.cc
+    #     (is_component_build=false → один статический линк, приватный доступ ок).
+    #     12a. include для типа QuicPathValidationContext в сигнатуре.
+    apply_patch(
+        'net/quic/dedicated_web_transport_http3_client.h',
+        r'(#include "net/third_party/quiche/src/quiche/quic/core/quic_connection_id\.h")',
+        r'\1\n'
+        r'#include "net/third_party/quiche/src/quiche/quic/core/quic_path_validator.h"'
+    )
+    #     12b. Публичные точки входа миграции (вызываются из нативного моста и из
+    #          result-delegate валидации пути).
+    apply_patch(
+        'net/quic/dedicated_web_transport_http3_client.h',
+        r'(handles::NetworkHandle target_network\(\) const \{ return target_network_; \})',
+        r'\1\n'
+        r'\n'
+        r'  // [EIDOLON] Миграция несущего QUIC-соединения на другую сеть Android\n'
+        r'  // (Wi-Fi<->сота). Валидирует новый путь (PATH_CHALLENGE/RESPONSE), затем\n'
+        r'  // переносит соединение на свежий сокет, привязанный к |network|; сессия\n'
+        r'  // WebTransport/MoQT и все стримы сохраняются. Вызывать на сетевом потоке.\n'
+        r'  void EidolonMigrateToNetwork(handles::NetworkHandle network);\n'
+        r'  // Коммит/отмена из result-delegate валидации пути.\n'
+        r'  void EidolonCommitMigration(\n'
+        r'      std::unique_ptr<quic::QuicPathValidationContext> context);\n'
+        r'  void EidolonAbortMigration();'
+    )
+    #     12c. Приватное состояние пробы миграции (сокет/writer/reader новой сети).
+    apply_patch(
+        'net/quic/dedicated_web_transport_http3_client.h',
+        r'(  std::unique_ptr<QuicChromiumPacketReader> packet_reader_;)',
+        r'\1\n'
+        r'\n'
+        r'  // [EIDOLON] Проба миграции: сокет/writer/reader новой сети до коммита.\n'
+        r'  void EidolonOnProbeConnected(quic::QuicSocketAddress peer, int rv);\n'
+        r'  std::unique_ptr<DatagramClientSocket> eidolon_probe_socket_;\n'
+        r'  std::unique_ptr<QuicChromiumPacketReader> eidolon_probe_reader_;\n'
+        r'  std::unique_ptr<QuicChromiumPacketWriter> eidolon_probe_writer_;'
+    )
+
     # 11. MoQT keying material (Фаза 2): AEAD-ключ туннеля берём из TLS-экспортера
     #     несущего WebTransport/QUIC-соединения (channel binding), а НЕ из master_secret.
     #     webtransport::Session на H3 — это quic::WebTransportHttp3, который держит

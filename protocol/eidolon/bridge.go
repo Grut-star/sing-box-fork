@@ -198,6 +198,22 @@ func (c *NativeStackConn) RawHandle() unsafe.Pointer {
 	return unsafe.Pointer(c.handle)
 }
 
+// Migrate переносит несущее QUIC/MoQT-соединение на другую сеть Android
+// (Wi-Fi<->сота) без разрыва туннеля. networkHandle — Network.getNetworkHandle()
+// из ConnectivityManager. No-op для закрытых и не-MoQT соединений (нативная
+// сторона сама игнорирует не-MoQT handle).
+func (c *NativeStackConn) Migrate(networkHandle int64) {
+	if c == nil {
+		return
+	}
+	c.closeMu.RLock()
+	defer c.closeMu.RUnlock()
+	if c.closed || c.handle == nil {
+		return
+	}
+	C.eidolon_migrate(c.handle, C.int64_t(networkHandle))
+}
+
 // nativeTransport выбирает несущий транспорт нативного стека.
 type nativeTransport int
 
