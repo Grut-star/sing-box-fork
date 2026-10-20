@@ -184,8 +184,12 @@ type NativeStackConn struct {
 	closed     bool
 	handle     C.EidolonHandle
 	dataConn   net.Conn
-	localAddr  net.Addr
-	remoteAddr net.Addr
+	// Фаза 4: ненадёжный датаграм-канал (MoQT datagram-objects). nil для TCP/QUIC
+	// и для MoQT-сессий без датаграм-lane. Кадрирование [len:2 BE][payload].
+	datagramConn net.Conn
+	dgramWriteMu sync.Mutex
+	localAddr    net.Addr
+	remoteAddr   net.Addr
 }
 
 // RawHandle returns the underlying EidolonHandle as an unsafe.Pointer (for testing and diagnostic introspection).
@@ -212,6 +216,73 @@ func (c *NativeStackConn) Migrate(networkHandle int64) {
 		return
 	}
 	C.eidolon_migrate(c.handle, C.int64_t(networkHandle))
+}
+
+// HasDatagramLane сообщает, поднят ли ненадёжный датаграм-канал (MoQT datagram-objects).
+func (c *NativeStackConn) HasDatagramLane() bool {
+	if c == nil {
+		return false
+	}
+	c.closeMu.RLock()
+	defer c.closeMu.RUnlock()
+	return c.datagramConn != nil && !c.closed
+}
+
+// WriteDatagram отправляет одну датаграмму (уже зашифрованный кодеком кадр) в
+// нативный слой — она уйдёт одним MoQT datagram-object. Кадр [len:2 BE][payload].
+// Потокобезопасно (несколько UDP-флоу делят один канал).
+func (c *NativeStackConn) WriteDatagram(p []byte) error {
+	if c == nil {
+		return errors.New("eidolon: nil conn")
+	}
+	if len(p) == 0 {
+		return nil
+	}
+	if len(p) > 0xFFFF {
+		return errors.New("eidolon: datagram too large to frame")
+	}
+	c.closeMu.RLock()
+	dc := c.datagramConn
+	closed := c.closed
+	c.closeMu.RUnlock()
+	if closed || dc == nil {
+		return errors.New("eidolon: datagram lane unavailable")
+	}
+	buf := make([]byte, 2+len(p))
+	buf[0] = byte(len(p) >> 8)
+	buf[1] = byte(len(p))
+	copy(buf[2:], p)
+	c.dgramWriteMu.Lock()
+	defer c.dgramWriteMu.Unlock()
+	_, err := dc.Write(buf) // net.Conn.Write пишет буфер целиком или возвращает ошибку
+	return err
+}
+
+// ReadDatagram читает одну входящую датаграмму (кадр [len:2 BE][payload]) из
+// нативного слоя. Блокирующий; рассчитан на одного читателя (демукс-горутину сессии).
+func (c *NativeStackConn) ReadDatagram() ([]byte, error) {
+	if c == nil {
+		return nil, errors.New("eidolon: nil conn")
+	}
+	c.closeMu.RLock()
+	dc := c.datagramConn
+	c.closeMu.RUnlock()
+	if dc == nil {
+		return nil, errors.New("eidolon: no datagram lane")
+	}
+	var hdr [2]byte
+	if _, err := io.ReadFull(dc, hdr[:]); err != nil {
+		return nil, err
+	}
+	n := int(hdr[0])<<8 | int(hdr[1])
+	if n == 0 {
+		return []byte{}, nil
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(dc, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
 }
 
 // nativeTransport выбирает несущий транспорт нативного стека.
@@ -246,6 +317,19 @@ func dialNative(ctx context.Context, host string, port int, token []byte, transp
 		return nil, fmt.Errorf("eidolon bridge: failed to create native pipe: %w", err)
 	}
 
+	// Фаза 4: для MoQT поднимаем ВТОРОЙ канал — ненадёжный датаграм-lane (UDP).
+	// Кадрирование [len:2 BE][payload] поверх STREAM-пайпа; на натив идёт как
+	// второй FD. Для TCP/QUIC датаграм-канала нет (datagram_fd=0).
+	var datagramConn net.Conn
+	var cFd2Ptr uintptr
+	if transport == transportMoQT {
+		datagramConn, cFd2Ptr, err = createNativePipe(true)
+		if err != nil {
+			dataConn.Close()
+			return nil, fmt.Errorf("eidolon bridge: failed to create datagram pipe: %w", err)
+		}
+	}
+
 	// 2. Готовим аргументы для CGO
 	cHost := C.CString(host)
 
@@ -261,6 +345,7 @@ func dialNative(ctx context.Context, host string, port int, token []byte, transp
 
 	// Приводим дескриптор к безопасному для Windows и POSIX типу uintptr_t
 	cFd := C.uintptr_t(cFdPtr)
+	cFd2 := C.uintptr_t(cFd2Ptr) // датаграм-FD (0 для не-MoQT)
 
 	// 3. Выполняем дозвон асинхронно, чтобы уважать context.Context
 	type dialResult struct {
@@ -274,7 +359,7 @@ func dialNative(ctx context.Context, host string, port int, token []byte, transp
 		var handle C.EidolonHandle
 		switch transport {
 		case transportMoQT:
-			handle = C.eidolon_dial_moqt(cHost, C.uint16_t(port), cToken, C.size_t(len(safeToken)), cFd)
+			handle = C.eidolon_dial_moqt(cHost, C.uint16_t(port), cToken, C.size_t(len(safeToken)), cFd, cFd2)
 		case transportQUIC:
 			handle = C.eidolon_dial_quic(cHost, C.uint16_t(port), cToken, C.size_t(len(safeToken)), cFd)
 		default:
@@ -317,70 +402,92 @@ func dialNative(ctx context.Context, host string, port int, token []byte, transp
 		default:
 		}
 		dataConn.Close()
+		if datagramConn != nil {
+			datagramConn.Close()
+		}
 		return nil, ctx.Err()
 	case res := <-resCh:
 		if res.err != nil {
 			dataConn.Close()
+			if datagramConn != nil {
+				datagramConn.Close()
+			}
 			return nil, res.err
 		}
 
 		// Сохраняем адреса на этапе создания для корректной работы sing-box ядра
 		return &NativeStackConn{
-			handle:     res.handle,
-			dataConn:   dataConn,
-			localAddr:  dataConn.LocalAddr(),
-			remoteAddr: dataConn.RemoteAddr(),
+			handle:       res.handle,
+			dataConn:     dataConn,
+			datagramConn: datagramConn,
+			localAddr:    dataConn.LocalAddr(),
+			remoteAddr:   dataConn.RemoteAddr(),
 		}, nil
 	}
 }
 
 func ListenNativeQUIC(ctx context.Context, host string, port int, secret []byte, onAccept func(net.Conn, []byte, []byte)) error {
-	return listenNative(ctx, host, port, secret, onAccept, transportQUIC)
+	return listenNative(ctx, host, port, secret, onAccept, nil, transportQUIC)
 }
 
 // ListenNativeMoQT поднимает серверный MoQT (WebTransport-over-H3) слушатель через стек
 // Chromium. Мост к локальному ядру и валидация токена идентичны QUIC-пути (80-байтовая meta).
-func ListenNativeMoQT(ctx context.Context, host string, port int, secret []byte, onAccept func(net.Conn, []byte, []byte)) error {
-	return listenNative(ctx, host, port, secret, onAccept, transportMoQT)
+// onDatagram (Фаза 4, может быть nil) — обработчик ненадёжного датаграм-lane: натив
+// коннектит второй cb_port, шлёт meta(80)=token‖key‖flowID(zeros), далее кадры
+// [len:2 BE][payload]; conn отдаётся обработчику ПОСЛЕ чтения meta.
+func ListenNativeMoQT(ctx context.Context, host string, port int, secret []byte, onAccept func(net.Conn, []byte, []byte), onDatagram func(conn net.Conn, sessionKey []byte)) error {
+	return listenNative(ctx, host, port, secret, onAccept, onDatagram, transportMoQT)
 }
 
-func listenNative(ctx context.Context, host string, port int, secret []byte, onAccept func(net.Conn, []byte, []byte), transport nativeTransport) error {
+// acceptMetaLoop принимает соединения от натива, читает 80-байтовую meta
+// (token‖sessionKey‖flowID), валидирует токен и отдаёт conn обработчику.
+func acceptMetaLoop(ln net.Listener, secret []byte, tag string, handle func(conn net.Conn, sessionKey, flowID []byte)) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		meta := make([]byte, 80)
+		if _, err := io.ReadFull(conn, meta); err != nil {
+			fmt.Printf("EIDOLON_QUIC_DIAG: %s meta read failed: %v\n", tag, err)
+			conn.Close()
+			continue
+		}
+		token := meta[:32]
+		sessionKey := meta[32:64]
+		flowID := meta[64:]
+		if !ValidateTokenConstantTime(string(secret), token, nil) {
+			fmt.Printf("EIDOLON_QUIC_DIAG: %s token validation FAILED -> closing\n", tag)
+			conn.Close()
+			continue
+		}
+		go handle(conn, sessionKey, flowID)
+	}
+}
+
+func listenNative(ctx context.Context, host string, port int, secret []byte, onAccept func(net.Conn, []byte, []byte), onDatagram func(net.Conn, []byte), transport nativeTransport) error {
 	localListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return err
 	}
 
-	go func() {
-		for {
-			conn, err := localListener.Accept()
-			if err != nil {
-				return
-			}
+	go acceptMetaLoop(localListener, secret, "reliable",
+		func(conn net.Conn, sessionKey, flowID []byte) { onAccept(conn, sessionKey, flowID) })
 
-			// Читаем: 32 (Token) + 32 (SessionKey) + 16 (FlowID) = 80 байт
-			meta := make([]byte, 80)
-			if _, err := io.ReadFull(conn, meta); err == nil {
-				token := meta[:32]
-				sessionKey := meta[32:64]
-				flowID := meta[64:]
-
-				fmt.Printf("EIDOLON_QUIC_DIAG: meta received token=%x flowID=%x keyPrefix=%x secretLen=%d\n", token, flowID, sessionKey[:4], len(secret))
-
-				// БЕСКОМПРОМИССНАЯ БЕЗОПАСНОСТЬ: Проверяем токен в Go
-				if !ValidateTokenConstantTime(string(secret), token, nil) {
-					fmt.Println("EIDOLON_QUIC_DIAG: token validation FAILED -> closing")
-					conn.Close() // C++ мост поймает разрыв TCP и аппаратно сбросит QUIC Stream
-					continue
-				}
-
-				fmt.Println("EIDOLON_QUIC_DIAG: token OK -> onAccept")
-				go onAccept(conn, sessionKey, flowID)
-			} else {
-				fmt.Printf("EIDOLON_QUIC_DIAG: meta read failed: %v\n", err)
-				conn.Close()
-			}
+	// Фаза 4: для MoQT с датаграм-обработчиком поднимаем ВТОРОЙ локальный listener
+	// (датаграм cb_port). Натив шлёт туда meta(80), затем кадрированные датаграммы.
+	var datagramListener net.Listener
+	var datagramPort int
+	if transport == transportMoQT && onDatagram != nil {
+		datagramListener, err = net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			localListener.Close()
+			return err
 		}
-	}()
+		datagramPort = datagramListener.Addr().(*net.TCPAddr).Port
+		go acceptMetaLoop(datagramListener, secret, "datagram",
+			func(conn net.Conn, sessionKey, _ []byte) { onDatagram(conn, sessionKey) })
+	}
 
 	localPort := localListener.Addr().(*net.TCPAddr).Port
 	cHost := C.CString(host)
@@ -389,12 +496,15 @@ func listenNative(ctx context.Context, host string, port int, secret []byte, onA
 
 	var handle C.EidolonHandle
 	if transport == transportMoQT {
-		handle = C.eidolon_listen_moqt(cHost, C.uint16_t(port), cSecret, C.size_t(len(secret)), C.uintptr_t(localPort))
+		handle = C.eidolon_listen_moqt(cHost, C.uint16_t(port), cSecret, C.size_t(len(secret)), C.uintptr_t(localPort), C.uintptr_t(datagramPort))
 	} else {
 		handle = C.eidolon_listen_quic(cHost, C.uint16_t(port), cSecret, C.size_t(len(secret)), C.uintptr_t(localPort))
 	}
 	if handle == nil {
 		localListener.Close()
+		if datagramListener != nil {
+			datagramListener.Close()
+		}
 		return errors.New("failed to start native listener in C++")
 	}
 	registerActiveHandle(handle)
@@ -403,6 +513,9 @@ func listenNative(ctx context.Context, host string, port int, secret []byte, onA
 		<-ctx.Done()
 		safeCloseHandle(handle)
 		localListener.Close()
+		if datagramListener != nil {
+			datagramListener.Close()
+		}
 	}()
 
 	return nil
@@ -450,11 +563,15 @@ func (c *NativeStackConn) Close() error {
 	h := c.handle
 	c.handle = nil
 	c.closed = true
+	dc := c.datagramConn
 	c.closeMu.Unlock()
 
 	var err error
 	if c.dataConn != nil {
 		err = c.dataConn.Close()
+	}
+	if dc != nil {
+		dc.Close() // разблокирует ReadDatagram демукс-горутины
 	}
 	if h != nil {
 		safeCloseHandle(h)

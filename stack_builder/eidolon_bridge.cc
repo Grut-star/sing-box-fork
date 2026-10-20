@@ -282,15 +282,32 @@ struct EidolonSession {
     std::unique_ptr<moqt::SubscribeVisitor> moqt_sub_visitor_;             // нисходящий потребитель -> FD
     bool moqt_upstream_paused_ = false;                                    // backpressure FD-ридера
 
+    // --- MoQT datagram-lane (Фаза 4): ненадёжный путь (проксируемый UDP) ---
+    // Отдельный трек датаграм-объектов (subgroup=nullopt => WT/QUIC-датаграммы) и
+    // отдельный FD к Go (datagram_fd_), кадрированный [len:2 BE][payload] (STREAM +
+    // length-framing; те же ключи/кодек датаграмм — в Go). Fire-and-forget: потеря
+    // при переполнении/без подписчика допустима (семантика UDP). Эти члены сбрасываются
+    // в Close() ПОСЛЕ moqt_session_.reset() (сессия держит на них сырые указатели).
+    uintptr_t datagram_fd_ = 0;
+    std::shared_ptr<moqt::MoqtTrackPublisher> moqt_dgram_pub_;    // наш датаграм-продюсер (владение)
+    raw_ptr<class EidolonDatagramPublisher> moqt_dgram_pub_raw_ = nullptr;
+    std::unique_ptr<moqt::SubscribeVisitor> moqt_dgram_sub_visitor_;
+    std::vector<std::string> pending_dgram_writes_;              // кадры [len:2][payload] в Go-FD
+    std::string dgram_read_buf_;                                 // недособранный кадр со стороны Go
+
     // Инструменты асинхронного I/O
     scoped_refptr<net::IOBufferWithSize> read_buf_;
 
 #if BUILDFLAG(IS_POSIX)
     std::unique_ptr<base::FileDescriptorWatcher::Controller> fd_read_controller_;
     std::unique_ptr<base::FileDescriptorWatcher::Controller> fd_write_controller_;
+    std::unique_ptr<base::FileDescriptorWatcher::Controller> dgram_read_controller_;
+    std::unique_ptr<base::FileDescriptorWatcher::Controller> dgram_write_controller_;
 #elif BUILDFLAG(IS_WIN)
     HANDLE socket_event_ = INVALID_HANDLE_VALUE;
     base::win::ObjectWatcher socket_watcher_;
+    // Датаграм-lane (Фаза 4) реализован только для POSIX (Android/Linux — цели деплоя);
+    // на Windows-хосте датаграммы не поднимаются (datagram_fd_ остаётся 0).
 #endif
 
     bool socket_write_pending_ = false;
@@ -300,14 +317,23 @@ struct EidolonSession {
     // иначе QuicChromiumClientStream::OnBodyAvailable не отдаёт тело в ReadBody.
     quiche::HttpHeaderBlock quic_response_headers_;
 
-    EidolonSession(uintptr_t fd, bool quic) : data_fd_(fd), is_quic_(quic) {
-        // Переводим FD от Go в неблокирующий режим (Non-Blocking)
+    EidolonSession(uintptr_t fd, bool quic, uintptr_t datagram_fd = 0)
+            : data_fd_(fd), is_quic_(quic), datagram_fd_(datagram_fd) {
+        // Переводим FD(ы) от Go в неблокирующий режим (Non-Blocking)
 #if BUILDFLAG(IS_POSIX)
         int flags = fcntl(static_cast<int>(data_fd_), F_GETFL, 0);
         fcntl(static_cast<int>(data_fd_), F_SETFL, flags | O_NONBLOCK);
+        if (datagram_fd_ != 0) {
+            int dflags = fcntl(static_cast<int>(datagram_fd_), F_GETFL, 0);
+            fcntl(static_cast<int>(datagram_fd_), F_SETFL, dflags | O_NONBLOCK);
+        }
 #elif BUILDFLAG(IS_WIN)
         u_long mode = 1;
         ioctlsocket(static_cast<SOCKET>(data_fd_), FIONBIO, &mode);
+        if (datagram_fd_ != 0) {
+            u_long dmode = 1;
+            ioctlsocket(static_cast<SOCKET>(datagram_fd_), FIONBIO, &dmode);
+        }
 #endif
 
         // Аллоцируем буфер 64 КБ (достаточно для QUIC Datagram / Jumbo Frames)
@@ -597,6 +623,63 @@ struct EidolonSession {
     void PublishUpstreamBytes(std::string_view data);  // тело после EidolonTrackPublisher
     void CloseUpstream();                              // тело после EidolonTrackPublisher
 
+    // --- MoQT datagram-lane (Фаза 4), всё на g_io_thread, только POSIX ---
+    // Запуск слежения за датаграм-FD от Go (кадры [len:2 BE][payload]).
+    void StartDatagramPump() {
+#if BUILDFLAG(IS_POSIX)
+        if (is_closed_ || datagram_fd_ == 0) return;
+        dgram_read_controller_ = base::FileDescriptorWatcher::WatchReadable(
+                static_cast<int>(datagram_fd_),
+                base::BindRepeating(&EidolonSession::OnDatagramFdReadable, base::Unretained(this)));
+#endif
+    }
+    // Go-FD -> датаграм-объекты трека. Тело out-of-line (нужен полный тип publisher'а).
+    void OnDatagramFdReadable();
+    // Входящая датаграмма (объект подписки) -> кадр [len:2][payload] в Go-FD.
+    void EnqueueDatagramWrite(absl::string_view datagram) {
+        if (is_closed_ || datagram_fd_ == 0 || datagram.empty()) return;
+        if (datagram.size() > 0xFFFF) return;  // не кадрируется 2 байтами -> дроп (UDP ок)
+        std::string frame;
+        frame.reserve(2 + datagram.size());
+        frame.push_back(static_cast<char>((datagram.size() >> 8) & 0xFF));
+        frame.push_back(static_cast<char>(datagram.size() & 0xFF));
+        frame.append(datagram.data(), datagram.size());
+        pending_dgram_writes_.push_back(std::move(frame));
+        TryWriteDatagramFd();
+    }
+    void TryWriteDatagramFd() {
+#if BUILDFLAG(IS_POSIX)
+        if (is_closed_ || datagram_fd_ == 0) return;
+        while (!pending_dgram_writes_.empty()) {
+            auto& chunk = pending_dgram_writes_.front();
+            ssize_t written = HANDLE_EINTR(write(static_cast<int>(datagram_fd_), chunk.data(), chunk.size()));
+            bool is_eagain = (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+            if (written > 0) {
+                if (static_cast<size_t>(written) == chunk.size()) {
+                    pending_dgram_writes_.erase(pending_dgram_writes_.begin());
+                } else {
+                    chunk = chunk.substr(written);
+                    break;  // ядро перегружено — ждём готовности FD
+                }
+            } else if (written < 0 && is_eagain) {
+                break;
+            } else {
+                Close();  // датаграм-FD мёртв (Go-сторона ушла) -> рвём сессию
+                return;
+            }
+        }
+        if (!pending_dgram_writes_.empty()) {
+            if (!dgram_write_controller_) {
+                dgram_write_controller_ = base::FileDescriptorWatcher::WatchWritable(
+                        static_cast<int>(datagram_fd_),
+                        base::BindRepeating(&EidolonSession::TryWriteDatagramFd, base::Unretained(this)));
+            }
+        } else {
+            dgram_write_controller_.reset();
+        }
+#endif
+    }
+
     void Close() {
         if (is_closed_) return;
         is_closed_ = true;
@@ -605,9 +688,15 @@ struct EidolonSession {
 #if BUILDFLAG(IS_POSIX)
         fd_read_controller_.reset();
         fd_write_controller_.reset();
+        dgram_read_controller_.reset();
+        dgram_write_controller_.reset();
         if (data_fd_ != 0) {
             close(static_cast<int>(data_fd_));
             data_fd_ = 0;
+        }
+        if (datagram_fd_ != 0) {
+            close(static_cast<int>(datagram_fd_));
+            datagram_fd_ = 0;
         }
 #elif BUILDFLAG(IS_WIN)
         socket_watcher_.StopWatching();
@@ -626,9 +715,12 @@ struct EidolonSession {
         moqt_session_.reset();
         // Data-plane после сессии: сессия держала на них сырые указатели.
         moqt_sub_visitor_.reset();
+        moqt_dgram_sub_visitor_.reset();
         moqt_known_publisher_.reset();
         moqt_local_pub_raw_ = nullptr;
         moqt_local_pub_.reset();
+        moqt_dgram_pub_raw_ = nullptr;
+        moqt_dgram_pub_.reset();
         wt_client_.reset();
         wt_visitor_.reset();
 
@@ -832,6 +924,122 @@ private:
     raw_ptr<EidolonSession> sess_;
 };
 
+// -------------------------------------------------------------------------
+// MoQT datagram-lane (Фаза 4): fire-and-forget паблишер + подписчик датаграмм
+// -------------------------------------------------------------------------
+// EidolonDatagramPublisher: каждый AddDatagram -> один MoQT datagram-object
+// (md.subgroup=nullopt => LivePublisher::SendDatagram => WT/QUIC-датаграмма).
+// В отличие от надёжного трека НЕ копим окно: SendDatagram синхронен из
+// OnNewObjectAvailable (дёргает GetCachedObject тут же), поэтому держим ровно
+// один «текущий» объект и сбрасываем после нотификации. Нет подписчика/
+// переполнение -> дроп (семантика UDP). Байты уже зашифрованы Go-кодеком.
+class EidolonDatagramPublisher : public moqt::MoqtTrackPublisher {
+public:
+    EidolonDatagramPublisher(moqt::FullTrackName track, const quic::QuicClock* clock)
+            : track_(std::move(track)), clock_(clock) {}
+
+    // --- Продюсер (g_io_thread) ---
+    void AddDatagram(std::string_view data) {
+        if (closed_ || data.empty() || listeners_.empty()) return;  // нет пути -> дроп
+        uint64_t id = next_object_id_++;
+        moqt::Location loc(0, id);
+        moqt::PublishedObjectMetadata md;
+        md.location = loc;
+        md.subgroup = std::nullopt;                 // <-- датаграмма
+        md.extensions = "";
+        md.status = moqt::MoqtObjectStatus::kNormal;
+        md.publisher_priority = moqt::kDefaultPublisherPriority;
+        md.first_object_in_subgroup = std::nullopt;  // для датаграмм недоступно
+        md.payload_length = data.size();
+        md.arrival_time = clock_->ApproximateNow();
+        current_ = std::make_shared<moqt::CachedObject>(
+                md, quiche::QuicheMemSlice::Copy(data), /*fin_after_this=*/false);
+        current_id_ = id;
+        // SendDatagram вызывается синхронно из OnNewObjectAvailable -> GetCachedObject
+        // вернёт current_ прямо сейчас. После — объект доставлен (one-shot).
+        for (moqt::MoqtObjectListener* l : listeners_) {
+            l->OnNewObjectAvailable(loc, /*subgroup=*/std::nullopt,
+                                    moqt::kDefaultPublisherPriority);
+        }
+        current_.reset();
+    }
+    void CloseStream() { closed_ = true; }
+
+    // --- MoqtTrackPublisher ---
+    const moqt::FullTrackName& GetTrackName() const override { return track_; }
+    std::optional<moqt::PublishedObject> GetCachedObject(
+            uint64_t group, std::optional<uint64_t> /*subgroup*/, uint64_t min_object,
+            uint64_t offset) const override {
+        if (group != 0 || !current_ || min_object > current_id_) return std::nullopt;
+        return current_->ToPublishedObject(offset);
+    }
+    void AddObjectListener(moqt::MoqtObjectListener* listener) override {
+        listeners_.insert(listener);
+        listener->OnSubscribeAccepted();
+        // Backlog НЕ реплеим: датаграммы fire-and-forget, прошлое не досылаем.
+    }
+    void RemoveObjectListener(moqt::MoqtObjectListener* listener) override {
+        listeners_.erase(listener);
+    }
+    std::optional<moqt::Location> largest_location() const override {
+        return std::nullopt;  // истории не держим
+    }
+    std::optional<quic::QuicTimeDelta> expiration() const override {
+        return quic::QuicTimeDelta::Zero();
+    }
+    const moqt::TrackExtensions& extensions() const override { return extensions_; }
+    std::unique_ptr<moqt::MoqtFetchTask> StandaloneFetch(
+            moqt::Location, moqt::Location, moqt::MoqtDeliveryOrder) override {
+        return std::make_unique<moqt::MoqtFailedFetch>(
+                absl::UnimplementedError("eidolon dgram: fetch unsupported"));
+    }
+    std::unique_ptr<moqt::MoqtFetchTask> RelativeFetch(uint64_t, moqt::MoqtDeliveryOrder) override {
+        return std::make_unique<moqt::MoqtFailedFetch>(
+                absl::UnimplementedError("eidolon dgram: fetch unsupported"));
+    }
+    std::unique_ptr<moqt::MoqtFetchTask> AbsoluteFetch(uint64_t, moqt::MoqtDeliveryOrder) override {
+        return std::make_unique<moqt::MoqtFailedFetch>(
+                absl::UnimplementedError("eidolon dgram: fetch unsupported"));
+    }
+
+private:
+    moqt::FullTrackName track_;
+    raw_ptr<const quic::QuicClock> clock_;
+    moqt::TrackExtensions extensions_;
+    mutable std::shared_ptr<moqt::CachedObject> current_;  // «текущий» объект под SendDatagram
+    mutable uint64_t current_id_ = 0;
+    uint64_t next_object_id_ = 0;
+    bool closed_ = false;
+    absl::flat_hash_set<moqt::MoqtObjectListener*> listeners_;
+};
+
+// EidolonDatagramSubscribeVisitor: КАЖДЫЙ объект входящего датаграм-трека = одна
+// датаграмма (одна UDP-посылка). НЕ конкатенируем (в отличие от надёжного визитора).
+class EidolonDatagramSubscribeVisitor : public moqt::SubscribeVisitor {
+public:
+    explicit EidolonDatagramSubscribeVisitor(EidolonSession* sess) : sess_(sess) {}
+    void OnReply(const moqt::FullTrackName& ftn,
+                 std::variant<moqt::SubscribeOkData, moqt::MoqtRequestErrorInfo> response) override {
+        if (std::holds_alternative<moqt::MoqtRequestErrorInfo>(response)) {
+            LOG(ERROR) << "EIDOLON_DIAG: MoQT dgram subscribe REJECTED track=" << ftn.ToString();
+        } else {
+            LOG(INFO) << "EIDOLON_DIAG: MoQT dgram subscribe OK track=" << ftn.ToString();
+        }
+    }
+    void OnCanAckObjects(moqt::MoqtObjectAckFunction) override {}
+    void OnObjectFragment(const moqt::FullTrackName&, const moqt::PublishedObjectMetadata&,
+                          absl::string_view object, uint64_t /*offset*/) override {
+        LOG(INFO) << "EIDOLON_DIAG: dgram OnObjectFragment size=" << object.size();
+        sess_->EnqueueDatagramWrite(object);  // один объект -> один кадр в Go-FD
+    }
+    void OnPublishDone(moqt::FullTrackName) override {}
+    void OnMalformedTrack(const moqt::FullTrackName&) override {}
+    void OnStreamFin(const moqt::FullTrackName&, moqt::DataStreamIndex) override {}
+    void OnStreamReset(const moqt::FullTrackName&, moqt::DataStreamIndex) override {}
+private:
+    raw_ptr<EidolonSession> sess_;
+};
+
 // Out-of-line методы EidolonSession, которым нужен полный тип EidolonTrackPublisher.
 void EidolonSession::PublishUpstreamBytes(std::string_view data) {
     if (!moqt_local_pub_raw_) return;
@@ -846,6 +1054,34 @@ void EidolonSession::PublishUpstreamBytes(std::string_view data) {
 
 void EidolonSession::CloseUpstream() {
     if (moqt_local_pub_raw_) moqt_local_pub_raw_->CloseStream();
+}
+
+// Go датаграм-FD -> датаграм-объекты трека. Кадры [len:2 BE][payload]; один
+// кадр = одна датаграмма = один AddDatagram. Неполный хвост остаётся в буфере.
+void EidolonSession::OnDatagramFdReadable() {
+#if BUILDFLAG(IS_POSIX)
+    if (is_closed_ || datagram_fd_ == 0) return;
+    std::vector<uint8_t> temp(65536);
+    ssize_t n = HANDLE_EINTR(read(static_cast<int>(datagram_fd_), temp.data(), temp.size()));
+    bool is_eagain = (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    if (n > 0) {
+        dgram_read_buf_.append(reinterpret_cast<char*>(temp.data()), static_cast<size_t>(n));
+        size_t off = 0;
+        while (dgram_read_buf_.size() - off >= 2) {
+            size_t len = (static_cast<uint8_t>(dgram_read_buf_[off]) << 8) |
+                         static_cast<uint8_t>(dgram_read_buf_[off + 1]);
+            if (dgram_read_buf_.size() - off - 2 < len) break;  // полный payload ещё не пришёл
+            if (moqt_dgram_pub_raw_ && len > 0) {
+                moqt_dgram_pub_raw_->AddDatagram(
+                        std::string_view(dgram_read_buf_.data() + off + 2, len));
+            }
+            off += 2 + len;
+        }
+        if (off > 0) dgram_read_buf_.erase(0, off);
+    } else if (n == 0 || (n < 0 && !is_eagain)) {
+        Close();
+    }
+#endif
 }
 
 // -------------------------------------------------------------------------
@@ -1082,6 +1318,31 @@ public:
             sub_params.authorization_tokens.push_back(
                     moqt::AuthToken(moqt::AuthTokenType::kOutOfBand, tok_sv));
             sess->moqt_session_->Subscribe(down_track, sess->moqt_sub_visitor_.get(), sub_params);
+
+            // --- Фаза 4: датаграм-трек (ненадёжный путь, проксируемый UDP) ---
+            // Публикуем "ud" (вверх-датаграммы) + подписываемся на "dd" (вниз).
+            // Тот же namespace "eidolon" и тот же known_publisher. Включается только
+            // если Go передал датаграм-FD (datagram_fd_ != 0).
+            if (sess->datagram_fd_ != 0) {
+                moqt::FullTrackName up_dgram(ns, "ud");
+                moqt::FullTrackName down_dgram(ns, "dd");
+                auto dgram_pub = std::make_shared<EidolonDatagramPublisher>(
+                        up_dgram, quic::QuicChromiumClock::GetInstance());
+                sess->moqt_dgram_pub_raw_ = dgram_pub.get();
+                sess->moqt_dgram_pub_ = dgram_pub;
+                sess->moqt_known_publisher_->Add(dgram_pub);
+
+                sess->moqt_dgram_sub_visitor_ =
+                        std::make_unique<EidolonDatagramSubscribeVisitor>(sess);
+                moqt::MessageParameters dgram_sub_params((moqt::Location(0, 0)));  // AbsoluteStart
+                dgram_sub_params.set_forward(true);
+                dgram_sub_params.authorization_tokens.push_back(
+                        moqt::AuthToken(moqt::AuthTokenType::kOutOfBand, tok_sv));
+                sess->moqt_session_->Subscribe(down_dgram, sess->moqt_dgram_sub_visitor_.get(),
+                                               dgram_sub_params);
+                sess->StartDatagramPump();
+                LOG(INFO) << "EIDOLON_DIAG: datagram-lane up: publish 'ud' + subscribe 'dd'";
+            }
 
             // 3. Запускаем FD-насос (восходящее: FD -> объекты трека "u").
             sess->StartPump();
@@ -1939,6 +2200,167 @@ private:
     scoped_refptr<EidolonMoqtFlow> flow_;
 };
 
+// Серверный датаграм-мост (Фаза 4): "ud"-объекты -> датаграм cb_port TCP;
+// датаграм cb_port -> "dd"-объекты. В отличие от надёжного моста payload'ы
+// непрозрачны (уже зашифрованы Go-кодеком), преамбулу не парсим. На cb_port
+// первой уходит meta(80)=token‖key‖flowID(zeros) — Go поднимает серверный
+// DatagramCodec по key и валидирует token. Fire-and-forget: потерю допускаем.
+class EidolonMoqtDatagramFlow : public base::RefCountedThreadSafe<EidolonMoqtDatagramFlow> {
+public:
+    EidolonMoqtDatagramFlow(uint16_t cb_port, EidolonDatagramPublisher* down_pub,
+                            moqt::MoqtSession* session, std::string token)
+            : cb_port_(cb_port), down_pub_(down_pub), session_(session),
+              token_(std::move(token)),
+              read_buf_(base::MakeRefCounted<net::IOBufferWithSize>(65536)) {}
+
+    // [g_quic_thread] входящий датаграм-объект с "ud" -> кадр в cb_port TCP.
+    void OnUpstreamDatagram(std::string_view data) {
+        if (!cb_started_) {
+            cb_started_ = true;
+            std::string key = ExportKey();  // keying material несущей QUIC (как reliable)
+            g_io_thread->task_runner()->PostTask(
+                    FROM_HERE, base::BindOnce(&EidolonMoqtDatagramFlow::ConnectCbPort,
+                                              base::RetainedRef(this), key));
+        }
+        std::string frame;
+        frame.reserve(2 + data.size());
+        frame.push_back(static_cast<char>((data.size() >> 8) & 0xFF));
+        frame.push_back(static_cast<char>(data.size() & 0xFF));
+        frame.append(data.data(), data.size());
+        g_io_thread->task_runner()->PostTask(
+                FROM_HERE, base::BindOnce(&EidolonMoqtDatagramFlow::WriteToCb,
+                                          base::RetainedRef(this), std::move(frame)));
+    }
+    // [g_quic_thread] сессия уходит.
+    void Detach() { down_pub_ = nullptr; session_ = nullptr; }
+
+private:
+    friend class base::RefCountedThreadSafe<EidolonMoqtDatagramFlow>;
+    ~EidolonMoqtDatagramFlow() {
+        if (tcp_socket_ && g_io_thread) {
+            g_io_thread->task_runner()->DeleteSoon(FROM_HERE, tcp_socket_.release());
+        }
+    }
+
+    // [g_quic_thread] keying material несущей WebTransport/QUIC-сессии.
+    std::string ExportKey() {
+        std::string out;
+        if (!session_ || !session_->session()) return out;
+        auto* wt = static_cast<quic::WebTransportHttp3*>(session_->session());
+        quic::QuicSpdySession* qs = wt->eidolon_quic_session();
+        const quic::QuicCryptoStream* cs = qs ? qs->GetCryptoStream() : nullptr;
+        if (cs) {
+            const_cast<quic::QuicCryptoStream*>(cs)->ExportKeyingMaterial(
+                    "eidolon-traffic-key", "", 32, &out);
+        }
+        return out;
+    }
+
+    // [g_io_thread]
+    void ConnectCbPort(std::string key) {
+        net::IPAddress ip;
+        (void)ip.AssignFromIPLiteral("127.0.0.1");
+        tcp_socket_ = std::make_unique<net::TCPClientSocket>(
+                net::AddressList(net::IPEndPoint(ip, cb_port_)), nullptr, nullptr, nullptr,
+                net::NetLogSource(), net::handles::kInvalidNetworkHandle);
+        // meta(80): token(32)‖key(32)‖flowID(16 нулей). Go валидирует token, строит
+        // серверный DatagramCodec(key); flowID датаграммам не нужен (per-flow id в кадре).
+        cb_write_buf_ = token_ + key + std::string(16, '\0');
+        int rv = tcp_socket_->Connect(
+                base::BindOnce(&EidolonMoqtDatagramFlow::OnCbConnect, base::RetainedRef(this)));
+        if (rv != net::ERR_IO_PENDING) OnCbConnect(rv);
+    }
+    void OnCbConnect(int rv) {
+        LOG(INFO) << "EIDOLON_DIAG: MoQT server dgram cb_port connect rv=" << rv;
+        if (rv != net::OK) { tcp_socket_.reset(); return; }
+        cb_connected_ = true;
+        TryFlushCb();
+        PumpCbToDownstream();
+    }
+    void WriteToCb(std::string frame) {
+        cb_write_buf_.append(frame);
+        TryFlushCb();
+    }
+    void TryFlushCb() {
+        if (!cb_connected_ || cb_write_pending_ || cb_write_buf_.empty() || !tcp_socket_) return;
+        cb_write_pending_ = true;
+        auto io_buf = base::MakeRefCounted<net::StringIOBuffer>(cb_write_buf_);
+        int rv = tcp_socket_->Write(io_buf.get(), static_cast<int>(cb_write_buf_.size()),
+                base::BindOnce(&EidolonMoqtDatagramFlow::OnCbWriteComplete, base::RetainedRef(this)),
+                TRAFFIC_ANNOTATION_FOR_TESTS);
+        if (rv != net::ERR_IO_PENDING) OnCbWriteComplete(rv);
+    }
+    void OnCbWriteComplete(int rv) {
+        cb_write_pending_ = false;
+        if (rv <= 0) { tcp_socket_.reset(); return; }
+        cb_write_buf_.erase(0, static_cast<size_t>(rv));
+        TryFlushCb();
+    }
+    void PumpCbToDownstream() {
+        if (!tcp_socket_) return;
+        int rv = tcp_socket_->Read(read_buf_.get(), read_buf_->size(),
+                base::BindOnce(&EidolonMoqtDatagramFlow::OnCbRead, base::RetainedRef(this)));
+        if (rv != net::ERR_IO_PENDING) OnCbRead(rv);
+    }
+    void OnCbRead(int rv) {
+        if (rv <= 0) { tcp_socket_.reset(); return; }
+        cb_read_buf_.append(read_buf_->data(), static_cast<size_t>(rv));
+        // Парсим полные кадры [len:2 BE][payload] -> публикуем каждый как "dd"-объект.
+        size_t off = 0;
+        while (cb_read_buf_.size() - off >= 2) {
+            size_t len = (static_cast<uint8_t>(cb_read_buf_[off]) << 8) |
+                         static_cast<uint8_t>(cb_read_buf_[off + 1]);
+            if (cb_read_buf_.size() - off - 2 < len) break;
+            std::string payload = cb_read_buf_.substr(off + 2, len);
+            off += 2 + len;
+            if (len == 0) continue;
+            g_quic_thread->task_runner()->PostTask(
+                    FROM_HERE, base::BindOnce([](scoped_refptr<EidolonMoqtDatagramFlow> self,
+                                                 std::string d) {
+                        if (self->down_pub_) self->down_pub_->AddDatagram(d);
+                    }, base::RetainedRef(this), std::move(payload)));
+        }
+        if (off > 0) cb_read_buf_.erase(0, off);
+        WakeQuicLoop();
+        PumpCbToDownstream();  // датаграммы fire-and-forget: читаем дальше без backpressure
+    }
+
+    uint16_t cb_port_;
+    raw_ptr<EidolonDatagramPublisher> down_pub_;  // g_quic_thread
+    raw_ptr<moqt::MoqtSession> session_;           // g_quic_thread
+    std::string token_;
+    scoped_refptr<net::IOBufferWithSize> read_buf_;
+    bool cb_started_ = false;                      // g_quic_thread
+    std::string cb_read_buf_;                      // g_io_thread (недособранный кадр)
+    std::unique_ptr<net::StreamSocket> tcp_socket_;  // g_io_thread
+    bool cb_connected_ = false;                    // g_io_thread
+    bool cb_write_pending_ = false;                // g_io_thread
+    std::string cb_write_buf_;                     // g_io_thread
+};
+
+// Подписчик входящего датаграм-трека "ud" на сервере -> датаграм-мост.
+class EidolonMoqtDatagramUpstreamVisitor : public moqt::SubscribeVisitor {
+public:
+    explicit EidolonMoqtDatagramUpstreamVisitor(scoped_refptr<EidolonMoqtDatagramFlow> flow)
+            : flow_(std::move(flow)) {}
+    void OnReply(const moqt::FullTrackName& ftn,
+                 std::variant<moqt::SubscribeOkData, moqt::MoqtRequestErrorInfo> r) override {
+        LOG(INFO) << "EIDOLON_DIAG: MoQT server subscribe(ud) reply ok="
+                  << std::holds_alternative<moqt::SubscribeOkData>(r) << " track=" << ftn.ToString();
+    }
+    void OnCanAckObjects(moqt::MoqtObjectAckFunction) override {}
+    void OnObjectFragment(const moqt::FullTrackName&, const moqt::PublishedObjectMetadata&,
+                          absl::string_view object, uint64_t) override {
+        flow_->OnUpstreamDatagram(object);  // один объект = одна датаграмма
+    }
+    void OnPublishDone(moqt::FullTrackName) override {}
+    void OnMalformedTrack(const moqt::FullTrackName&) override {}
+    void OnStreamFin(const moqt::FullTrackName&, moqt::DataStreamIndex) override {}
+    void OnStreamReset(const moqt::FullTrackName&, moqt::DataStreamIndex) override {}
+private:
+    scoped_refptr<EidolonMoqtDatagramFlow> flow_;
+};
+
 // Всё состояние одной MoQT-сессии; живёт, пока жива MoqtSession (держим в
 // session_deleted_callback). Сессия ссылается на publisher/visitor сырыми указателями.
 struct EidolonMoqtPeer {
@@ -1948,22 +2370,40 @@ struct EidolonMoqtPeer {
     std::unique_ptr<moqt::SubscribeVisitor> up_visitor;       // "u" (клиент->сервер)
     scoped_refptr<EidolonMoqtFlow> flow;
     bool subscribed_up = false;
+
+    // --- Фаза 4: датаграм-lane ---
+    uint16_t dgram_cb_port = 0;
+    std::shared_ptr<EidolonDatagramPublisher> down_dgram_pub;      // "dd" (сервер->клиент)
+    std::unique_ptr<moqt::SubscribeVisitor> dgram_up_visitor;      // "ud" (клиент->сервер)
+    scoped_refptr<EidolonMoqtDatagramFlow> dgram_flow;
+    bool subscribed_up_dgram = false;
 };
 
 // Конфигурируем только что созданную серверную MoqtSession (вызывается из handler_factory;
 // session() трогать здесь НЕЛЬЗЯ — он ещё не готов, только сохраняем).
-static void ConfigureEidolonMoqtSession(moqt::MoqtSession* session, uint16_t cb_port) {
+static void ConfigureEidolonMoqtSession(moqt::MoqtSession* session, uint16_t cb_port,
+                                        uint16_t dgram_cb_port) {
     auto peer = std::make_shared<EidolonMoqtPeer>();
     peer->cb_port = cb_port;
+    peer->dgram_cb_port = dgram_cb_port;
 
     moqt::TrackNamespace ns({"eidolon"});
     moqt::FullTrackName up_track(ns, "u");
     moqt::FullTrackName down_track(ns, "d");
+    moqt::FullTrackName up_dgram(ns, "ud");
+    moqt::FullTrackName down_dgram(ns, "dd");
 
     peer->down_pub = std::make_shared<EidolonTrackPublisher>(
             down_track, quic::QuicDefaultClock::Get());
     peer->known_publisher = std::make_unique<moqt::MoqtKnownTrackPublisher>();
     peer->known_publisher->Add(peer->down_pub);
+
+    // Фаза 4: датаграм-паблишер "dd" в тот же known_publisher (если lane включён).
+    if (dgram_cb_port != 0) {
+        peer->down_dgram_pub = std::make_shared<EidolonDatagramPublisher>(
+                down_dgram, quic::QuicDefaultClock::Get());
+        peer->known_publisher->Add(peer->down_dgram_pub);
+    }
     session->set_publisher(peer->known_publisher.get());
 
     peer->flow = base::MakeRefCounted<EidolonMoqtFlow>(cb_port, peer->down_pub.get(), session);
@@ -1972,23 +2412,45 @@ static void ConfigureEidolonMoqtSession(moqt::MoqtSession* session, uint16_t cb_
     peer->down_pub->SetOnResumable([f = peer->flow.get()] { f->ResumeDownstream(); });
 
     EidolonMoqtPeer* peer_raw = peer.get();
-    // Клиент анонсирует namespace -> принимаем и подписываемся на "u".
+    // Клиент анонсирует namespace -> принимаем и подписываемся на "u" (+ "ud").
     session->callbacks().incoming_publish_namespace_callback =
-            [session, peer_raw, up_track](const moqt::TrackNamespace& /*tns*/,
-                                          const moqt::MessageParameters* params,
-                                          moqt::MoqtResponseCallback cb) {
+            [session, peer_raw, up_track, up_dgram](const moqt::TrackNamespace& /*tns*/,
+                                                    const moqt::MessageParameters* params,
+                                                    moqt::MoqtResponseCallback cb) {
                 if (cb) std::move(cb)(moqt::MessageParameters{});  // accept
-                if (params == nullptr || peer_raw->subscribed_up) return;  // DONE или дубль
-                peer_raw->subscribed_up = true;
-                moqt::MessageParameters sub((moqt::Location(0, 0)));  // AbsoluteStart
-                sub.set_forward(true);
-                session->Subscribe(up_track, peer_raw->up_visitor.get(), sub);
-                LOG(INFO) << "EIDOLON_DIAG: MoQT server accepted namespace, subscribed(u)";
+                if (params == nullptr) return;                     // DONE
+                if (!peer_raw->subscribed_up) {
+                    peer_raw->subscribed_up = true;
+                    moqt::MessageParameters sub((moqt::Location(0, 0)));  // AbsoluteStart
+                    sub.set_forward(true);
+                    session->Subscribe(up_track, peer_raw->up_visitor.get(), sub);
+                    LOG(INFO) << "EIDOLON_DIAG: MoQT server accepted namespace, subscribed(u)";
+                }
+                // Датаграм-lane: токен берём из namespace-params (клиент кладёт его в
+                // PublishNamespace); он уходит в meta датаграм cb_port для валидации в Go.
+                if (peer_raw->dgram_cb_port != 0 && peer_raw->down_dgram_pub &&
+                    !peer_raw->subscribed_up_dgram) {
+                    peer_raw->subscribed_up_dgram = true;
+                    std::string token;
+                    if (!params->authorization_tokens.empty() &&
+                        params->authorization_tokens[0].value.has_value()) {
+                        token = *params->authorization_tokens[0].value;
+                    }
+                    peer_raw->dgram_flow = base::MakeRefCounted<EidolonMoqtDatagramFlow>(
+                            peer_raw->dgram_cb_port, peer_raw->down_dgram_pub.get(), session, token);
+                    peer_raw->dgram_up_visitor =
+                            std::make_unique<EidolonMoqtDatagramUpstreamVisitor>(peer_raw->dgram_flow);
+                    moqt::MessageParameters dsub((moqt::Location(0, 0)));
+                    dsub.set_forward(true);
+                    session->Subscribe(up_dgram, peer_raw->dgram_up_visitor.get(), dsub);
+                    LOG(INFO) << "EIDOLON_DIAG: MoQT server subscribed(ud) datagram-lane";
+                }
             };
 
-    // Держим peer живым до конца сессии; затем отвязываем мост.
+    // Держим peer живым до конца сессии; затем отвязываем мосты.
     session->callbacks().session_deleted_callback = [peer]() mutable {
         if (peer->flow) peer->flow->Detach();
+        if (peer->dgram_flow) peer->dgram_flow->Detach();
     };
 }
 
@@ -1996,15 +2458,17 @@ static void ConfigureEidolonMoqtSession(moqt::MoqtSession* session, uint16_t cb_
 // видящий quic/tools, собрал всё сам — без линковки tools/moqt_server.cc в moqt source_set).
 class EidolonMoqtListenHelper {
 public:
-    static void Start(const std::string& host, uint16_t port, uint16_t cb_port) {
-        auto* self = new EidolonMoqtListenHelper(host, port, cb_port);
+    static void Start(const std::string& host, uint16_t port, uint16_t cb_port,
+                      uint16_t dgram_cb_port) {
+        auto* self = new EidolonMoqtListenHelper(host, port, cb_port, dgram_cb_port);
         g_quic_thread->task_runner()->PostTask(
                 FROM_HERE, base::BindOnce(&EidolonMoqtListenHelper::Run, base::Unretained(self)));
     }
 
 private:
-    EidolonMoqtListenHelper(const std::string& host, uint16_t port, uint16_t cb_port)
-            : host_(host), port_(port), cb_port_(cb_port),
+    EidolonMoqtListenHelper(const std::string& host, uint16_t port, uint16_t cb_port,
+                            uint16_t dgram_cb_port)
+            : host_(host), port_(port), cb_port_(cb_port), dgram_cb_port_(dgram_cb_port),
               config_(moqt::GenerateQuicConfig()) {}  // QuicConfig не копируется присваиванием
 
     void Run() {
@@ -2036,15 +2500,16 @@ private:
                 *conn_id_gen_);
 
         uint16_t cb_port = cb_port_;
+        uint16_t dgram_cb_port = dgram_cb_port_;
         quic::QuicEventLoop* loop = event_loop_.get();
         dispatcher_->parameters().handler_factory =
-                [cb_port, loop](webtransport::Session* session,
+                [cb_port, dgram_cb_port, loop](webtransport::Session* session,
                                 const quic::WebTransportIncomingRequestDetails& /*details*/)
                         -> absl::StatusOr<quic::WebTransportConnectResponse> {
                     auto moqt_session = std::make_unique<moqt::MoqtSession>(
                             session, moqt::MoqtSessionParameters(quic::Perspective::IS_SERVER),
                             loop->CreateAlarmFactory());
-                    ConfigureEidolonMoqtSession(moqt_session.get(), cb_port);
+                    ConfigureEidolonMoqtSession(moqt_session.get(), cb_port, dgram_cb_port);
                     quic::WebTransportConnectResponse response;
                     response.visitor = std::move(moqt_session);
                     return response;
@@ -2091,6 +2556,7 @@ private:
     std::string host_;
     uint16_t port_;
     uint16_t cb_port_;
+    uint16_t dgram_cb_port_;
     quic::QuicConfig config_;
     std::unique_ptr<quic::QuicCryptoServerConfig> crypto_config_;
     std::unique_ptr<quic::QuicVersionManager> version_manager_;
@@ -2374,13 +2840,14 @@ EIDOLON_EXPORT EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, 
 // Фаза 1: дозвон по MoQT (WebTransport-over-H3). Сигнатура как у dial_quic.
 // Data-plane (Go-FD <-> MoQT объекты/датаграммы) — Фаза 2; пока устанавливаем
 // только WebTransport + MoQT-сессию (control-plane) и валидируем линковку.
-EIDOLON_EXPORT EidolonHandle eidolon_dial_moqt(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd) {
+EIDOLON_EXPORT EidolonHandle eidolon_dial_moqt(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd, uintptr_t datagram_fd) {
     LOG(INFO) << "EIDOLON_DIAG: eidolon_dial_moqt ENTRY host=" << (host ? host : "(null)")
-              << " port=" << port << " token_len=" << token_len << " data_fd=" << data_fd;
+              << " port=" << port << " token_len=" << token_len << " data_fd=" << data_fd
+              << " datagram_fd=" << datagram_fd;
     EnsureChromiumIOThread();
     LOG(INFO) << "EIDOLON_DIAG: eidolon_dial_moqt io-thread ready (running="
               << (g_io_thread && g_io_thread->IsRunning()) << ")";
-    auto session = std::make_unique<EidolonSession>(data_fd, false);
+    auto session = std::make_unique<EidolonSession>(data_fd, false, datagram_fd);
     session->is_moqt_ = true;
     std::string target_host(host);
     std::string target_ip = target_host;
@@ -2511,17 +2978,18 @@ EIDOLON_EXPORT EidolonHandle eidolon_listen_quic(const char* host, uint16_t port
 // Серверный listen по MoQT (WebTransport-over-H3). Сигнатура как у eidolon_listen_quic.
 // secret сейчас не используется для ключей (sessionKey = TLS-экспортер несущей сессии);
 // токен авторитетно валидирует Go по 80-байтовой meta, как в QUIC-пути.
-EIDOLON_EXPORT EidolonHandle eidolon_listen_moqt(const char* host, uint16_t port, const uint8_t* secret, size_t secret_len, uintptr_t cb_port) {
+EIDOLON_EXPORT EidolonHandle eidolon_listen_moqt(const char* host, uint16_t port, const uint8_t* secret, size_t secret_len, uintptr_t cb_port, uintptr_t datagram_cb_port) {
 #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
     (void)secret; (void)secret_len;
     EnsureChromiumIOThread();
     auto session = std::make_unique<EidolonSession>(0, false);
     session->is_moqt_ = true;
     std::string target_host(host);
-    EidolonMoqtListenHelper::Start(target_host, port, static_cast<uint16_t>(cb_port));
+    EidolonMoqtListenHelper::Start(target_host, port, static_cast<uint16_t>(cb_port),
+                                   static_cast<uint16_t>(datagram_cb_port));
     return session.release();
 #else
-    (void)secret; (void)secret_len;
+    (void)secret; (void)secret_len; (void)datagram_cb_port;
     return nullptr;
 #endif
 }
