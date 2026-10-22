@@ -1413,9 +1413,11 @@ private:
 class MoQTDialHelper {
 public:
     static void Start(EidolonSession* sess, const std::string& ip, const std::string& sni,
-                      uint16_t port, const std::vector<uint8_t>& token, base::WaitableEvent* event) {
+                      uint16_t port, const std::vector<uint8_t>& token, base::WaitableEvent* event,
+                      net::handles::NetworkHandle network_handle) {
         LOG(INFO) << "EIDOLON_DIAG: MoQTDialHelper::Start ENTER ip=" << ip
                   << " sni=" << sni << " port=" << port
+                  << " network_handle=" << network_handle
                   << " on_io_thread=" << (base::SingleThreadTaskRunner::GetCurrentDefault() != nullptr);
         net::URLRequestContextBuilder builder;
         builder.DisableHttpCache();
@@ -1469,9 +1471,15 @@ public:
 
         sess->wt_visitor_ = std::make_unique<EidolonWtVisitor>(sess, token, event);
         LOG(INFO) << "EIDOLON_DIAG: Start step7 visitor created, calling CreateWebTransportClient";
+        // Android/VPN: привязываем несущий QUIC-сокет к underlying-сети
+        // (network_handle из Network.getNetworkHandle()). Без этого сокет
+        // маршрутизируется в собственный VpnService-TUN и дозвон падает с
+        // ERR_CONNECTION_REFUSED (TCP-линия защищена SetBeforeConnectCallback,
+        // а WebTransport/QUIC-сокет — нет). network_handle==0 -> поведение как
+        // прежде (kInvalidNetworkHandle, для не-Android/без VPN).
         sess->wt_client_ = net::CreateWebTransportClient(
                 url, origin, sess->wt_visitor_.get(), net::NetworkAnonymizationKey(),
-                net::handles::kInvalidNetworkHandle, sess->url_context.get(), params);
+                network_handle, sess->url_context.get(), params);
         LOG(INFO) << "EIDOLON_DIAG: Start step8 WebTransport client created ok=" << (sess->wt_client_ != nullptr);
         LOG(INFO) << "EIDOLON_DIAG: MoQT dialing " << ip << ":" << port << " sni=" << sni;
         // Connect асинхронный: event просигналит visitor из OnConnected/OnConnectionFailed.
@@ -2840,10 +2848,10 @@ EIDOLON_EXPORT EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, 
 // Фаза 1: дозвон по MoQT (WebTransport-over-H3). Сигнатура как у dial_quic.
 // Data-plane (Go-FD <-> MoQT объекты/датаграммы) — Фаза 2; пока устанавливаем
 // только WebTransport + MoQT-сессию (control-plane) и валидируем линковку.
-EIDOLON_EXPORT EidolonHandle eidolon_dial_moqt(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd, uintptr_t datagram_fd) {
+EIDOLON_EXPORT EidolonHandle eidolon_dial_moqt(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd, uintptr_t datagram_fd, int64_t network_handle) {
     LOG(INFO) << "EIDOLON_DIAG: eidolon_dial_moqt ENTRY host=" << (host ? host : "(null)")
               << " port=" << port << " token_len=" << token_len << " data_fd=" << data_fd
-              << " datagram_fd=" << datagram_fd;
+              << " datagram_fd=" << datagram_fd << " network_handle=" << network_handle;
     EnsureChromiumIOThread();
     LOG(INFO) << "EIDOLON_DIAG: eidolon_dial_moqt io-thread ready (running="
               << (g_io_thread && g_io_thread->IsRunning()) << ")";
@@ -2867,9 +2875,10 @@ EIDOLON_EXPORT EidolonHandle eidolon_dial_moqt(const char* host, uint16_t port, 
 
     LOG(INFO) << "EIDOLON_DIAG: eidolon_dial_moqt posting MoQTDialHelper::Start to io-thread";
     g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
-            EidolonSession* sess, std::string ip_str, std::string sni_str, uint16_t port_num, std::vector<uint8_t> tok, base::WaitableEvent* event) {
-        MoQTDialHelper::Start(sess, ip_str, sni_str, port_num, tok, event);
-    }, session.get(), target_ip, target_sni, port, token_vec, &connect_event));
+                                                                           EidolonSession* sess, std::string ip_str, std::string sni_str, uint16_t port_num, std::vector<uint8_t> tok, base::WaitableEvent* event, net::handles::NetworkHandle net_handle) {
+                                                                       MoQTDialHelper::Start(sess, ip_str, sni_str, port_num, tok, event, net_handle);
+                                                                   }, session.get(), target_ip, target_sni, port, token_vec, &connect_event,
+                                                                   static_cast<net::handles::NetworkHandle>(network_handle)));
 
     LOG(INFO) << "EIDOLON_DIAG: eidolon_dial_moqt waiting on connect_event";
     connect_event.Wait();

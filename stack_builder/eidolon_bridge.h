@@ -15,7 +15,7 @@ EIDOLON_EXPORT EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, c
 EIDOLON_EXPORT EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd);
 // Фаза 1 перехода на MoQ: дозвон по MoQT (WebTransport-over-H3).
 // datagram_fd (Фаза 4) — второй FD к Go под ненадёжный датаграм-lane (0 = выкл).
-EIDOLON_EXPORT EidolonHandle eidolon_dial_moqt(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd, uintptr_t datagram_fd);
+EIDOLON_EXPORT EidolonHandle eidolon_dial_moqt(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd, uintptr_t datagram_fd, int64_t network_handle);
 
 // Серверный listen (только Linux): QUIC и MoQT. Мост к локальному ядру на cb_port.
 EIDOLON_EXPORT EidolonHandle eidolon_listen_quic(const char* host, uint16_t port, const uint8_t* secret, size_t secret_len, uintptr_t cb_port);
