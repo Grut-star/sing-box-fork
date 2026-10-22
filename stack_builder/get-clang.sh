@@ -3,31 +3,42 @@ set -ex
 
 . ./get-sysroot.sh
 
-# fetch <url> <out> [validate-regex] [tries]
-# Надёжная загрузка с ретраями и бэкоффом. Важно:
-#   -f  — curl ПАДАЕТ на HTTP>=400 и НЕ пишет тело ошибки в файл. Без него ответ
-#         "429: Too Many Requests" от raw.githubusercontent.com сохранялся КАК
-#         сам файл (update.py/DEPS), и дальше python давился им с SyntaxError.
-#   ретраи+бэкофф — raw.githubusercontent.com под общими IP раннеров регулярно
-#         отдаёт 429; одного запроса (и даже ре-рана) мало.
-#   validate-regex — необязательная проверка содержимого (отсекает «успешные»
-#         200 с мусором/HTML); при непрохождении файл удаляется и попытка не
-#         засчитывается.
-# Возвращает !=0 после исчерпания попыток → при set -e скрипт падает (а не идёт
-# дальше с битым файлом).
-fetch() {
-  _url="$1"; _out="$2"; _pat="$3"; _tries="${4:-8}"; _i=1
-  while [ "$_i" -le "$_tries" ]; do
-    if curl -fsSL "$_url" -o "$_out" && [ -s "$_out" ] \
-       && { [ -z "$_pat" ] || grep -q "$_pat" "$_out"; }; then
-      return 0
+# fetch_src <repo-rel-path> <out> [validate-regex]
+# Качает файл из дерева chromium (напр. DEPS, tools/clang/scripts/update.py).
+#
+# ОСНОВНОЙ источник — gitiles-зеркало chromium.googlesource.com: raw.githubusercontent.com
+# для chromium регулярно отдаёт 429 (огромный репо, общий IP раннеров), причём
+# устойчиво — даже ре-раны и внутрискриптовые ретраи его не переживают. Gitiles
+# (?format=TEXT) отдаёт содержимое в base64 и 200, поэтому берём оттуда и декодим.
+# ФОЛБЭК — raw.githubusercontent (на случай проблем gitiles).
+#
+# Важно -f: curl ПАДАЕТ на HTTP>=400 и НЕ пишет тело ошибки в файл (без него ответ
+# "429: Too Many Requests" сохранялся КАК сам update.py/DEPS, и python давился им
+# с SyntaxError). validate-regex отсекает «успешный» 200 с мусором/HTML. Возвращает
+# !=0 после исчерпания попыток → при set -e скрипт падает, а не идёт с битым файлом.
+fetch_src() {
+  _path="$1"; _out="$2"; _pat="$3"
+  _gitiles="https://chromium.googlesource.com/chromium/src/+/refs/tags/${CHROMIUM_VERSION}/${_path}?format=TEXT"
+  _raw="https://raw.githubusercontent.com/chromium/chromium/${CHROMIUM_VERSION}/${_path}"
+  _i=1
+  while [ "$_i" -le 10 ]; do
+    # 1) gitiles (base64) — основной
+    if curl -fsSL "$_gitiles" 2>/dev/null | base64 -d > "$_out" 2>/dev/null \
+       && [ -s "$_out" ] && { [ -z "$_pat" ] || grep -q "$_pat" "$_out"; }; then
+      echo "fetch_src: $_path <- gitiles" >&2; return 0
     fi
     rm -f "$_out"
-    echo "fetch: attempt $_i/$_tries failed for $_url; retry in $((_i * 5))s..." >&2
-    sleep $((_i * 5))
+    # 2) raw.githubusercontent — фолбэк
+    if curl -fsSL "$_raw" -o "$_out" 2>/dev/null \
+       && [ -s "$_out" ] && { [ -z "$_pat" ] || grep -q "$_pat" "$_out"; }; then
+      echo "fetch_src: $_path <- raw.githubusercontent" >&2; return 0
+    fi
+    rm -f "$_out"
+    echo "fetch_src: attempt $_i/10 failed for $_path; retry in $((_i * 3))s..." >&2
+    sleep $((_i * 3))
     _i=$((_i + 1))
   done
-  echo "fetch: giving up on $_url after $_tries attempts" >&2
+  echo "fetch_src: giving up on $_path after 10 attempts" >&2
   return 1
 }
 
@@ -40,12 +51,11 @@ if [ "$OPENWRT_FLAGS" ]; then
 fi
 
 if [ ! -f DEPS ]; then
-  fetch "https://raw.githubusercontent.com/chromium/chromium/${CHROMIUM_VERSION}/DEPS" DEPS "vars"
+  fetch_src DEPS DEPS "vars"
 fi
 if [ ! -f tools/clang/scripts/update.py ]; then
   mkdir -p tools/clang/scripts
-  fetch "https://raw.githubusercontent.com/chromium/chromium/${CHROMIUM_VERSION}/tools/clang/scripts/update.py" \
-        tools/clang/scripts/update.py "def main"
+  fetch_src tools/clang/scripts/update.py tools/clang/scripts/update.py "def main"
 fi
 
 echo "Fetching Clang toolchain..."
