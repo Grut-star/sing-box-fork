@@ -764,7 +764,6 @@ public:
         moqt::PublishedObjectMetadata md;
         md.location = loc;
         md.subgroup = 0;
-        md.extensions = "";
         md.status = moqt::MoqtObjectStatus::kNormal;
         md.publisher_priority = moqt::kDefaultPublisherPriority;
         md.first_object_in_subgroup = (id == 0);
@@ -818,7 +817,8 @@ public:
         return it->second->ToPublishedObject(offset);
     }
 
-    void AddObjectListener(moqt::MoqtObjectListener* listener) override {
+    void AddObjectListener(moqt::MoqtObjectListener* listener,
+                           const moqt::MessageParameters& /*parameters*/) override {
         listeners_.insert(listener);
         LOG(INFO) << "EIDOLON_DIAG: TrackPublisher[" << track_.ToString()
                   << "] AddObjectListener -> listeners=" << listeners_.size()
@@ -857,6 +857,10 @@ public:
     void RemoveObjectListener(moqt::MoqtObjectListener* listener) override {
         listeners_.erase(listener);
     }
+    absl::Status UpdateObjectListener(moqt::MoqtObjectListener* /*listener*/,
+                                      const moqt::MessageParameters& /*parameters*/) override {
+        return absl::OkStatus();
+    }
     std::optional<moqt::Location> largest_location() const override {
         if (window_.empty()) return std::nullopt;
         return moqt::Location(0, window_.rbegin()->first);
@@ -864,26 +868,41 @@ public:
     std::optional<quic::QuicTimeDelta> expiration() const override {
         return quic::QuicTimeDelta::Zero();
     }
-    const moqt::TrackExtensions& extensions() const override { return extensions_; }
+    // chromium-156 MoQT API: extensions()/TrackExtensions -> properties()/TrackProperties;
+    // у трека нет key-value свойств, отдаём пустой TrackProperties.
+    const moqt::TrackProperties& properties() const override { return properties_; }
+    // Fetch (RFC объекты по запросу) туннелю не нужен: control-plane у нас —
+    // live publish/subscribe. В 156 сигнатуры получили FetchResponseCallback, а
+    // MoqtFailedFetch удалён — сообщаем kNotSupported через callback и отдаём nullptr
+    // (как MoqtOutgoingQueue для неподдерживаемого Fetch).
     std::unique_ptr<moqt::MoqtFetchTask> StandaloneFetch(
-            moqt::Location, moqt::Location, moqt::MoqtDeliveryOrder) override {
-        return std::make_unique<moqt::MoqtFailedFetch>(
-                absl::UnimplementedError("eidolon tunnel: fetch unsupported"));
+            moqt::Location, moqt::Location, moqt::MoqtDeliveryOrder,
+            moqt::FetchResponseCallback callback) override {
+        std::move(callback)(moqt::MoqtRequestErrorInfo(
+                moqt::RequestErrorCode::kNotSupported, std::nullopt,
+                "eidolon tunnel: fetch unsupported"));
+        return nullptr;
     }
-    std::unique_ptr<moqt::MoqtFetchTask> RelativeFetch(uint64_t, moqt::MoqtDeliveryOrder) override {
-        return std::make_unique<moqt::MoqtFailedFetch>(
-                absl::UnimplementedError("eidolon tunnel: fetch unsupported"));
+    std::unique_ptr<moqt::MoqtFetchTask> RelativeFetch(
+            uint64_t, moqt::MoqtDeliveryOrder, moqt::FetchResponseCallback callback) override {
+        std::move(callback)(moqt::MoqtRequestErrorInfo(
+                moqt::RequestErrorCode::kNotSupported, std::nullopt,
+                "eidolon tunnel: fetch unsupported"));
+        return nullptr;
     }
-    std::unique_ptr<moqt::MoqtFetchTask> AbsoluteFetch(uint64_t, moqt::MoqtDeliveryOrder) override {
-        return std::make_unique<moqt::MoqtFailedFetch>(
-                absl::UnimplementedError("eidolon tunnel: fetch unsupported"));
+    std::unique_ptr<moqt::MoqtFetchTask> AbsoluteFetch(
+            uint64_t, moqt::MoqtDeliveryOrder, moqt::FetchResponseCallback callback) override {
+        std::move(callback)(moqt::MoqtRequestErrorInfo(
+                moqt::RequestErrorCode::kNotSupported, std::nullopt,
+                "eidolon tunnel: fetch unsupported"));
+        return nullptr;
     }
 
 private:
     moqt::FullTrackName track_;
     raw_ptr<const quic::QuicClock> clock_;
     std::function<void()> on_resumable_;
-    moqt::TrackExtensions extensions_;
+    moqt::TrackProperties properties_;
     mutable std::map<uint64_t, std::shared_ptr<moqt::CachedObject>> window_;
     uint64_t next_object_id_ = 0;
     mutable uint64_t bytes_in_window_ = 0;
@@ -946,7 +965,6 @@ public:
         moqt::PublishedObjectMetadata md;
         md.location = loc;
         md.subgroup = std::nullopt;                 // <-- датаграмма
-        md.extensions = "";
         md.status = moqt::MoqtObjectStatus::kNormal;
         md.publisher_priority = moqt::kDefaultPublisherPriority;
         md.first_object_in_subgroup = std::nullopt;  // для датаграмм недоступно
@@ -973,7 +991,8 @@ public:
         if (group != 0 || !current_ || min_object > current_id_) return std::nullopt;
         return current_->ToPublishedObject(offset);
     }
-    void AddObjectListener(moqt::MoqtObjectListener* listener) override {
+    void AddObjectListener(moqt::MoqtObjectListener* listener,
+                           const moqt::MessageParameters& /*parameters*/) override {
         listeners_.insert(listener);
         listener->OnSubscribeAccepted();
         // Backlog НЕ реплеим: датаграммы fire-and-forget, прошлое не досылаем.
@@ -981,31 +1000,47 @@ public:
     void RemoveObjectListener(moqt::MoqtObjectListener* listener) override {
         listeners_.erase(listener);
     }
+    absl::Status UpdateObjectListener(moqt::MoqtObjectListener* /*listener*/,
+                                      const moqt::MessageParameters& /*parameters*/) override {
+        return absl::OkStatus();
+    }
     std::optional<moqt::Location> largest_location() const override {
         return std::nullopt;  // истории не держим
     }
     std::optional<quic::QuicTimeDelta> expiration() const override {
         return quic::QuicTimeDelta::Zero();
     }
-    const moqt::TrackExtensions& extensions() const override { return extensions_; }
+    // chromium-156: extensions()/TrackExtensions -> properties()/TrackProperties.
+    const moqt::TrackProperties& properties() const override { return properties_; }
+    // Fetch датаграм-треку не нужен (fire-and-forget). В 156 +FetchResponseCallback,
+    // MoqtFailedFetch удалён -> kNotSupported через callback + nullptr.
     std::unique_ptr<moqt::MoqtFetchTask> StandaloneFetch(
-            moqt::Location, moqt::Location, moqt::MoqtDeliveryOrder) override {
-        return std::make_unique<moqt::MoqtFailedFetch>(
-                absl::UnimplementedError("eidolon dgram: fetch unsupported"));
+            moqt::Location, moqt::Location, moqt::MoqtDeliveryOrder,
+            moqt::FetchResponseCallback callback) override {
+        std::move(callback)(moqt::MoqtRequestErrorInfo(
+                moqt::RequestErrorCode::kNotSupported, std::nullopt,
+                "eidolon dgram: fetch unsupported"));
+        return nullptr;
     }
-    std::unique_ptr<moqt::MoqtFetchTask> RelativeFetch(uint64_t, moqt::MoqtDeliveryOrder) override {
-        return std::make_unique<moqt::MoqtFailedFetch>(
-                absl::UnimplementedError("eidolon dgram: fetch unsupported"));
+    std::unique_ptr<moqt::MoqtFetchTask> RelativeFetch(
+            uint64_t, moqt::MoqtDeliveryOrder, moqt::FetchResponseCallback callback) override {
+        std::move(callback)(moqt::MoqtRequestErrorInfo(
+                moqt::RequestErrorCode::kNotSupported, std::nullopt,
+                "eidolon dgram: fetch unsupported"));
+        return nullptr;
     }
-    std::unique_ptr<moqt::MoqtFetchTask> AbsoluteFetch(uint64_t, moqt::MoqtDeliveryOrder) override {
-        return std::make_unique<moqt::MoqtFailedFetch>(
-                absl::UnimplementedError("eidolon dgram: fetch unsupported"));
+    std::unique_ptr<moqt::MoqtFetchTask> AbsoluteFetch(
+            uint64_t, moqt::MoqtDeliveryOrder, moqt::FetchResponseCallback callback) override {
+        std::move(callback)(moqt::MoqtRequestErrorInfo(
+                moqt::RequestErrorCode::kNotSupported, std::nullopt,
+                "eidolon dgram: fetch unsupported"));
+        return nullptr;
     }
 
 private:
     moqt::FullTrackName track_;
     raw_ptr<const quic::QuicClock> clock_;
-    moqt::TrackExtensions extensions_;
+    moqt::TrackProperties properties_;
     mutable std::shared_ptr<moqt::CachedObject> current_;  // «текущий» объект под SendDatagram
     mutable uint64_t current_id_ = 0;
     uint64_t next_object_id_ = 0;
