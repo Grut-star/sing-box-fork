@@ -96,6 +96,11 @@ typedef SSIZE_T ssize_t;
 #include "net/quic/address_utils.h"
 #include "net/socket/datagram_client_socket.h"
 #include "net/socket/client_socket_factory.h"
+#include "net/socket/udp_client_socket.h"
+#include "net/socket/socket_descriptor.h"
+#include "net/base/address_family.h"
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include "net/http/http_network_session.h"
 #include "quiche/quic/core/quic_path_validator.h"
 #include "net/quic/quic_chromium_alarm_factory.h"
@@ -174,6 +179,55 @@ static void EidolonProtectFd(int fd) {
         LOG(INFO) << "EIDOLON_DIAG: socket protected fd=" << fd;
     }
 }
+
+// EidolonProtectingSocketFactory — кастомная ClientSocketFactory, защищающая UDP-сокеты
+// несущей QUIC/WebTransport от собственного VpnService-TUN тем же механизмом, что и
+// TCP-линия: VpnService.protect(fd) через g_protect_func.
+//
+// Почему не bind-к-NetworkHandle: Chromium умеет привязать QUIC-сокет к underlying-сети
+// (CreateWebTransportClient(network_handle)), но на Android это идёт через
+// net::android::BindToNetwork -> dlsym("android_setsocknetwork"), который в нашей среде
+// (redroid) не резолвится -> ERR_NOT_IMPLEMENTED, и дозвон падает. protect(fd) работает
+// везде (им же живёт рабочая TCP-линия).
+//
+// Создаём UDP-fd сами, защищаем ДО connect и усыновляем в UDPClientSocket (сконструирован
+// с kInvalidNetworkHandle, чтобы он сам не пытался bind). TCP/SSL-фабрики делегируем дефолту.
+class EidolonProtectingSocketFactory : public net::ClientSocketFactory {
+public:
+    std::unique_ptr<net::DatagramClientSocket> CreateDatagramClientSocket(
+            net::DatagramSocket::BindType bind_type,
+            net::handles::NetworkHandle /*target_network*/,  // игнорируем: protect вместо bind
+            net::NetLog* net_log, const net::NetLogSource& source) override {
+        auto socket = std::make_unique<net::UDPClientSocket>(
+                bind_type, net_log, source, net::handles::kInvalidNetworkHandle);
+        // TODO(ipv6): серверы eidolon сейчас IPv4; при dual-stack определять семейство по dest.
+        net::SocketDescriptor fd = net::CreatePlatformSocket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (fd != net::kInvalidSocket) {
+            EidolonProtectFd(fd);
+            int rv = socket->AdoptOpenedSocket(net::ADDRESS_FAMILY_IPV4, fd);
+            if (rv != net::OK) {
+                LOG(ERROR) << "EIDOLON_DIAG: UDP AdoptOpenedSocket failed rv=" << rv;
+            }
+        } else {
+            LOG(ERROR) << "EIDOLON_DIAG: CreatePlatformSocket(UDP) failed";
+        }
+        return socket;
+    }
+    std::unique_ptr<net::TransportClientSocket> CreateTransportClientSocket(
+            const net::AddressList& addresses, net::handles::NetworkHandle target_network,
+            std::unique_ptr<net::SocketPerformanceWatcher> watcher,
+            net::NetworkQualityEstimator* nqe, net::NetLog* net_log,
+            const net::NetLogSource& source) override {
+        return net::ClientSocketFactory::GetDefaultFactory()->CreateTransportClientSocket(
+                addresses, target_network, std::move(watcher), nqe, net_log, source);
+    }
+    std::unique_ptr<net::SSLClientSocket> CreateSSLClientSocket(
+            net::SSLClientContext* context, std::unique_ptr<net::StreamSocket> stream_socket,
+            const net::HostPortPair& host_and_port, const net::SSLConfig& ssl_config) override {
+        return net::ClientSocketFactory::GetDefaultFactory()->CreateSSLClientSocket(
+                context, std::move(stream_socket), host_and_port, ssl_config);
+    }
+};
 
 class EidolonCertVerifier : public net::CertVerifier {
 public:
@@ -1475,6 +1529,15 @@ public:
         quic_context->params()->supported_versions = net::DefaultSupportedQuicVersions();
         builder.SetSpdyAndQuicEnabled(false, true);
         builder.set_quic_context(std::move(quic_context));
+        // Защищаем UDP-сокеты несущей от собственного VpnService-TUN через protect(fd)
+        // (bind-к-NetworkHandle в redroid = ERR_NOT_IMPLEMENTED). network_handle=0 — не
+        // Android / без VPN: фабрику не ставим, идём дефолтным путём.
+        if (network_handle != net::handles::kInvalidNetworkHandle) {
+            builder.set_client_socket_factory(
+                    std::make_unique<EidolonProtectingSocketFactory>());
+            LOG(INFO) << "EIDOLON_DIAG: installed protecting socket factory (network_handle="
+                      << network_handle << ")";
+        }
         LOG(INFO) << "EIDOLON_DIAG: Start step4 quic context set, calling builder.Build()";
         sess->url_context = builder.Build();
         LOG(INFO) << "EIDOLON_DIAG: Start step5 URLRequestContext built ok=" << (sess->url_context != nullptr);
@@ -1506,15 +1569,15 @@ public:
 
         sess->wt_visitor_ = std::make_unique<EidolonWtVisitor>(sess, token, event);
         LOG(INFO) << "EIDOLON_DIAG: Start step7 visitor created, calling CreateWebTransportClient";
-        // Android/VPN: привязываем несущий QUIC-сокет к underlying-сети
-        // (network_handle из Network.getNetworkHandle()). Без этого сокет
-        // маршрутизируется в собственный VpnService-TUN и дозвон падает с
-        // ERR_CONNECTION_REFUSED (TCP-линия защищена SetBeforeConnectCallback,
-        // а WebTransport/QUIC-сокет — нет). network_handle==0 -> поведение как
-        // прежде (kInvalidNetworkHandle, для не-Android/без VPN).
+        // Несущий QUIC-сокет защищаем от собственного VpnService-TUN через
+        // protect(fd) (EidolonProtectingSocketFactory, установлена выше по
+        // network_handle). Сюда передаём kInvalidNetworkHandle: bind-к-сети на
+        // Android идёт через android_setsocknetwork, которого в нашей среде нет
+        // (-> ERR_NOT_IMPLEMENTED). Без защиты сокет уходит в TUN и дозвон падает
+        // с ERR_CONNECTION_REFUSED (TCP-линия защищена SetBeforeConnectCallback).
         sess->wt_client_ = net::CreateWebTransportClient(
                 url, origin, sess->wt_visitor_.get(), net::NetworkAnonymizationKey(),
-                network_handle, sess->url_context.get(), params);
+                net::handles::kInvalidNetworkHandle, sess->url_context.get(), params);
         LOG(INFO) << "EIDOLON_DIAG: Start step8 WebTransport client created ok=" << (sess->wt_client_ != nullptr);
         LOG(INFO) << "EIDOLON_DIAG: MoQT dialing " << ip << ":" << port << " sni=" << sni;
         // Connect асинхронный: event просигналит visitor из OnConnected/OnConnectionFailed.
