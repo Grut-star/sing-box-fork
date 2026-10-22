@@ -296,21 +296,24 @@ const (
 
 // DialNativeTCP устанавливает TLS 1.3 соединение через стек Chromium.
 func DialNativeTCP(ctx context.Context, host string, port int, token []byte) (*NativeStackConn, error) {
-	return dialNative(ctx, host, port, token, transportTCP)
+	return dialNative(ctx, host, port, token, transportTCP, 0)
 }
 
 // DialNativeQUIC устанавливает HTTP/3 QUIC соединение через стек Chromium.
 func DialNativeQUIC(ctx context.Context, host string, port int, token []byte) (*NativeStackConn, error) {
-	return dialNative(ctx, host, port, token, transportQUIC)
+	return dialNative(ctx, host, port, token, transportQUIC, 0)
 }
 
-// DialNativeMoQT устанавливает MoQT (WebTransport-over-H3) соединение через стек Chromium.
-func DialNativeMoQT(ctx context.Context, host string, port int, token []byte) (*NativeStackConn, error) {
-	return dialNative(ctx, host, port, token, transportMoQT)
+// DialNativeMoQT устанавливает MoQT (WebTransport-over-H3) соединение через стек
+// Chromium. networkHandle — underlying Android-сеть (Network.getNetworkHandle()),
+// к которой привязывается несущий QUIC-сокет в обход VpnService-TUN; 0 = не
+// привязывать (не-Android/без активного VPN).
+func DialNativeMoQT(ctx context.Context, host string, port int, token []byte, networkHandle int64) (*NativeStackConn, error) {
+	return dialNative(ctx, host, port, token, transportMoQT, networkHandle)
 }
 
 // Главная фабрика соединений
-func dialNative(ctx context.Context, host string, port int, token []byte, transport nativeTransport) (*NativeStackConn, error) {
+func dialNative(ctx context.Context, host string, port int, token []byte, transport nativeTransport, networkHandle int64) (*NativeStackConn, error) {
 	// 1. Создаем платформозависимый канал связи (Socketpair для POSIX, Loopback TCP для Windows)
 	dataConn, cFdPtr, err := createNativePipe(transport != transportTCP)
 	if err != nil {
@@ -359,7 +362,7 @@ func dialNative(ctx context.Context, host string, port int, token []byte, transp
 		var handle C.EidolonHandle
 		switch transport {
 		case transportMoQT:
-			handle = C.eidolon_dial_moqt(cHost, C.uint16_t(port), cToken, C.size_t(len(safeToken)), cFd, cFd2)
+			handle = C.eidolon_dial_moqt(cHost, C.uint16_t(port), cToken, C.size_t(len(safeToken)), cFd, cFd2, C.int64_t(networkHandle))
 		case transportQUIC:
 			handle = C.eidolon_dial_quic(cHost, C.uint16_t(port), cToken, C.size_t(len(safeToken)), cFd)
 		default:

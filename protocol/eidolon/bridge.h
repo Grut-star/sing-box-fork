@@ -29,7 +29,9 @@ EIDOLON_EXPORT EidolonHandle eidolon_dial_tcp(const char* host, uint16_t port, c
 EIDOLON_EXPORT EidolonHandle eidolon_dial_quic(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd);
 // Фаза 2 перехода на MoQ: дозвон/listen по MoQT (WebTransport-over-H3).
 // datagram_fd (Фаза 4) — второй FD к Go под ненадёжный датаграм-lane (0 = выкл).
-EIDOLON_EXPORT EidolonHandle eidolon_dial_moqt(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd, uintptr_t datagram_fd);
+// network_handle — underlying Android-сеть (Network.getNetworkHandle()); несущий
+// QUIC-сокет привязывается к ней в обход VpnService-TUN (0 = kInvalidNetworkHandle).
+EIDOLON_EXPORT EidolonHandle eidolon_dial_moqt(const char* host, uint16_t port, const uint8_t* token, size_t token_len, uintptr_t data_fd, uintptr_t datagram_fd, int64_t network_handle);
 
 // Экспорт TLS-ключа (RFC 5705) для нашего внутреннего AEAD
 EIDOLON_EXPORT int eidolon_export_key(EidolonHandle handle, uint8_t* out_key, size_t key_len);
