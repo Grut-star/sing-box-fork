@@ -3,6 +3,34 @@ set -ex
 
 . ./get-sysroot.sh
 
+# fetch <url> <out> [validate-regex] [tries]
+# Надёжная загрузка с ретраями и бэкоффом. Важно:
+#   -f  — curl ПАДАЕТ на HTTP>=400 и НЕ пишет тело ошибки в файл. Без него ответ
+#         "429: Too Many Requests" от raw.githubusercontent.com сохранялся КАК
+#         сам файл (update.py/DEPS), и дальше python давился им с SyntaxError.
+#   ретраи+бэкофф — raw.githubusercontent.com под общими IP раннеров регулярно
+#         отдаёт 429; одного запроса (и даже ре-рана) мало.
+#   validate-regex — необязательная проверка содержимого (отсекает «успешные»
+#         200 с мусором/HTML); при непрохождении файл удаляется и попытка не
+#         засчитывается.
+# Возвращает !=0 после исчерпания попыток → при set -e скрипт падает (а не идёт
+# дальше с битым файлом).
+fetch() {
+  _url="$1"; _out="$2"; _pat="$3"; _tries="${4:-8}"; _i=1
+  while [ "$_i" -le "$_tries" ]; do
+    if curl -fsSL "$_url" -o "$_out" && [ -s "$_out" ] \
+       && { [ -z "$_pat" ] || grep -q "$_pat" "$_out"; }; then
+      return 0
+    fi
+    rm -f "$_out"
+    echo "fetch: attempt $_i/$_tries failed for $_url; retry in $((_i * 5))s..." >&2
+    sleep $((_i * 5))
+    _i=$((_i + 1))
+  done
+  echo "fetch: giving up on $_url after $_tries attempts" >&2
+  return 1
+}
+
 if [ "$SYSROOT_ARCH" -a ! -d ./"$WITH_SYSROOT/lib" ]; then
   ./build/linux/sysroot_scripts/sysroot_creator.py build "$SYSROOT_ARCH" || true
 fi
@@ -12,11 +40,12 @@ if [ "$OPENWRT_FLAGS" ]; then
 fi
 
 if [ ! -f DEPS ]; then
-  curl -s "https://raw.githubusercontent.com/chromium/chromium/${CHROMIUM_VERSION}/DEPS" -o DEPS
+  fetch "https://raw.githubusercontent.com/chromium/chromium/${CHROMIUM_VERSION}/DEPS" DEPS "vars"
 fi
 if [ ! -f tools/clang/scripts/update.py ]; then
   mkdir -p tools/clang/scripts
-  curl -s "https://raw.githubusercontent.com/chromium/chromium/${CHROMIUM_VERSION}/tools/clang/scripts/update.py" -o tools/clang/scripts/update.py
+  fetch "https://raw.githubusercontent.com/chromium/chromium/${CHROMIUM_VERSION}/tools/clang/scripts/update.py" \
+        tools/clang/scripts/update.py "def main"
 fi
 
 echo "Fetching Clang toolchain..."
