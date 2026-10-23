@@ -2142,28 +2142,41 @@ private:
 // down_pub_/session_ трогаем только на g_quic_thread; tcp_* — только на g_io_thread.
 class EidolonMoqtFlow : public base::RefCountedThreadSafe<EidolonMoqtFlow> {
 public:
-    EidolonMoqtFlow(uint16_t cb_port, EidolonTrackPublisher* down_pub, moqt::MoqtSession* session)
+    EidolonMoqtFlow(uint16_t cb_port, EidolonTrackPublisher* down_pub, moqt::MoqtSession* session,
+                    std::shared_ptr<std::string> dgram_token = nullptr)
             : cb_port_(cb_port), down_pub_(down_pub), session_(session),
+              dgram_token_(std::move(dgram_token)),
               read_buf_(base::MakeRefCounted<net::IOBufferWithSize>(65536)) {}
+
+    // [g_quic_thread] Колбэк после разбора преамбулы (dgram_token готов) -> ранний коннект
+    // датаграм-cb_port. Если преамбула уже разобрана к моменту установки — вызываем сразу.
+    void SetOnPreambleParsed(base::RepeatingClosure cb) {
+        on_preamble_parsed_ = std::move(cb);
+        if (preamble_done_ && on_preamble_parsed_) on_preamble_parsed_.Run();
+    }
 
     // [g_quic_thread] Байты восходящего трека "u".
     void OnUpstreamBytes(std::string_view data) {
         if (!preamble_done_) {
             buffer_.append(data);
-            if (buffer_.size() >= 50) {
-                uint16_t pad_len = (static_cast<uint8_t>(buffer_[48]) << 8) |
-                                   static_cast<uint8_t>(buffer_[49]);
-                if (buffer_.size() >= 50u + pad_len) {
+            // Преамбула Фазы 4: token(32)‖flowID(16)‖dgramToken(32)‖padLen(2)‖pad.
+            if (buffer_.size() >= 82) {
+                uint16_t pad_len = (static_cast<uint8_t>(buffer_[80]) << 8) |
+                                   static_cast<uint8_t>(buffer_[81]);
+                if (buffer_.size() >= 82u + pad_len) {
                     std::string token = buffer_.substr(0, 32);
                     std::string flow_id = buffer_.substr(32, 16);
+                    std::string dgram_token = buffer_.substr(48, 32);  // Фаза 4: токен датаграм-дорожки
                     std::string key = ExportKey();                 // sessionKey (TLS-экспортер)
-                    std::string rest = buffer_.substr(50 + pad_len);
+                    std::string rest = buffer_.substr(82 + pad_len);
+                    if (dgram_token_) *dgram_token_ = dgram_token;  // отдаём датаграм-flow'у (тот же peer)
                     preamble_done_ = true;
                     buffer_.clear();
                     LOG(INFO) << "EIDOLON_DIAG: MoQT server preamble ok -> cb_port=" << cb_port_;
                     g_io_thread->task_runner()->PostTask(
                             FROM_HERE, base::BindOnce(&EidolonMoqtFlow::ConnectTCP,
                                                       base::RetainedRef(this), token, key, flow_id, rest));
+                    if (on_preamble_parsed_) on_preamble_parsed_.Run();  // ранний коннект датаграм-cb_port
                 }
             }
             return;
@@ -2273,6 +2286,8 @@ private:
     uint16_t cb_port_;
     raw_ptr<EidolonTrackPublisher> down_pub_;  // g_quic_thread
     raw_ptr<moqt::MoqtSession> session_;        // g_quic_thread
+    std::shared_ptr<std::string> dgram_token_;  // peer->session_token: пишем из преамбулы (g_quic_thread)
+    base::RepeatingClosure on_preamble_parsed_; // g_quic_thread: триггер раннего коннекта датаграм-cb_port
     scoped_refptr<net::IOBufferWithSize> read_buf_;
     bool preamble_done_ = false;                // g_quic_thread
     bool downstream_paused_ = false;            // g_quic_thread (backpressure cb_port->"d")
@@ -2314,20 +2329,28 @@ private:
 class EidolonMoqtDatagramFlow : public base::RefCountedThreadSafe<EidolonMoqtDatagramFlow> {
 public:
     EidolonMoqtDatagramFlow(uint16_t cb_port, EidolonDatagramPublisher* down_pub,
-                            moqt::MoqtSession* session, std::string token)
+                            moqt::MoqtSession* session, std::shared_ptr<std::string> dgram_token)
             : cb_port_(cb_port), down_pub_(down_pub), session_(session),
-              token_(std::move(token)),
+              dgram_token_(std::move(dgram_token)),
               read_buf_(base::MakeRefCounted<net::IOBufferWithSize>(65536)) {}
+
+    // [g_quic_thread] Ранний коннект датаграм-cb_port: вызывается reliable-flow'ом сразу
+    // после разбора преамбулы (dgram_token_ готов и СВЕЖ — в окне валидности токена ~15с).
+    // Коннект при setup, а не лениво на первой датаграмме (та может прийти через минуты).
+    void StartCbPortEager() {
+        if (cb_started_) return;
+        if (!dgram_token_ || dgram_token_->empty()) return;  // преамбула ещё не разобрана
+        cb_started_ = true;
+        std::string tok = *dgram_token_;  // g_quic_thread — без гонок с reliable-flow
+        std::string key = ExportKey();
+        g_io_thread->task_runner()->PostTask(
+                FROM_HERE, base::BindOnce(&EidolonMoqtDatagramFlow::ConnectCbPort,
+                                          base::RetainedRef(this), tok, key));
+    }
 
     // [g_quic_thread] входящий датаграм-объект с "ud" -> кадр в cb_port TCP.
     void OnUpstreamDatagram(std::string_view data) {
-        if (!cb_started_) {
-            cb_started_ = true;
-            std::string key = ExportKey();  // keying material несущей QUIC (как reliable)
-            g_io_thread->task_runner()->PostTask(
-                    FROM_HERE, base::BindOnce(&EidolonMoqtDatagramFlow::ConnectCbPort,
-                                              base::RetainedRef(this), key));
-        }
+        if (!cb_started_) return;  // ранний коннект ещё не прошёл -> дроп (fire-and-forget)
         std::string frame;
         frame.reserve(2 + data.size());
         frame.push_back(static_cast<char>((data.size() >> 8) & 0xFF));
@@ -2363,15 +2386,16 @@ private:
     }
 
     // [g_io_thread]
-    void ConnectCbPort(std::string key) {
+    void ConnectCbPort(std::string token, std::string key) {
         net::IPAddress ip;
         (void)ip.AssignFromIPLiteral("127.0.0.1");
         tcp_socket_ = std::make_unique<net::TCPClientSocket>(
                 net::AddressList(net::IPEndPoint(ip, cb_port_)), nullptr, nullptr, nullptr,
                 net::NetLogSource(), net::handles::kInvalidNetworkHandle);
-        // meta(80): token(32)‖key(32)‖flowID(16 нулей). Go валидирует token, строит
-        // серверный DatagramCodec(key); flowID датаграммам не нужен (per-flow id в кадре).
-        cb_write_buf_ = token_ + key + std::string(16, '\0');
+        // meta(80): token(32)‖key(32)‖flowID(16 нулей). Go валидирует token (channel-bound
+        // к key=sessionKey), строит серверный DatagramCodec(key). Токен — отдельный свежий
+        // (из преамбулы), не reliable (тот одноразовый).
+        cb_write_buf_ = token + key + std::string(16, '\0');
         int rv = tcp_socket_->Connect(
                 base::BindOnce(&EidolonMoqtDatagramFlow::OnCbConnect, base::RetainedRef(this)));
         if (rv != net::ERR_IO_PENDING) OnCbConnect(rv);
@@ -2434,7 +2458,7 @@ private:
     uint16_t cb_port_;
     raw_ptr<EidolonDatagramPublisher> down_pub_;  // g_quic_thread
     raw_ptr<moqt::MoqtSession> session_;           // g_quic_thread
-    std::string token_;
+    std::shared_ptr<std::string> dgram_token_;     // peer->session_token (из reliable-преамбулы)
     scoped_refptr<net::IOBufferWithSize> read_buf_;
     bool cb_started_ = false;                      // g_quic_thread
     std::string cb_read_buf_;                      // g_io_thread (недособранный кадр)
@@ -2483,6 +2507,11 @@ struct EidolonMoqtPeer {
     std::unique_ptr<moqt::SubscribeVisitor> dgram_up_visitor;      // "ud" (клиент->сервер)
     scoped_refptr<EidolonMoqtDatagramFlow> dgram_flow;
     bool subscribed_up_dgram = false;
+
+    // Фаза 4: отдельный свежий токен датаграм-дорожки, снятый reliable-flow'ом из преамбулы
+    // "u" и переданный датаграм-flow'у для meta cb_port (channel-bound к sessionKey, Go
+    // валидирует). Пишется reliable-flow'ом, читается датаграм-flow'ом — оба на g_quic_thread.
+    std::shared_ptr<std::string> session_token = std::make_shared<std::string>();
 };
 
 // Конфигурируем только что созданную серверную MoqtSession (вызывается из handler_factory;
@@ -2512,7 +2541,8 @@ static void ConfigureEidolonMoqtSession(moqt::MoqtSession* session, uint16_t cb_
     }
     session->set_publisher(peer->known_publisher.get());
 
-    peer->flow = base::MakeRefCounted<EidolonMoqtFlow>(cb_port, peer->down_pub.get(), session);
+    peer->flow = base::MakeRefCounted<EidolonMoqtFlow>(cb_port, peer->down_pub.get(), session,
+                                                       peer->session_token);
     peer->up_visitor = std::make_unique<EidolonMoqtUpstreamVisitor>(peer->flow);
     // Backpressure cb_port->"d": возобновляем чтение cb_port, когда окно "d" слилось.
     peer->down_pub->SetOnResumable([f = peer->flow.get()] { f->ResumeDownstream(); });
@@ -2532,23 +2562,25 @@ static void ConfigureEidolonMoqtSession(moqt::MoqtSession* session, uint16_t cb_
                     session->Subscribe(up_track, peer_raw->up_visitor.get(), sub);
                     LOG(INFO) << "EIDOLON_DIAG: MoQT server accepted namespace, subscribed(u)";
                 }
-                // Датаграм-lane: токен берём из namespace-params (клиент кладёт его в
-                // PublishNamespace); он уходит в meta датаграм cb_port для валидации в Go.
+                // Датаграм-lane (Фаза 4): токен НЕ из namespace authorization_tokens (он не
+                // доезжает до Go сырыми 32 байтами). Отдельный свежий dgramToken приходит в
+                // reliable-преамбуле "u"; reliable-flow кладёт его в peer->session_token и
+                // триггерит ранний коннект датаграм-cb_port (StartCbPortEager) — токен свеж.
                 if (peer_raw->dgram_cb_port != 0 && peer_raw->down_dgram_pub &&
                     !peer_raw->subscribed_up_dgram) {
                     peer_raw->subscribed_up_dgram = true;
-                    std::string token;
-                    if (!params->authorization_tokens.empty() &&
-                        params->authorization_tokens[0].value.has_value()) {
-                        token = *params->authorization_tokens[0].value;
-                    }
                     peer_raw->dgram_flow = base::MakeRefCounted<EidolonMoqtDatagramFlow>(
-                            peer_raw->dgram_cb_port, peer_raw->down_dgram_pub.get(), session, token);
+                            peer_raw->dgram_cb_port, peer_raw->down_dgram_pub.get(), session,
+                            peer_raw->session_token);
                     peer_raw->dgram_up_visitor =
                             std::make_unique<EidolonMoqtDatagramUpstreamVisitor>(peer_raw->dgram_flow);
                     moqt::MessageParameters dsub((moqt::Location(0, 0)));
                     dsub.set_forward(true);
                     session->Subscribe(up_dgram, peer_raw->dgram_up_visitor.get(), dsub);
+                    if (peer_raw->flow) {
+                        peer_raw->flow->SetOnPreambleParsed(base::BindRepeating(
+                                &EidolonMoqtDatagramFlow::StartCbPortEager, peer_raw->dgram_flow));
+                    }
                     LOG(INFO) << "EIDOLON_DIAG: MoQT server subscribed(ud) datagram-lane";
                 }
             };
