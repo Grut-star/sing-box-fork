@@ -47,6 +47,21 @@ EIDOLON_EXPORT void eidolon_close(EidolonHandle handle);
 // (Network.getNetworkHandle()). No-op для не-MoQT сессий.
 EIDOLON_EXPORT void eidolon_migrate(EidolonHandle handle, int64_t network_handle);
 
+// Фаза 4 FC-3 — телеметрия несущего QUIC-соединения для receiver-driven flow
+// control (адаптив FEC в пределах свободной ёмкости). Мгновенный снимок
+// congestion-контроллера несущей MoQT-сессии. eidolon_get_stats возвращает 0
+// при успехе (out заполнен), -1 если сессия не MoQT / не готова / закрыта.
+typedef struct {
+    uint64_t bandwidth_bps;   // BandwidthEstimate несущей, байт/с
+    uint64_t cwnd_bytes;      // congestion window, байт
+    uint64_t inflight_bytes;  // bytes in flight
+    uint64_t smoothed_rtt_us; // сглаженный RTT, микросекунды
+    uint64_t packets_lost;    // накопительно потеряно пакетов
+    uint64_t ecn_ce;          // накопительно ECN-CE марок (0 до проводки ECN)
+} EidolonStats;
+
+EIDOLON_EXPORT int eidolon_get_stats(EidolonHandle handle, EidolonStats* out);
+
 EIDOLON_EXPORT EidolonHandle eidolon_listen_quic(const char* host, uint16_t port, const uint8_t* secret, size_t secret_len, uintptr_t go_callback_port);
 EIDOLON_EXPORT EidolonHandle eidolon_listen_moqt(const char* host, uint16_t port, const uint8_t* secret, size_t secret_len, uintptr_t go_callback_port, uintptr_t datagram_cb_port);
 

@@ -35,6 +35,8 @@ import (
 	"sync/atomic"
 	"time"
 	"unsafe"
+
+	"github.com/sagernet/sing-box/protocol/eidolon/flowctl"
 )
 
 var (
@@ -216,6 +218,34 @@ func (c *NativeStackConn) Migrate(networkHandle int64) {
 		return
 	}
 	C.eidolon_migrate(c.handle, C.int64_t(networkHandle))
+}
+
+// CarrierStats снимает congestion-телеметрию несущей MoQT/QUIC-сессии (FC-3) для
+// receiver-driven flow control. ok=false, если сессия не MoQT/не готова/закрыта
+// или нативный стек — стаб (вернёт -1): тогда flowctl остаётся loss-driven.
+func (c *NativeStackConn) CarrierStats() (flowctl.CarrierStats, bool) {
+	if c == nil {
+		return flowctl.CarrierStats{}, false
+	}
+	c.closeMu.RLock()
+	h := c.handle
+	closed := c.closed
+	c.closeMu.RUnlock()
+	if closed || h == nil {
+		return flowctl.CarrierStats{}, false
+	}
+	var cs C.EidolonStats
+	if C.eidolon_get_stats(h, &cs) != 0 {
+		return flowctl.CarrierStats{}, false
+	}
+	return flowctl.CarrierStats{
+		BandwidthBps:  uint64(cs.bandwidth_bps),
+		CwndBytes:     uint64(cs.cwnd_bytes),
+		InflightBytes: uint64(cs.inflight_bytes),
+		SmoothedRTT:   time.Duration(cs.smoothed_rtt_us) * time.Microsecond,
+		ECNCE:         uint64(cs.ecn_ce),
+		Lost:          uint64(cs.packets_lost),
+	}, true
 }
 
 // HasDatagramLane сообщает, поднят ли ненадёжный датаграм-канал (MoQT datagram-objects).
@@ -444,7 +474,7 @@ func ListenNativeMoQT(ctx context.Context, host string, port int, secret []byte,
 
 // acceptMetaLoop принимает соединения от натива, читает 80-байтовую meta
 // (token‖sessionKey‖flowID), валидирует токен и отдаёт conn обработчику.
-func acceptMetaLoop(ln net.Listener, secret []byte, tag string, handle func(conn net.Conn, sessionKey, flowID []byte)) {
+func acceptMetaLoop(ln net.Listener, secret []byte, tag string, channelBind bool, handle func(conn net.Conn, sessionKey, flowID []byte)) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -459,7 +489,13 @@ func acceptMetaLoop(ln net.Listener, secret []byte, tag string, handle func(conn
 		token := meta[:32]
 		sessionKey := meta[32:64]
 		flowID := meta[64:]
-		if !ValidateTokenConstantTime(string(secret), token, nil) {
+		// Для датаграм-линии токен channel-bound к sessionKey (Option A):
+		// валидируем с keyShare=sessionKey, иначе nil (reliable-линия).
+		var keyShare []byte
+		if channelBind {
+			keyShare = sessionKey
+		}
+		if !ValidateTokenConstantTime(string(secret), token, keyShare) {
 			fmt.Printf("EIDOLON_QUIC_DIAG: %s token validation FAILED -> closing\n", tag)
 			conn.Close()
 			continue
@@ -474,7 +510,7 @@ func listenNative(ctx context.Context, host string, port int, secret []byte, onA
 		return err
 	}
 
-	go acceptMetaLoop(localListener, secret, "reliable",
+	go acceptMetaLoop(localListener, secret, "reliable", false,
 		func(conn net.Conn, sessionKey, flowID []byte) { onAccept(conn, sessionKey, flowID) })
 
 	// Фаза 4: для MoQT с датаграм-обработчиком поднимаем ВТОРОЙ локальный listener
@@ -488,7 +524,7 @@ func listenNative(ctx context.Context, host string, port int, secret []byte, onA
 			return err
 		}
 		datagramPort = datagramListener.Addr().(*net.TCPAddr).Port
-		go acceptMetaLoop(datagramListener, secret, "datagram",
+		go acceptMetaLoop(datagramListener, secret, "datagram", true,
 			func(conn net.Conn, sessionKey, _ []byte) { onDatagram(conn, sessionKey) })
 	}
 
