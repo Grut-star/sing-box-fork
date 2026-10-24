@@ -3097,6 +3097,53 @@ g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
 }, session, static_cast<net::handles::NetworkHandle>(network_handle)));
 }
 
+// Фаза 4 FC-3 — снимок congestion-состояния несущей QUIC-сессии под WebTransport
+// для receiver-driven flow control (адаптив FEC в пределах свободной ёмкости).
+// Модель та же, что у eidolon_export_key: хоп на g_io_thread + WaitableEvent,
+// доступ к несущей QUIC через wt->eidolon_quic_session()->connection().
+// Только клиентская MoQT-несущая (wt_client_); иначе -1.
+//
+// NB(CI): имена аксессоров quiche подтвердить при первой сборке chromium —
+// sent_packet_manager().BandwidthEstimate()/GetCongestionWindowInBytes()/
+// GetBytesInFlight()/GetRttStats()->smoothed_rtt(); GetStats().packets_lost.
+// ECN-CE пока не проводим (0) — добавить после сверки поля в QuicConnectionStats.
+EIDOLON_EXPORT int eidolon_get_stats(EidolonHandle handle, EidolonStats* out) {
+if (!handle || !out) return -1;
+auto* session = static_cast<EidolonSession*>(handle);
+int result = -1;
+*out = EidolonStats{};
+base::WaitableEvent event(base::WaitableEvent::ResetPolicy::MANUAL, base::WaitableEvent::InitialState::NOT_SIGNALED);
+
+g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
+        EidolonSession* s, EidolonStats* o, int* res, base::WaitableEvent* ev) {
+    if (s->is_moqt_ && s->wt_client_ && s->wt_client_->session()) {
+        auto* wt = static_cast<quic::WebTransportHttp3*>(s->wt_client_->session());
+        quic::QuicSpdySession* qs = wt->eidolon_quic_session();
+        quic::QuicConnection* conn = qs ? qs->connection() : nullptr;
+        if (conn) {
+            const quic::QuicConnectionStats& cs = conn->GetStats();
+            const quic::QuicSentPacketManager& spm = conn->sent_packet_manager();
+            int64_t bw = spm.BandwidthEstimate().ToBytesPerSecond();
+            if (bw > 0) o->bandwidth_bps = static_cast<uint64_t>(bw);
+            o->cwnd_bytes = static_cast<uint64_t>(spm.GetCongestionWindowInBytes());
+            o->inflight_bytes = static_cast<uint64_t>(spm.GetBytesInFlight());
+            const quic::RttStats* rtt = spm.GetRttStats();
+            if (rtt) {
+                int64_t us = rtt->smoothed_rtt().ToMicroseconds();
+                if (us > 0) o->smoothed_rtt_us = static_cast<uint64_t>(us);
+            }
+            o->packets_lost = static_cast<uint64_t>(cs.packets_lost);
+            o->ecn_ce = 0;
+            *res = 0;
+        }
+    }
+    ev->Signal();
+}, session, out, &result, &event));
+
+event.Wait();
+return result;
+}
+
 EIDOLON_EXPORT EidolonHandle eidolon_listen_quic(const char* host, uint16_t port, const uint8_t* secret, size_t secret_len, uintptr_t cb_port) {
 #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
     EnsureChromiumIOThread();
