@@ -2346,6 +2346,13 @@ public:
         g_io_thread->task_runner()->PostTask(
                 FROM_HERE, base::BindOnce(&EidolonMoqtDatagramFlow::ConnectCbPort,
                                           base::RetainedRef(this), tok, key));
+        // Фаза 4 (б): периодический push телеметрии несущей в Go (downstream
+        // flow control: spare-clamp/ECN для server->client FEC). Снимаем на
+        // g_quic_thread (сессия жива), шлём тем же каналом, что датаграммы.
+        g_quic_thread->task_runner()->PostDelayedTask(
+                FROM_HERE, base::BindOnce(&EidolonMoqtDatagramFlow::EmitStats,
+                                          base::RetainedRef(this)),
+                base::Milliseconds(200));
     }
 
     // [g_quic_thread] входящий датаграм-объект с "ud" -> кадр в cb_port TCP.
@@ -2383,6 +2390,55 @@ private:
                     "eidolon-traffic-key", "", 32, &out);
         }
         return out;
+    }
+
+    // [g_quic_thread] Фаза 4 (б): снимок телеметрии несущей -> кадр в cb_port.
+    // Кадр: [0x8000|CarrierStatsWireLen : 2 BE][7×uint64 BE] (bandwidth, cwnd,
+    // inflight, rtt_us, lost, ecnCE, maxDatagram). Бит 0x8000 длины отличает его
+    // от датаграммы (те всегда < 0x8000). Перепостит себя через 200мс, пока
+    // сессия жива; на Detach (session_==null) — тихо останавливается. Доступ к
+    // сессии только здесь (g_quic_thread), запись — на g_io_thread (WriteToCb).
+    void EmitStats() {
+        if (!cb_started_ || !session_ || !session_->session()) return;
+        auto* wt = static_cast<quic::WebTransportHttp3*>(session_->session());
+        quic::QuicSpdySession* qs = wt->eidolon_quic_session();
+        quic::QuicConnection* conn = qs ? qs->connection() : nullptr;
+        if (conn) {
+            const quic::QuicConnectionStats& cs = conn->GetStats();
+            const quic::QuicSentPacketManager& spm = conn->sent_packet_manager();
+            uint64_t f[7] = {0, 0, 0, 0, 0, 0, 0};
+            int64_t bw = spm.BandwidthEstimate().ToBytesPerSecond();
+            if (bw > 0) f[0] = static_cast<uint64_t>(bw);
+            f[1] = static_cast<uint64_t>(spm.GetCongestionWindowInBytes());
+            f[2] = static_cast<uint64_t>(spm.GetBytesInFlight());
+            const quic::RttStats* rtt = spm.GetRttStats();
+            if (rtt) {
+                int64_t us = rtt->smoothed_rtt().ToMicroseconds();
+                if (us > 0) f[3] = static_cast<uint64_t>(us);
+            }
+            f[4] = static_cast<uint64_t>(cs.packets_lost);
+            f[5] = static_cast<uint64_t>(cs.num_ecn_marks_received.ce);
+            f[6] = static_cast<uint64_t>(wt->GetMaxDatagramSize());
+
+            const int kLen = 7 * 8;  // == flowctl.CarrierStatsWireLen
+            std::string frame;
+            frame.reserve(2 + kLen);
+            uint16_t hdr = static_cast<uint16_t>(0x8000 | kLen);
+            frame.push_back(static_cast<char>((hdr >> 8) & 0xFF));
+            frame.push_back(static_cast<char>(hdr & 0xFF));
+            for (int i = 0; i < 7; ++i) {
+                for (int b = 7; b >= 0; --b) {
+                    frame.push_back(static_cast<char>((f[i] >> (b * 8)) & 0xFF));
+                }
+            }
+            g_io_thread->task_runner()->PostTask(
+                    FROM_HERE, base::BindOnce(&EidolonMoqtDatagramFlow::WriteToCb,
+                                              base::RetainedRef(this), std::move(frame)));
+        }
+        g_quic_thread->task_runner()->PostDelayedTask(
+                FROM_HERE, base::BindOnce(&EidolonMoqtDatagramFlow::EmitStats,
+                                          base::RetainedRef(this)),
+                base::Milliseconds(200));
     }
 
     // [g_io_thread]
@@ -3106,7 +3162,7 @@ g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
 // NB(CI): имена аксессоров quiche подтвердить при первой сборке chromium —
 // sent_packet_manager().BandwidthEstimate()/GetCongestionWindowInBytes()/
 // GetBytesInFlight()/GetRttStats()->smoothed_rtt(); GetStats().packets_lost.
-// ECN-CE пока не проводим (0) — добавить после сверки поля в QuicConnectionStats.
+// ECN-CE: cs.num_ecn_marks_received.ce (QuicEcnCounts, quiche quic_types.h).
 EIDOLON_EXPORT int eidolon_get_stats(EidolonHandle handle, EidolonStats* out) {
 if (!handle || !out) return -1;
 auto* session = static_cast<EidolonSession*>(handle);
@@ -3133,7 +3189,12 @@ g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
                 if (us > 0) o->smoothed_rtt_us = static_cast<uint64_t>(us);
             }
             o->packets_lost = static_cast<uint64_t>(cs.packets_lost);
-            o->ecn_ce = 0;
+            // ECN-CE: кумулятивно получено CE-марок несущей (ранний сигнал
+            // затора для AIMD-отступления spare в flowctl, до роста loss).
+            o->ecn_ce = static_cast<uint64_t>(cs.num_ecn_marks_received.ce);
+            // DPLPMTUD: макс. payload WT-датаграммы (quiche учёл path-MTU
+            // несущей QUIC + WT-оверхед) — бюджет кадра для датаграм-lane в Go.
+            o->max_datagram = static_cast<uint64_t>(wt->GetMaxDatagramSize());
             *res = 0;
         }
     }

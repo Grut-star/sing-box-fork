@@ -245,6 +245,7 @@ func (c *NativeStackConn) CarrierStats() (flowctl.CarrierStats, bool) {
 		SmoothedRTT:   time.Duration(cs.smoothed_rtt_us) * time.Microsecond,
 		ECNCE:         uint64(cs.ecn_ce),
 		Lost:          uint64(cs.packets_lost),
+		MaxDatagram:   uint64(cs.max_datagram),
 	}, true
 }
 

@@ -57,7 +57,8 @@ typedef struct {
     uint64_t inflight_bytes;  // bytes in flight
     uint64_t smoothed_rtt_us; // сглаженный RTT, микросекунды
     uint64_t packets_lost;    // накопительно потеряно пакетов
-    uint64_t ecn_ce;          // накопительно ECN-CE марок (0 до проводки ECN)
+    uint64_t ecn_ce;          // накопительно получено ECN-CE марок несущей
+    uint64_t max_datagram;    // DPLPMTUD: макс. payload WT-датаграммы (без фрагментации)
 } EidolonStats;
 
 EIDOLON_EXPORT int eidolon_get_stats(EidolonHandle handle, EidolonStats* out);
