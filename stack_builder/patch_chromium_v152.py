@@ -221,6 +221,22 @@ def main():
         r'component("quiche") {'
     )
 
+    # 10a. A1 (Фаза 5): серверный GSO batch-writer. QuicGsoBatchWriter и его группа
+    #      (quic_batch_writer_base/buffer, quic_sendmmsg_batch_writer, quic_linux_socket_utils)
+    #      лежат в linux_only_srcs, но Chromium НЕ линкует их ни в один GN-таргет →
+    #      mold: undefined symbol QuicGsoBatchWriter при линковке libeidolon. Тянем группу
+    #      в static_library("epoll_tool_support"): он Linux-only (if build_epoll_based_tools),
+    #      libeidolon его уже линкует (оттуда QuicServerIoHarness/QuicDefaultPacketWriter),
+    #      и в нём УЖЕ есть quic_syscall_wrapper.cc — единственная внешняя зависимость
+    #      batch_writer. Значит все символы резолвятся в ОДНОМ таргете под теми же
+    #      quiche-конфигами (без moqt-cflags/shim). linux_only_* в scope (source_list.gni).
+    apply_patch(
+        'net/third_party/quiche/BUILD.gn',
+        r'io_tool_support_srcs \+ io_tool_support_hdrs',
+        r'io_tool_support_srcs + io_tool_support_hdrs +\n'
+        r'              linux_only_srcs + linux_only_hdrs',
+    )
+
     # 12. Connection Migration (Фаза 3, Этап C): Wi-Fi<->сота без teardown туннеля.
     #     DedicatedWebTransportHttp3Client владеет своим QUIC-соединением, сокетом и
     #     reader'ом, но НЕ использует QuicChromiumClientSession (её миграционный

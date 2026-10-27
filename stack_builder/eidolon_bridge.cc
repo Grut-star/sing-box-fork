@@ -133,7 +133,7 @@ typedef SSIZE_T ssize_t;
 #include "quiche/quic/core/http/web_transport_only_dispatcher.h"
 #include "quiche/quic/core/io/quic_server_io_harness.h"
 #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
-#include "quiche/quic/core/batch_writer/quic_gso_batch_writer.h" // A1: GSO send-batch (Linux)
+#include "quiche/quic/core/batch_writer/quic_gso_batch_writer.h" // A1: GSO send-batch (Linux; .cc втянут патчем в epoll_tool_support)
 #endif
 #include "quiche/quic/core/io/socket.h"
 #include "quiche/quic/core/io/quic_default_event_loop.h"
@@ -2771,12 +2771,17 @@ private:
         io_ = *std::move(io);
         // A1 (Фаза 5): GSO batch-writer на отдачу сервера вместо per-packet
         // QuicDefaultPacketWriter (что ставит io_->InitializeWriter). Ядро нарезает
-        // один большой буфер из пачки QUIC-пакетов одним sendmmsg/UDP_SEGMENT —
-        // крупная экономия CPU/энергии под высоким битрейтом. Пинг НЕ растёт: тайминг
-        // держит BBRv3-pacing, GSO лишь группирует уже запланированные пакеты. fd_
-        // (OwnedSocketFd) переживает writer; writer владения не берёт (как default).
-        // ⚠️ Экзотическое ядро без UDP_SEGMENT → ошибки записи в логах сервера;
-        // откат в одну строку: io_->InitializeWriter();
+        // пачку QUIC-пакетов одним sendmmsg/UDP_SEGMENT — экономия CPU/энергии под
+        // высоким битрейтом. Пинг НЕ растёт: тайминг держит BBRv3-pacing, GSO лишь
+        // группирует уже запланированные пакеты. fd_ (OwnedSocketFd) переживает
+        // writer; writer владения fd не берёт (как default).
+        // ЛИНК: реализации batch_writer (linux_only_srcs: quic_gso_batch_writer.cc,
+        // quic_batch_writer_base/buffer.cc, quic_linux_socket_utils.cc) Chromium не
+        // собирает ни в один GN-таргет — втянуты в static_library("epoll_tool_support")
+        // патчем patch_chromium_v152.py (п.10a): он Linux-only, libeidolon его уже
+        // линкует, и в нём лежит quic_syscall_wrapper (единственная внешняя зависимость
+        // группы). Ядро сервера GSO поддерживает (5.15, UDP_SEGMENT OK). Откат =
+        // io_->InitializeWriter();
         dispatcher_->InitializeWithWriter(new quic::QuicGsoBatchWriter(*fd_));
         LOG(INFO) << "EIDOLON_DIAG: MoQT server GSO batch-writer initialized (A1)";
         LOG(INFO) << "EIDOLON_DIAG: MoQT server listening on " << host_ << ":" << port_;
