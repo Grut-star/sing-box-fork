@@ -68,8 +68,9 @@ typedef SSIZE_T ssize_t;
 #include "net/quic/quic_chromium_client_session.h"
 #include "net/third_party/quiche/src/quiche/quic/core/crypto/crypto_protocol.h" // quic::kAFF2/kAFIA/kMTUH (A3/M.1)
 // P5.4 (0-RTT/resumption): персистентный клиентский session-cache между дозвонами.
+// (База quic::SessionCache объявлена в quic_client_session_cache.h + транзитивно в
+// quic_crypto_client_config.h; отдельного session_cache.h в дереве нет.)
 #include "net/third_party/quiche/src/quiche/quic/core/crypto/quic_client_session_cache.h"
-#include "net/third_party/quiche/src/quiche/quic/core/crypto/session_cache.h"
 // WP-4/WP-5: публичные ручки несущей (set_keep_alive_ping_timeout/SendPing/
 // SetMaxPacketLength) + MTU-таргеты DPLPMTUD.
 #include "net/third_party/quiche/src/quiche/quic/core/quic_connection.h"
