@@ -66,7 +66,14 @@ typedef SSIZE_T ssize_t;
 #include "net/traffic_annotation/network_traffic_annotation_test_helper.h"
 #include "net/quic/quic_context.h"
 #include "net/quic/quic_chromium_client_session.h"
-#include "net/third_party/quiche/src/quiche/quic/core/crypto/crypto_protocol.h" // quic::kAFF2/kAFIA (A3)
+#include "net/third_party/quiche/src/quiche/quic/core/crypto/crypto_protocol.h" // quic::kAFF2/kAFIA/kMTUH (A3/M.1)
+// P5.4 (0-RTT/resumption): персистентный клиентский session-cache между дозвонами.
+#include "net/third_party/quiche/src/quiche/quic/core/crypto/quic_client_session_cache.h"
+#include "net/third_party/quiche/src/quiche/quic/core/crypto/session_cache.h"
+// WP-4/WP-5: публичные ручки несущей (set_keep_alive_ping_timeout/SendPing/
+// SetMaxPacketLength) + MTU-таргеты DPLPMTUD.
+#include "net/third_party/quiche/src/quiche/quic/core/quic_connection.h"
+#include "net/third_party/quiche/src/quiche/quic/core/quic_constants.h"
 #include "net/quic/quic_chromium_client_stream.h"
 #include "net/quic/quic_session_pool.h"
 #include "net/quic/quic_session_attempt.h"
@@ -188,6 +195,51 @@ static void EidolonProtectFd(int fd) {
     } else {
         LOG(INFO) << "EIDOLON_DIAG: socket protected fd=" << fd;
     }
+}
+
+// =========================================================================
+// WP-4/WP-5 (Фаза 5): sleep/wake + keep-alive + 0-RTT + MTU/CID на миграции.
+// =========================================================================
+
+// P5.1 keep-alive. Таймаут keep-alive-пинга = «молчим столько → шлём PING».
+// Пинг НЕ фаерит, пока по соединению идёт трафик (quiche ставит пинг-аларм только
+// при пустом in-flight и ShouldKeepConnectionAlive()==true — у нас всегда открыт
+// WT/CONNECT-стрим). Поэтому в foreground с данными эти значения ни на что не
+// влияют (трафик вытесняет пинг), а работают только в простое/фоне/Doze, держа
+// NAT/роутер-маппинг и путь тёплыми в ОБЕ стороны (клиент→PING→сервер→ACK→клиент).
+// Все интервалы СТРОГО < idle-timeout несущей (мы ставим idle=120с, см.
+// kEidolonCarrierIdleTimeout), с запасом. ВАЖНО: буквальный «active=RTT/2» из плана
+// для bulk-туннеля НЕ берём — при RTT 15мс это пинг раз в 7мс на любой микро-паузе,
+// радио не уснёт (прямо против цели по батарее). active держим как редкую страховку.
+enum EidolonPowerState {
+    kEidolonPowerActive = 0,      // экран/приложение активно: трафик сам держит путь
+    kEidolonPowerBackground = 1,  // фон: редкий heartbeat
+    kEidolonPowerDoze = 2,        // Doze/сон: самый редкий, но < idle
+};
+static constexpr int kEidolonKeepAliveActiveMs = 15 * 1000;       // foreground-страховка
+static constexpr int kEidolonKeepAliveBackgroundMs = 25 * 1000;   // фон
+static constexpr int kEidolonKeepAliveDozeMs = 50 * 1000;         // Doze (< 120с idle)
+
+// Несущий idle-timeout: поднимаем с дефолта (~30с) до 120с, чтобы Doze-heartbeat
+// (до 50с, плюс возможная пачковка Doze-окон) НЕ ловил timeout. Сервер ставит
+// такой же (см. серверный config_), эффективный idle = min(обе стороны).
+static constexpr int kEidolonCarrierIdleTimeoutSec = 120;
+
+// M.1: консервативный MTU на свежем пути сразу после миграции (Wi-Fi↔сота) — чтобы
+// «толстые» пакеты не черно-дырили на меньшем MTU соты до завершения ре-DPLPMTUD.
+static constexpr size_t kEidolonMigrationSafeMtu = 1200;
+
+// P5.4: ОДИН персистентный клиентский session-cache на весь процесс. TLS1.3 тикеты
+// резумпции, которые сервер выдаёт по завершении handshake, складываются сюда по
+// QuicServerId и переживают ПОЛНЫЙ пере-дозвон (несущая умерла → penalty → re-dial),
+// давая resumption (короткий handshake без пере-проверки серта) и, где стек поддержит,
+// 0-RTT early-data. Replay-риск 0-RTT закрыт нашим токен-replay-cache (привязка к
+// key_share, окно 5с — см. патч key_share binding). shared_ptr: один инстанс общий
+// для crypto_config всех WT-клиентов (каждый дозвон строит свой url_context/клиент).
+static std::shared_ptr<quic::SessionCache>& EidolonSharedSessionCacheRef() {
+    static base::NoDestructor<std::shared_ptr<quic::SessionCache>> cache(
+            std::make_shared<quic::QuicClientSessionCache>());
+    return *cache;
 }
 
 // EidolonProtectingSocketFactory — кастомная ClientSocketFactory, защищающая UDP-сокеты
@@ -325,6 +377,9 @@ struct EidolonSession {
     uintptr_t data_fd_ = 0;
     bool is_quic_ = false;
     bool is_closed_ = false;
+    // WP-4 (Фаза 5): последний энергетический режим несущей (0=active/1=bg/2=doze),
+    // чтобы ловить именно ПЕРЕХОД в active (wake-resync шлём один раз на пробуждение).
+    int power_state_ = 0;  // kEidolonPowerActive
 
     // --- MoQT / WebTransport (Фаза 1) ---
     // Порядок объявления важен: разрушаются в обратном порядке, поэтому
@@ -1403,6 +1458,21 @@ public:
             LOG(INFO) << "EIDOLON_DIAG: MoQT session established (peer SETUP ok)";
             if (sess->is_closed_ || !sess->moqt_session_) return;
 
+            // P5.1 (Фаза 5) — начальный keep-alive несущей (active=15с) сразу по
+            // установлению, чтобы фон/Doze не рвал сессию по idle ещё ДО того, как
+            // Android-слой пришлёт первый eidolon_set_power_state. Дальше интервал
+            // уточняется из Kotlin по жизненному циклу. Фаерит лишь в простое.
+            if (sess->wt_client_ && sess->wt_client_->session()) {
+                auto* wt0 = static_cast<quic::WebTransportHttp3*>(sess->wt_client_->session());
+                quic::QuicSpdySession* qs0 = wt0->eidolon_quic_session();
+                if (qs0 && qs0->connection()) {
+                    qs0->connection()->set_keep_alive_ping_timeout(
+                            quic::QuicTime::Delta::FromMilliseconds(kEidolonKeepAliveActiveMs));
+                    LOG(INFO) << "EIDOLON_DIAG: P5.1 initial keep-alive armed ("
+                              << kEidolonKeepAliveActiveMs << "ms)";
+                }
+            }
+
             // --- Фаза 2: двунаправленный туннель на объектах (реактивная модель) ---
             // namespace {"eidolon"}; "u" — публикуем (вверх), "d" — подписываемся (вниз).
             // Нативный слой прозрачен: Go кладёт в FD преамбулу token‖flowID‖pad + данные,
@@ -1562,6 +1632,27 @@ public:
 
         auto quic_context = std::make_unique<net::QuicContext>();
         quic_context->params()->supported_versions = net::DefaultSupportedQuicVersions();
+        // A3 (Фаза 5) — ACK-frequency НА БОЕВОМ MoQT-карьере. Ранее эти опции стояли
+        // только в legacy QUICDialHelper (путь eidolon_dial_quic, не используется), т.е.
+        // на реальной несущей ACK-децимация была ВЫКЛЮЧЕНА. InitializeQuicConfig()
+        // (net/quic/quic_context.cc) переносит connection_options/client_connection_options
+        // из params прямиком в QuicConfig WT-клиента, так что здесь они и нужны.
+        //   kAFF2 (client-SENT)  → сервер по завершении handshake шлёт нам AckFrequencyFrame;
+        //   kAFIA (client-INDEP) → анонсируем min_ack_delay (разрешаем приём управления ACK).
+        // Пинг не растёт: reordering_threshold=1 (немедленный ACK на дыру, fast-retransmit
+        // цел), max_ack_delay ≤ ~0.25·RTT.
+        quic_context->params()->connection_options.push_back(quic::kAFF2);
+        quic_context->params()->client_connection_options.push_back(quic::kAFIA);
+        // M.1 (Фаза 5) — включаем DPLPMTUD (kMTUH, target 1400): quiche прощупывает путь
+        // и поднимает размер пакета несущей до оптимального без фрагментации. Важно для
+        // эффективности датаграм-lane/FEC (больше payload на кадр). На миграции делаем
+        // ре-пробинг (см. EidolonCommitMigration).
+        quic_context->params()->connection_options.push_back(quic::kMTUH);
+        // P5.1/P5.2 (Фаза 5) — idle-timeout несущей 120с (дефолт ~30с мал для Doze-
+        // heartbeat до 50с). Сервер ставит столько же; эффективный idle = min(обе стороны).
+        // Все keep-alive-интервалы (15/25/50с) держатся строго ниже.
+        quic_context->params()->idle_connection_timeout =
+                base::Seconds(kEidolonCarrierIdleTimeoutSec);
         builder.SetSpdyAndQuicEnabled(false, true);
         builder.set_quic_context(std::move(quic_context));
         // Защищаем UDP-сокеты несущей от собственного VpnService-TUN через protect(fd)
@@ -1614,6 +1705,15 @@ public:
                 url, origin, sess->wt_visitor_.get(), net::NetworkAnonymizationKey(),
                 net::handles::kInvalidNetworkHandle, sess->url_context.get(), params);
         LOG(INFO) << "EIDOLON_DIAG: Start step8 WebTransport client created ok=" << (sess->wt_client_ != nullptr);
+        // P5.4 (Фаза 5) — подключаем ОБЩИЙ персистентный session-cache к crypto_config
+        // этого клиента ДО Connect() (его читает TlsClientHandshaker на старте
+        // handshake). Тикеты резумпции с прошлых дозвонов к тому же серверу дают
+        // короткий handshake/0-RTT при re-dial после смерти несущей. Метод добавлен
+        // патчем (crypto_config_ приватный); для не-Dedicated клиента — no-op.
+        if (sess->wt_client_) {
+            static_cast<net::DedicatedWebTransportHttp3Client*>(sess->wt_client_.get())
+                    ->EidolonEnableResumption();
+        }
         LOG(INFO) << "EIDOLON_DIAG: MoQT dialing " << ip << ":" << port << " sni=" << sni;
         // Connect асинхронный: event просигналит visitor из OnConnected/OnConnectionFailed.
         sess->wt_client_->Connect();
@@ -2721,6 +2821,18 @@ private:
                 quic::kQuicDefaultConnectionIdLength);
         event_loop_ = quic::GetDefaultEventLoop()->Create(quic::QuicDefaultClock::Get());
 
+        // P5.2 (Фаза 5) — серверный idle-timeout 120с, в пару к клиентскому (эффективный
+        // idle = min(обе стороны)). Нужен запас под клиентский Doze-heartbeat (до 50с),
+        // иначе сервер закрыл бы сессию в простое. Отдельный серверный keep-alive-пинг НЕ
+        // шлём намеренно: клиентский heartbeat (15/25/50с) уже гонит ДВУНАПРАВЛЕННЫЙ
+        // трафик (client→PING→server→ACK→client), чего достаточно, чтобы NAT/роутер на
+        // пути НЕ «замораживал» UDP-маппинг ни в одну сторону. config_ инициализирован
+        // в init-list (GenerateQuicConfig); присваивать нельзя, но мутировать — можно.
+        config_.SetIdleNetworkTimeout(
+                quic::QuicTime::Delta::FromSeconds(kEidolonCarrierIdleTimeoutSec));
+        LOG(INFO) << "EIDOLON_DIAG: P5.2 server idle-timeout set to "
+                  << kEidolonCarrierIdleTimeoutSec << "s";
+
         dispatcher_ = std::make_unique<quic::WebTransportOnlyDispatcher>(
                 &config_, crypto_config_.get(), version_manager_.get(),
                 std::make_unique<quic::QuicDefaultConnectionHelper>(),
@@ -2938,6 +3050,12 @@ void net::DedicatedWebTransportHttp3Client::EidolonCommitMigration(
     }
     quic::QuicSocketAddress self = context->self_address();
     quic::QuicSocketAddress peer = context->peer_address();
+    // M.2 (Фаза 5) — CID rotation на миграции: фиксируем серверный CID ДО переноса,
+    // чтобы подтвердить его смену ПОСЛЕ. quiche в MigratePath() сам зовёт
+    // UpdateConnectionIdsOnMigration() и берёт запасной CID (сервер выдаёт их по
+    // active_connection_id_limit, дефолт 2 → запас есть) — анти-корреляция пути на
+    // проводе. Нам тут править нечего, только проверяем и логируем.
+    quic::QuicConnectionId cid_before = connection_->connection_id();
     // Write-ошибки нового пути обрабатываем мы (как и для исходного writer).
     eidolon_probe_writer_->set_delegate(this);
     bool ok = connection_->MigratePath(self, peer, eidolon_probe_writer_.release(),
@@ -2949,6 +3067,42 @@ void net::DedicatedWebTransportHttp3Client::EidolonCommitMigration(
     }
     // Старый reader (и его сокет) уничтожается — трафик идёт с нового сокета.
     packet_reader_ = std::move(eidolon_probe_reader_);
+
+    quic::QuicConnectionId cid_after = connection_->connection_id();
+    LOG(INFO) << "EIDOLON_DIAG: M.2 CID on migration before=" << cid_before
+              << " after=" << cid_after
+              << (cid_before == cid_after ? " (NOT rotated — нет запасного CID?)"
+                                          : " (rotated OK)");
+
+    // M.1 (Фаза 5) — проактивный сброс MTU на свежем пути. После Wi-Fi→сота старый
+    // (возможно подросший DPLPMTUD до ~1400) размер пакета черно-дырит на меньшем MTU
+    // соты, пока blackhole-детектор не откатит — это вспышка потерь «толстых» пакетов.
+    // Сразу ужимаем до безопасного 1200, затем ре-запускаем DPLPMTUD (growth-пробинг),
+    // чтобы на новом пути снова найти оптимум. SetMaxPacketLength — публичный; ре-арм
+    // дискавери — через патч-метод (SetMtuDiscoveryTarget приватный в quiche).
+    connection_->SetMaxPacketLength(kEidolonMigrationSafeMtu);
+    connection_->EidolonRestartMtuDiscovery();
+    LOG(INFO) << "EIDOLON_DIAG: M.1 MTU reset to " << kEidolonMigrationSafeMtu
+              << " + DPLPMTUD re-probe armed after migration";
+}
+
+// P5.4 (Фаза 5) — включить TLS-резумпцию: подключить общий персистентный
+// session-cache к crypto_config этого клиента. Вызывается из MoQTDialHelper ДО
+// Connect(). crypto_config_ приватный → метод добавлен патчем в заголовок клиента,
+// а реализация тут (тот же TU, доступ к file-local кэшу). set_session_cache просто
+// меняет shared_ptr; TlsClientHandshaker читает его на старте handshake.
+void net::DedicatedWebTransportHttp3Client::EidolonEnableResumption() {
+    crypto_config_.set_session_cache(EidolonSharedSessionCacheRef());
+    LOG(INFO) << "EIDOLON_DIAG: P5.4 shared session-cache attached (resumption/0-RTT)";
+}
+
+// M.1 (Фаза 5) — ре-запуск DPLPMTUD после миграции. SetMtuDiscoveryTarget приватен в
+// QuicConnection, поэтому это ЧЛЕН-функция QuicConnection (объявлена патчем в
+// quic_connection.h), реализованная здесь: как член она имеет доступ к private.
+// Enable(long_term_mtu_, target) заново взводит mtu_discoverer_; дальше MaybeSetMtuAlarm
+// на отправках пакетов сам гонит growth-пробинг до нового оптимума на свежем пути.
+void quic::QuicConnection::EidolonRestartMtuDiscovery() {
+    SetMtuDiscoveryTarget(quic::kMtuDiscoveryTargetPacketSizeHigh);
 }
 
 void net::DedicatedWebTransportHttp3Client::EidolonAbortMigration() {
@@ -3259,6 +3413,52 @@ g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
     auto* wt = static_cast<net::DedicatedWebTransportHttp3Client*>(s->wt_client_.get());
     wt->EidolonMigrateToNetwork(net_handle);
 }, session, static_cast<net::handles::NetworkHandle>(network_handle)));
+}
+
+// WP-4 (Фаза 5) — смена энергетического режима несущей (P5.1 keep-alive + P5.3 wake).
+// state: 0=active (foreground), 1=background, 2=doze. Go зовёт из Android-колбэка на
+// жизненный цикл приложения (foreground/background) и Doze (PowerManager). Делает:
+//  • выставляет keep-alive-таймаут пинга под режим (фаерит лишь в простое, трафик его
+//    вытесняет; все значения < idle=120с) — реже радио-пробуждений в фоне/Doze;
+//  • при ПРОБУЖДЕНИИ (переход в active) немедленно шлёт PING — высокоприоритетный
+//    health-check пути: вынуждает немедленный ACK-обмен, quiche-recovery (PTO) тут же
+//    до-ретрансмитит всё потерянное во сне по НАДЁЖНОЙ линии (это и есть «resync» из
+//    P5.3). Явный запрос SN/окна + до-запрос FEC НЕ применим: надёжная линия
+//    (CONNECT-стрим) само-восстанавливается ретрансмитом QUIC, а датаграм-lane
+//    forward-error-corrected by design (NACK-канала нет — FEC заменяет ретрансмит).
+// Fire-and-forget: без WaitableEvent, как eidolon_migrate.
+EIDOLON_EXPORT void eidolon_set_power_state(EidolonHandle handle, int state) {
+if (!handle || !g_io_thread) return;
+auto* session = static_cast<EidolonSession*>(handle);
+g_io_thread->task_runner()->PostTask(FROM_HERE, base::BindOnce([](
+        EidolonSession* s, int st) {
+    if (s->is_closed_ || !s->is_moqt_ || !s->wt_client_ || !s->wt_client_->session())
+        return;
+    auto* wt = static_cast<quic::WebTransportHttp3*>(s->wt_client_->session());
+    quic::QuicSpdySession* qs = wt->eidolon_quic_session();
+    quic::QuicConnection* conn = qs ? qs->connection() : nullptr;
+    if (!conn || !conn->connected()) return;
+
+    int interval_ms = kEidolonKeepAliveActiveMs;
+    const char* name = "active";
+    if (st == kEidolonPowerBackground) {
+        interval_ms = kEidolonKeepAliveBackgroundMs; name = "background";
+    } else if (st == kEidolonPowerDoze) {
+        interval_ms = kEidolonKeepAliveDozeMs; name = "doze";
+    }
+    conn->set_keep_alive_ping_timeout(
+            quic::QuicTime::Delta::FromMilliseconds(interval_ms));
+
+    // Пробуждение (любой переход В active): немедленный health-check пути.
+    bool waking = (st == kEidolonPowerActive) && (s->power_state_ != kEidolonPowerActive);
+    if (waking) {
+        conn->SendPing();
+        LOG(INFO) << "EIDOLON_DIAG: P5.3 wake resync — high-prio PING sent";
+    }
+    s->power_state_ = st;
+    LOG(INFO) << "EIDOLON_DIAG: P5.1 power state=" << name
+              << " keep-alive=" << interval_ms << "ms";
+}, session, state));
 }
 
 // Фаза 4 FC-3 — снимок congestion-состояния несущей QUIC-сессии под WebTransport

@@ -297,6 +297,34 @@ def main():
         r'  QuicSpdySession* eidolon_quic_session() { return session_; }'
     )
 
+    # 13. P5.4 (Фаза 5): включение TLS-резумпции/0-RTT на несущей. crypto_config_
+    #     строится в ctor с session_cache=nullptr (хардкод) → тикеты не хранятся,
+    #     0-RTT невозможен. Добавляем метод, подключающий ОБЩИЙ персистентный
+    #     session-cache к приватному crypto_config_ (реализация в eidolon_bridge.cc).
+    apply_patch(
+        'net/quic/dedicated_web_transport_http3_client.h',
+        r'(  void EidolonAbortMigration\(\);)',
+        r'\1\n'
+        r'\n'
+        r'  // [EIDOLON] P5.4: подключить общий персистентный session-cache к\n'
+        r'  // crypto_config этого клиента ДО Connect() (resumption/0-RTT при re-dial).\n'
+        r'  void EidolonEnableResumption();'
+    )
+
+    # 14. M.1 (Фаза 5): ре-запуск DPLPMTUD после миграции. SetMtuDiscoveryTarget в
+    #     QuicConnection приватный, поэтому объявляем ПУБЛИЧНЫЙ тонкий метод-обёртку
+    #     (реализация — член-функция в eidolon_bridge.cc, имеет доступ к private).
+    #     Якорь — публичный set_keep_alive_ping_timeout.
+    apply_patch(
+        'net/third_party/quiche/src/quiche/quic/core/quic_connection.h',
+        r'(  void set_keep_alive_ping_timeout\(QuicTime::Delta keep_alive_ping_timeout\);)',
+        r'\1\n'
+        r'\n'
+        r'  // [EIDOLON] M.1: заново взвести path-MTU discovery (growth-пробинг) после\n'
+        r'  // миграции несущей на новую сеть. Реализация в eidolon_bridge.cc.\n'
+        r'  void EidolonRestartMtuDiscovery();'
+    )
+
 
 #     apply_patch(
 #         'third_party/abseil-cpp/absl/base/internal/spinlock_win32.inc',

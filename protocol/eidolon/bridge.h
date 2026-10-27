@@ -47,6 +47,11 @@ EIDOLON_EXPORT void eidolon_close(EidolonHandle handle);
 // (Network.getNetworkHandle()). No-op для не-MoQT сессий.
 EIDOLON_EXPORT void eidolon_migrate(EidolonHandle handle, int64_t network_handle);
 
+// Фаза 5 WP-4 — энергетический режим несущей (keep-alive heartbeat + wake-resync).
+// state: 0=active (foreground), 1=background, 2=doze. Android зовёт из колбэков
+// жизненного цикла приложения и Doze. No-op для не-MoQT/закрытых сессий.
+EIDOLON_EXPORT void eidolon_set_power_state(EidolonHandle handle, int state);
+
 // Фаза 4 FC-3 — телеметрия несущего QUIC-соединения для receiver-driven flow
 // control (адаптив FEC в пределах свободной ёмкости). Мгновенный снимок
 // congestion-контроллера несущей MoQT-сессии. eidolon_get_stats возвращает 0

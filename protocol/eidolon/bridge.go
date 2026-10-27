@@ -220,6 +220,22 @@ func (c *NativeStackConn) Migrate(networkHandle int64) {
 	C.eidolon_migrate(c.handle, C.int64_t(networkHandle))
 }
 
+// SetPowerState сообщает несущей энергетический режим приложения (Фаза 5 WP-4):
+// 0=active (foreground), 1=background, 2=doze. Нативка подстраивает keep-alive
+// heartbeat несущей (реже радио-пробуждений в фоне/Doze) и на переходе в active
+// шлёт немедленный wake-resync PING. No-op для закрытых/не-MoQT соединений.
+func (c *NativeStackConn) SetPowerState(state int) {
+	if c == nil {
+		return
+	}
+	c.closeMu.RLock()
+	defer c.closeMu.RUnlock()
+	if c.closed || c.handle == nil {
+		return
+	}
+	C.eidolon_set_power_state(c.handle, C.int(state))
+}
+
 // CarrierStats снимает congestion-телеметрию несущей MoQT/QUIC-сессии (FC-3) для
 // receiver-driven flow control. ok=false, если сессия не MoQT/не готова/закрыта
 // или нативный стек — стаб (вернёт -1): тогда flowctl остаётся loss-driven.
