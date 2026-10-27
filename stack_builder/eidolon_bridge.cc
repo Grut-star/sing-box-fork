@@ -7,7 +7,13 @@
 #include <fcntl.h>
 #include "base/files/file_descriptor_watcher_posix.h"
 #include "base/posix/eintr_wrapper.h"
-#elif BUILDFLAG(IS_WIN)
+#endif
+#if BUILDFLAG(IS_ANDROID)
+#include <sched.h>   // sched_setaffinity (C1: pin io-потока на little-ядра)
+#include <errno.h>
+#include <fstream>   // чтение /sys .../cpu_capacity без зависимости от base/files
+#endif
+#if BUILDFLAG(IS_WIN)
 #include <winsock2.h>
 #include <windows.h>
 #include <basetsd.h>
@@ -60,6 +66,7 @@ typedef SSIZE_T ssize_t;
 #include "net/traffic_annotation/network_traffic_annotation_test_helper.h"
 #include "net/quic/quic_context.h"
 #include "net/quic/quic_chromium_client_session.h"
+#include "net/third_party/quiche/src/quiche/quic/core/crypto/crypto_protocol.h" // quic::kAFF2/kAFIA (A3)
 #include "net/quic/quic_chromium_client_stream.h"
 #include "net/quic/quic_session_pool.h"
 #include "net/quic/quic_session_attempt.h"
@@ -125,6 +132,9 @@ typedef SSIZE_T ssize_t;
 // Серверная обвязка MoQT (линкуется только на linux; на android код под #if не инстанцируется).
 #include "quiche/quic/core/http/web_transport_only_dispatcher.h"
 #include "quiche/quic/core/io/quic_server_io_harness.h"
+#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
+#include "quiche/quic/core/batch_writer/quic_gso_batch_writer.h" // A1: GSO send-batch (Linux)
+#endif
 #include "quiche/quic/core/io/socket.h"
 #include "quiche/quic/core/io/quic_default_event_loop.h"
 #include "quiche/quic/core/quic_default_clock.h"
@@ -1217,6 +1227,31 @@ private:
 
         auto quic_context = std::make_unique<net::QuicContext>();
         quic_context->params()->supported_versions = net::DefaultSupportedQuicVersions();
+
+        // A3 (Фаза 5): ACK-frequency — экономия радио/батареи клиента. По умолчанию
+        // телефон шлёт ACK каждые 2 пакета; на видеопотоке это сотни ACK/с, которые
+        // непрерывно греют передатчик и не дают модему уснуть (C-DRX). BBRv3 на
+        // сервере работает от своего pacing-таймера и частые ACK ему не нужны.
+        // Включаем ACK-децимацию чисто через connection-опции (своего кода в quiche
+        // не требуется, серверной правки — тоже):
+        //   kAFF2 (client-SENT)      → сервер по завершении handshake шлёт нам
+        //                              AckFrequencyFrame (quic_connection.cc:484);
+        //   kAFIA (client-INDEP)     → анонсируем min_ack_delay, т.е. РАЗРЕШАЕМ приём
+        //                              управления частотой ACK (quic_session.cc:233).
+        // Пинг НЕ растёт: кадр строится с reordering_threshold=1 — немедленный ACK
+        // при первой же дыре в номерах (fast-retransmit цел), а max_ack_delay
+        // ограничен ~0.25·RTT (kPeerAckDecimationDelay).
+        quic_context->params()->connection_options.push_back(quic::kAFF2);
+        quic_context->params()->client_connection_options.push_back(quic::kAFIA);
+
+        // A5 (ОТЛОЖЕНО, опционально на будущее): явный порядок cipher-suite внешнего
+        // QUIC-TLS — AES-128-GCM первым при наличии HWCAP_AES/PMULL (на ARMv8-crypto
+        // AES-GCM в 2.5–3× дешевле ChaCha20 по тактам/энергии на МБ), ChaCha20 как
+        // фоллбэк для чипов без AES-акселератора. НЕ включаем сейчас: ⚠️ порядок
+        // cipher-suite виден в ClientHello и ДОЛЖЕН совпадать с реальным Chrome, иначе
+        // уезжает отпечаток (прикрытие, §4/фаза 7). BoringSSL и так предпочитает
+        // AES-GCM при аппаратном AES, так что выигрыш может быть уже получен по
+        // умолчанию — включать только после сверки отпечатка с живым Chrome.
 
         builder.SetSpdyAndQuicEnabled(false, true);
         builder.set_quic_context(std::move(quic_context));
@@ -2734,7 +2769,16 @@ private:
             delete this; return;
         }
         io_ = *std::move(io);
-        io_->InitializeWriter();
+        // A1 (Фаза 5): GSO batch-writer на отдачу сервера вместо per-packet
+        // QuicDefaultPacketWriter (что ставит io_->InitializeWriter). Ядро нарезает
+        // один большой буфер из пачки QUIC-пакетов одним sendmmsg/UDP_SEGMENT —
+        // крупная экономия CPU/энергии под высоким битрейтом. Пинг НЕ растёт: тайминг
+        // держит BBRv3-pacing, GSO лишь группирует уже запланированные пакеты. fd_
+        // (OwnedSocketFd) переживает writer; writer владения не берёт (как default).
+        // ⚠️ Экзотическое ядро без UDP_SEGMENT → ошибки записи в логах сервера;
+        // откат в одну строку: io_->InitializeWriter();
+        dispatcher_->InitializeWithWriter(new quic::QuicGsoBatchWriter(*fd_));
+        LOG(INFO) << "EIDOLON_DIAG: MoQT server GSO batch-writer initialized (A1)";
         LOG(INFO) << "EIDOLON_DIAG: MoQT server listening on " << host_ << ":" << port_;
         g_quic_event_loop = event_loop_.get();
         PumpOnce();
@@ -2925,6 +2969,58 @@ EIDOLON_EXPORT void eidolon_set_protect(EidolonProtectFunc cb) {
     g_protect_func = cb;
 }
 
+#if BUILDFLAG(IS_ANDROID)
+// C1 (Фаза 5): пин сетевого+крипто io-потока на энергоэффективные (little) ядра.
+// Сетевой цикл QUIC + AEAD + сборка объектов — высокая пропускная способность, но
+// НЕ пиковая частота; на little-ядрах та же работа потребляет в разы меньше ватт.
+// Кластер little определяем по МИНИМАЛЬНОМУ cpu_capacity (надёжнее хардкода «ядра
+// 0..3» — топологии разные). Нет данных capacity или ядра однородны (нет
+// big.LITTLE) → НЕ пиним: мис-пиннинг хуже отсутствия. Запускается НА io-потоке,
+// поэтому sched_setaffinity(0,…) целит именно его. Только Android: на сервере
+// (Linux) пин на слабые ядра резал бы throughput.
+void PinIoThreadToLittleCoresOnIoThread() {
+    long ncpu = sysconf(_SC_NPROCESSORS_CONF);
+    if (ncpu <= 1 || ncpu > CPU_SETSIZE) {
+        return;
+    }
+    std::vector<long> cap(static_cast<size_t>(ncpu), -1);
+    long minCap = -1;
+    for (long c = 0; c < ncpu; ++c) {
+        std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/cpu_capacity");
+        long v = 0;
+        if (f >> v && v > 0) {
+            cap[static_cast<size_t>(c)] = v;
+            if (minCap < 0 || v < minCap) {
+                minCap = v;
+            }
+        }
+    }
+    if (minCap < 0) {
+        LOG(INFO) << "EIDOLON_DIAG: C1 affinity skipped (нет cpu_capacity)";
+        return;
+    }
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    int pinned = 0;
+    for (long c = 0; c < ncpu; ++c) {
+        if (cap[static_cast<size_t>(c)] == minCap) {
+            CPU_SET(c, &set);
+            ++pinned;
+        }
+    }
+    if (pinned == 0 || pinned == ncpu) {
+        LOG(INFO) << "EIDOLON_DIAG: C1 affinity skipped (однородные ядра, нет big.LITTLE)";
+        return;
+    }
+    if (sched_setaffinity(0, sizeof(set), &set) != 0) {
+        LOG(INFO) << "EIDOLON_DIAG: C1 sched_setaffinity failed errno=" << errno;
+    } else {
+        LOG(INFO) << "EIDOLON_DIAG: C1 io-thread pinned to " << pinned
+                  << " little core(s), cpu_capacity=" << minCap;
+    }
+}
+#endif  // IS_ANDROID
+
 EIDOLON_EXPORT void eidolon_init() {
     if (!base::CommandLine::InitializedForCurrentProcess()) {
         base::CommandLine::Init(0, nullptr);
@@ -2948,6 +3044,13 @@ EIDOLON_EXPORT void eidolon_init() {
         base::Thread::Options options;
         options.message_pump_type = base::MessagePumpType::IO;
         g_io_thread->StartWithOptions(std::move(options));
+
+#if BUILDFLAG(IS_ANDROID)
+        // C1: пин io-потока на little-ядра исполняем НА нём самом (задача в его
+        // очереди), чтобы sched_setaffinity(0,…) применился к нужному потоку.
+        g_io_thread->task_runner()->PostTask(
+                FROM_HERE, base::BindOnce(&PinIoThreadToLittleCoresOnIoThread));
+#endif
 
 #if BUILDFLAG(IS_POSIX)
         g_file_descriptor_watcher = new base::FileDescriptorWatcher(g_io_thread->task_runner());
