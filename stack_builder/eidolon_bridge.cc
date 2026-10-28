@@ -1095,34 +1095,6 @@ private:
     raw_ptr<EidolonSession> sess_;
 };
 
-// [COVER-PROBE dev-only — ревертнуть перед prod] Минимальный подписчик на публичный
-// cover-трек прикрытия (Фаза 6, валидация b2). Ничего не пишет в туннель/FD — только
-// логирует приём объектов, доказывая on-demand путь бродкастера (attach->source->objects).
-class EidolonCoverProbeVisitor : public moqt::SubscribeVisitor {
-public:
-    void OnReply(const moqt::FullTrackName& ftn,
-                 std::variant<moqt::SubscribeOkData, moqt::MoqtRequestErrorInfo> response) override {
-        if (std::holds_alternative<moqt::MoqtRequestErrorInfo>(response))
-            LOG(ERROR) << "EIDOLON_DIAG: COVER-PROBE subscribe REJECTED track=" << ftn.ToString();
-        else
-            LOG(INFO) << "EIDOLON_DIAG: COVER-PROBE subscribe OK track=" << ftn.ToString();
-    }
-    void OnCanAckObjects(moqt::MoqtObjectAckFunction) override {}
-    void OnObjectFragment(const moqt::FullTrackName& /*ftn*/,
-                          const moqt::PublishedObjectMetadata& /*metadata*/,
-                          absl::string_view object, uint64_t /*offset*/) override {
-        ++count_;
-        LOG(INFO) << "EIDOLON_DIAG: COVER-PROBE object #" << count_ << " size=" << object.size();
-    }
-    void OnPublishDone(moqt::FullTrackName) override {}
-    void OnMalformedTrack(const moqt::FullTrackName&) override {}
-    void OnStreamFin(const moqt::FullTrackName&, moqt::DataStreamIndex) override {}
-    void OnStreamReset(const moqt::FullTrackName&, moqt::DataStreamIndex) override {}
-
-private:
-    uint64_t count_ = 0;
-};
-
 // -------------------------------------------------------------------------
 // MoQT datagram-lane (Фаза 4): fire-and-forget паблишер + подписчик датаграмм
 // -------------------------------------------------------------------------
@@ -1607,27 +1579,6 @@ public:
         };
         callbacks.session_terminated_callback =
                 +[](absl::string_view e) { LOG(ERROR) << "EIDOLON_DIAG: MoQT terminated: " << e; };
-
-        // [COVER-PROBE dev-only — ревертнуть перед prod] Фаза 6 b2: принять cover-анонс
-        // сервера (по умолчанию клиент его отклоняет) и подписаться на <ns>/"audio", чтобы
-        // дёрнуть on-demand бродкастер прикрытия (attach refcount=1 -> source connect ->
-        // synthetic-объекты). Трек прикрытия per-session рандомен -> имя берём из анонса.
-        callbacks.incoming_publish_namespace_callback =
-                [sess, done = std::make_shared<bool>(false)](
-                        const moqt::TrackNamespace& tns, const moqt::MessageParameters* params,
-                        moqt::MoqtResponseCallback cb) {
-                    if (cb) std::move(cb)(moqt::MessageParameters{});  // accept announce
-                    if (params == nullptr) return;                     // DONE marker
-                    if (*done || sess->is_closed_ || !sess->moqt_session_) return;
-                    *done = true;
-                    auto* v = new EidolonCoverProbeVisitor();  // leaked: dev harness only
-                    moqt::FullTrackName cover_track(tns, "audio");
-                    moqt::MessageParameters sub((moqt::Location(0, 0)));  // AbsoluteStart
-                    sub.set_forward(true);
-                    sess->moqt_session_->Subscribe(cover_track, v, sub);
-                    LOG(INFO) << "EIDOLON_DIAG: COVER-PROBE accepted announce + subscribed ns="
-                              << tns.ToString();
-                };
 
         sess_->moqt_session_ = std::make_unique<moqt::MoqtSession>(
                 wt, moqt::MoqtSessionParameters(quic::Perspective::IS_CLIENT),
@@ -2918,6 +2869,20 @@ private:
         socket_ = std::make_unique<net::TCPClientSocket>(
                 net::AddressList(net::IPEndPoint(ip, g_cover_cb_port)), nullptr, nullptr, nullptr,
                 net::NetLogSource(), net::handles::kInvalidNetworkHandle);
+        // Фаза 6 fix: помечаем cb_port-сокет FD_CLOEXEC. Go-ingest порождает ffmpeg
+        // (exec) при подписке; без CLOEXEC дочерний ffmpeg НАСЛЕДУЕТ этот fd и держит
+        // сокет открытым после detach -> Go не видит EOF -> источник не глушится (leak).
+        // Колбэк зовётся после open fd, до connect (fd валиден). Чистый источник (synthetic)
+        // не форкал -> проблемы не было; ffmpeg форкает -> нужен CLOEXEC.
+        net::TCPClientSocket* sock_ptr = socket_.get();
+        sock_ptr->SetBeforeConnectCallback(base::BindRepeating([](net::TCPClientSocket* s) -> int {
+            int fd = s->SocketDescriptorForTesting();
+            if (fd >= 0) {
+                int flags = ::fcntl(fd, F_GETFD);
+                if (flags != -1) ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+            }
+            return net::OK;
+        }, base::Unretained(sock_ptr)));
         int rv = socket_->Connect(
                 base::BindOnce(&EidolonCoverBroadcaster::OnConnect, base::Unretained(this)));
         if (rv != net::ERR_IO_PENDING) OnConnect(rv);
