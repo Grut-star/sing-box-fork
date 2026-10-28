@@ -1095,6 +1095,34 @@ private:
     raw_ptr<EidolonSession> sess_;
 };
 
+// [COVER-PROBE dev-only — ревертнуть перед prod] Минимальный подписчик на публичный
+// cover-трек прикрытия (Фаза 6, валидация b2). Ничего не пишет в туннель/FD — только
+// логирует приём объектов, доказывая on-demand путь бродкастера (attach->source->objects).
+class EidolonCoverProbeVisitor : public moqt::SubscribeVisitor {
+public:
+    void OnReply(const moqt::FullTrackName& ftn,
+                 std::variant<moqt::SubscribeOkData, moqt::MoqtRequestErrorInfo> response) override {
+        if (std::holds_alternative<moqt::MoqtRequestErrorInfo>(response))
+            LOG(ERROR) << "EIDOLON_DIAG: COVER-PROBE subscribe REJECTED track=" << ftn.ToString();
+        else
+            LOG(INFO) << "EIDOLON_DIAG: COVER-PROBE subscribe OK track=" << ftn.ToString();
+    }
+    void OnCanAckObjects(moqt::MoqtObjectAckFunction) override {}
+    void OnObjectFragment(const moqt::FullTrackName& /*ftn*/,
+                          const moqt::PublishedObjectMetadata& /*metadata*/,
+                          absl::string_view object, uint64_t /*offset*/) override {
+        ++count_;
+        LOG(INFO) << "EIDOLON_DIAG: COVER-PROBE object #" << count_ << " size=" << object.size();
+    }
+    void OnPublishDone(moqt::FullTrackName) override {}
+    void OnMalformedTrack(const moqt::FullTrackName&) override {}
+    void OnStreamFin(const moqt::FullTrackName&, moqt::DataStreamIndex) override {}
+    void OnStreamReset(const moqt::FullTrackName&, moqt::DataStreamIndex) override {}
+
+private:
+    uint64_t count_ = 0;
+};
+
 // -------------------------------------------------------------------------
 // MoQT datagram-lane (Фаза 4): fire-and-forget паблишер + подписчик датаграмм
 // -------------------------------------------------------------------------
@@ -1579,6 +1607,27 @@ public:
         };
         callbacks.session_terminated_callback =
                 +[](absl::string_view e) { LOG(ERROR) << "EIDOLON_DIAG: MoQT terminated: " << e; };
+
+        // [COVER-PROBE dev-only — ревертнуть перед prod] Фаза 6 b2: принять cover-анонс
+        // сервера (по умолчанию клиент его отклоняет) и подписаться на <ns>/"audio", чтобы
+        // дёрнуть on-demand бродкастер прикрытия (attach refcount=1 -> source connect ->
+        // synthetic-объекты). Трек прикрытия per-session рандомен -> имя берём из анонса.
+        callbacks.incoming_publish_namespace_callback =
+                [sess, done = std::make_shared<bool>(false)](
+                        const moqt::TrackNamespace& tns, const moqt::MessageParameters* params,
+                        moqt::MoqtResponseCallback cb) {
+                    if (cb) std::move(cb)(moqt::MessageParameters{});  // accept announce
+                    if (params == nullptr) return;                     // DONE marker
+                    if (*done || sess->is_closed_ || !sess->moqt_session_) return;
+                    *done = true;
+                    auto* v = new EidolonCoverProbeVisitor();  // leaked: dev harness only
+                    moqt::FullTrackName cover_track(tns, "audio");
+                    moqt::MessageParameters sub((moqt::Location(0, 0)));  // AbsoluteStart
+                    sub.set_forward(true);
+                    sess->moqt_session_->Subscribe(cover_track, v, sub);
+                    LOG(INFO) << "EIDOLON_DIAG: COVER-PROBE accepted announce + subscribed ns="
+                              << tns.ToString();
+                };
 
         sess_->moqt_session_ = std::make_unique<moqt::MoqtSession>(
                 wt, moqt::MoqtSessionParameters(quic::Perspective::IS_CLIENT),
