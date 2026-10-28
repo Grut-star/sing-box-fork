@@ -36,6 +36,7 @@ typedef SSIZE_T ssize_t;
 
 #include <vector>
 #include <string>
+#include <atomic>
 
 #include "net/socket/tcp_client_socket.h"
 #include "net/socket/ssl_client_socket_impl.h"
@@ -857,6 +858,37 @@ struct EidolonSession {
 };
 
 // -------------------------------------------------------------------------
+// Фаза 6 — сервис-прикрытие (Вариант 3): общий генератор правдоподобных MoQT-
+// namespace (per-session) + глобальная конфигурация прикрытия.
+// -------------------------------------------------------------------------
+// Генератор нужен обоим концам: сервер — для cover-namespace, клиент (WP-D) — для
+// туннель-ns, чтобы туннель и прикрытие НЕ делились на «фикс-ns vs случайный».
+// Имя = {<слово-из-пула>, <случайный id>} (CSPRNG) — выглядит как id станции/шоу.
+static moqt::TrackNamespace EidolonPlausibleNamespace() {
+    static const char* const kWords[] = {
+            "radio", "live", "stream", "fm", "media", "audio", "cast", "studio"};
+    constexpr size_t kWordCount = sizeof(kWords) / sizeof(kWords[0]);
+    static const char kAlphabet[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+    uint8_t rnd[9];
+    quic::QuicRandom::GetInstance()->RandBytes(rnd, sizeof(rnd));
+    std::string word(kWords[rnd[0] % kWordCount]);
+    std::string id;
+    id.reserve(8);
+    for (int i = 1; i <= 8; ++i) {
+        id.push_back(kAlphabet[rnd[i] % (sizeof(kAlphabet) - 1)]);
+    }
+    return moqt::TrackNamespace({absl::string_view(word), absl::string_view(id)});
+}
+
+// Глобальная конфигурация прикрытия. Ставится ОДИН РАЗ из eidolon_cover_configure
+// (Go StartCoverIngest) ДО старта listen; читается на g_quic_thread при настройке
+// сессий. ns_override пустой => namespace генерим per-session генератором выше.
+static bool g_cover_enabled = false;
+static uint16_t g_cover_cb_port = 0;
+static std::string g_cover_ns_override;
+static std::string g_cover_track = "audio";
+
+// -------------------------------------------------------------------------
 // MoQT data-plane (Фаза 2): кастомный надёжный паблишер + подписчик туннеля
 // -------------------------------------------------------------------------
 // Watermark'и backpressure восходящего потока (байты недоставленных объектов в окне).
@@ -1475,10 +1507,13 @@ public:
             }
 
             // --- Фаза 2: двунаправленный туннель на объектах (реактивная модель) ---
-            // namespace {"eidolon"}; "u" — публикуем (вверх), "d" — подписываемся (вниз).
-            // Нативный слой прозрачен: Go кладёт в FD преамбулу token‖flowID‖pad + данные,
-            // мы гоняем их как объекты. Протокол/ключи/паддинг — в Go и парсере сервера.
-            moqt::TrackNamespace ns({"eidolon"});
+            // "u" — публикуем (вверх), "d" — подписываемся (вниз). Нативный слой прозрачен:
+            // Go кладёт в FD преамбулу token‖flowID‖pad + данные, мы гоняем их как объекты.
+            // WP-D (Фаза 6): namespace БОЛЬШЕ НЕ статичный {"eidolon"} — генерим правдоподобный
+            // per-session (тот же генератор, что у cover), чтобы туннель и прикрытие не делились
+            // на «фикс-ns vs случайный». Сервер зеркалит присланное имя (берёт tns из анонса).
+            // Гейт держится на токене в преамбуле "u" (валидирует Go), не на имени namespace.
+            moqt::TrackNamespace ns = EidolonPlausibleNamespace();
             moqt::FullTrackName up_track(ns, "u");
             moqt::FullTrackName down_track(ns, "d");
             absl::string_view tok_sv(reinterpret_cast<const char*>(sess->moqt_token_.data()),
@@ -2683,6 +2718,243 @@ private:
     scoped_refptr<EidolonMoqtDatagramFlow> flow_;
 };
 
+// -------------------------------------------------------------------------
+// Фаза 6 — сервис-прикрытие (Вариант 3): публичный live cover-паблишер + бродкастер.
+// -------------------------------------------------------------------------
+// EidolonCoverTrackPublisher — публичный (не токен-гейтный) live-трек прикрытия.
+// Модель как у датаграм-паблишера (Фаза 4): каждый чанк контента = один MoQT
+// datagram-объект (md.subgroup=nullopt => LivePublisher::SendDatagram), fire-and-
+// forget. Для живого медиа это естественно: объекты независимы, поздний вход и
+// дропы тривиальны (в отличие от надёжного subgroup-стрима, где эвикшн рвёт
+// непрерывность). При появлении первого подписчика цепляемся к бродкастеру
+// (= «есть зонд, давай контент»), при уходе последнего — отцепляемся (on-demand).
+class EidolonCoverBroadcaster;  // fwd
+class EidolonCoverTrackPublisher : public moqt::MoqtTrackPublisher {
+public:
+    EidolonCoverTrackPublisher(moqt::FullTrackName track, const quic::QuicClock* clock,
+                               EidolonCoverBroadcaster* broadcaster)
+            : track_(std::move(track)), clock_(clock), broadcaster_(broadcaster) {}
+
+    // [g_quic_thread] бродкастер отдаёт очередной чанк живого контента.
+    void PushPayload(std::string_view data) {
+        if (closed_ || data.empty() || listeners_.empty()) return;  // нет зонда -> дроп
+        uint64_t id = next_object_id_++;
+        moqt::Location loc(0, id);
+        moqt::PublishedObjectMetadata md;
+        md.location = loc;
+        md.subgroup = std::nullopt;                  // <-- датаграмма
+        md.status = moqt::MoqtObjectStatus::kNormal;
+        md.publisher_priority = moqt::kDefaultPublisherPriority;
+        md.first_object_in_subgroup = std::nullopt;  // для датаграмм недоступно
+        md.payload_length = data.size();
+        md.arrival_time = clock_->ApproximateNow();
+        current_ = std::make_shared<moqt::CachedObject>(
+                md, quiche::QuicheMemSlice::Copy(data), /*fin_after_this=*/false);
+        current_id_ = id;
+        for (moqt::MoqtObjectListener* l : listeners_) {
+            l->OnNewObjectAvailable(loc, /*subgroup=*/std::nullopt,
+                                    moqt::kDefaultPublisherPriority);
+        }
+        current_.reset();  // one-shot: SendDatagram синхронен из OnNewObjectAvailable
+    }
+
+    void Detach();  // тело после EidolonCoverBroadcaster (session уходит)
+
+    // --- MoqtTrackPublisher ---
+    const moqt::FullTrackName& GetTrackName() const override { return track_; }
+    std::optional<moqt::PublishedObject> GetCachedObject(
+            uint64_t group, std::optional<uint64_t> /*subgroup*/, uint64_t min_object,
+            uint64_t offset) const override {
+        if (group != 0 || !current_ || min_object > current_id_) return std::nullopt;
+        return current_->ToPublishedObject(offset);
+    }
+    void AddObjectListener(moqt::MoqtObjectListener* listener,
+                           const moqt::MessageParameters& /*parameters*/) override;  // тело ниже
+    void RemoveObjectListener(moqt::MoqtObjectListener* listener) override;          // тело ниже
+    absl::Status UpdateObjectListener(moqt::MoqtObjectListener* /*listener*/,
+                                      const moqt::MessageParameters& /*parameters*/) override {
+        return absl::OkStatus();
+    }
+    std::optional<moqt::Location> largest_location() const override {
+        return std::nullopt;  // истории не держим (живой край)
+    }
+    std::optional<quic::QuicTimeDelta> expiration() const override {
+        return quic::QuicTimeDelta::Zero();
+    }
+    const moqt::TrackProperties& properties() const override { return properties_; }
+    std::unique_ptr<moqt::MoqtFetchTask> StandaloneFetch(
+            moqt::Location, moqt::Location, moqt::MoqtDeliveryOrder,
+            moqt::FetchResponseCallback callback) override {
+        std::move(callback)(moqt::MoqtRequestErrorInfo(
+                moqt::RequestErrorCode::kNotSupported, std::nullopt, "eidolon cover: fetch unsupported"));
+        return nullptr;
+    }
+    std::unique_ptr<moqt::MoqtFetchTask> RelativeFetch(
+            uint64_t, moqt::MoqtDeliveryOrder, moqt::FetchResponseCallback callback) override {
+        std::move(callback)(moqt::MoqtRequestErrorInfo(
+                moqt::RequestErrorCode::kNotSupported, std::nullopt, "eidolon cover: fetch unsupported"));
+        return nullptr;
+    }
+    std::unique_ptr<moqt::MoqtFetchTask> AbsoluteFetch(
+            uint64_t, moqt::MoqtDeliveryOrder, moqt::FetchResponseCallback callback) override {
+        std::move(callback)(moqt::MoqtRequestErrorInfo(
+                moqt::RequestErrorCode::kNotSupported, std::nullopt, "eidolon cover: fetch unsupported"));
+        return nullptr;
+    }
+
+private:
+    moqt::FullTrackName track_;
+    raw_ptr<const quic::QuicClock> clock_;
+    raw_ptr<EidolonCoverBroadcaster> broadcaster_;
+    moqt::TrackProperties properties_;
+    mutable std::shared_ptr<moqt::CachedObject> current_;
+    mutable uint64_t current_id_ = 0;
+    uint64_t next_object_id_ = 0;
+    bool closed_ = false;
+    bool attached_ = false;  // зацеплены ли к бродкастеру (= есть подписчик)
+    absl::flat_hash_set<moqt::MoqtObjectListener*> listeners_;
+};
+
+// EidolonCoverBroadcaster — процессный синглтон: один источник контента (одно
+// соединение к Go cover-cb_port) фанится на ВСЕ cover-паблишеры (по одному на
+// сессию-зонд). Рефкаунт по числу зацепленных паблишеров: 0->1 коннектим Go
+// (Go стартует источник ffmpeg/synthetic), ->0 закрываем (Go глушит источник).
+// Фрейминг от Go: [len:2 BE][payload] поверх loopback-TCP. Вся cover-машинерия и
+// pubs_ — на g_quic_thread; сокет и чтение — на g_io_thread.
+class EidolonCoverBroadcaster {
+public:
+    static EidolonCoverBroadcaster* Get() {
+        static base::NoDestructor<EidolonCoverBroadcaster> inst;
+        return inst.get();
+    }
+
+    // [g_quic_thread] у паблишера появился первый подписчик.
+    void Attach(EidolonCoverTrackPublisher* pub) {
+        if (!pubs_.insert(pub).second) return;
+        LOG(INFO) << "EIDOLON_DIAG: cover broadcaster attach refcount=" << pubs_.size();
+        if (pubs_.size() == 1) StartSource();
+    }
+    // [g_quic_thread] у паблишера ушёл последний подписчик / сессия закрылась.
+    void DetachPub(EidolonCoverTrackPublisher* pub) {
+        if (pubs_.erase(pub) == 0) return;
+        LOG(INFO) << "EIDOLON_DIAG: cover broadcaster detach refcount=" << pubs_.size();
+        if (pubs_.empty()) StopSource();
+    }
+
+private:
+    friend class base::NoDestructor<EidolonCoverBroadcaster>;
+    EidolonCoverBroadcaster()
+            : read_buf_(base::MakeRefCounted<net::IOBufferWithSize>(65536)) {}
+
+    // [g_quic_thread] поднять источник: взвести want_connected_ и попросить g_io_thread коннектить.
+    void StartSource() {
+        want_connected_.store(true);
+        g_io_thread->task_runner()->PostTask(
+                FROM_HERE, base::BindOnce(&EidolonCoverBroadcaster::ConnectOnIo,
+                                          base::Unretained(this)));
+    }
+    // [g_quic_thread] погасить источник.
+    void StopSource() {
+        want_connected_.store(false);
+        g_io_thread->task_runner()->PostTask(
+                FROM_HERE, base::BindOnce(&EidolonCoverBroadcaster::CloseOnIo,
+                                          base::Unretained(this)));
+    }
+
+    // [g_io_thread]
+    void ConnectOnIo() {
+        if (!want_connected_.load() || socket_ || g_cover_cb_port == 0) return;
+        net::IPAddress ip;
+        (void)ip.AssignFromIPLiteral("127.0.0.1");
+        socket_ = std::make_unique<net::TCPClientSocket>(
+                net::AddressList(net::IPEndPoint(ip, g_cover_cb_port)), nullptr, nullptr, nullptr,
+                net::NetLogSource(), net::handles::kInvalidNetworkHandle);
+        int rv = socket_->Connect(
+                base::BindOnce(&EidolonCoverBroadcaster::OnConnect, base::Unretained(this)));
+        if (rv != net::ERR_IO_PENDING) OnConnect(rv);
+    }
+    void OnConnect(int rv) {
+        LOG(INFO) << "EIDOLON_DIAG: cover source connect rv=" << rv;
+        if (rv != net::OK || !want_connected_.load()) { socket_.reset(); return; }
+        inbuf_.clear();
+        ReadOnIo();
+    }
+    void ReadOnIo() {
+        if (!socket_) return;
+        int rv = socket_->Read(read_buf_.get(), read_buf_->size(),
+                base::BindOnce(&EidolonCoverBroadcaster::OnRead, base::Unretained(this)));
+        if (rv != net::ERR_IO_PENDING) OnRead(rv);
+    }
+    void OnRead(int rv) {
+        if (rv <= 0 || !want_connected_.load()) { socket_.reset(); return; }
+        inbuf_.append(read_buf_->data(), static_cast<size_t>(rv));
+        // Выделяем полные кадры [len:2 BE][payload] и шлём их на g_quic_thread.
+        size_t pos = 0;
+        while (inbuf_.size() - pos >= 2) {
+            size_t n = (static_cast<uint8_t>(inbuf_[pos]) << 8) |
+                       static_cast<uint8_t>(inbuf_[pos + 1]);
+            if (inbuf_.size() - pos - 2 < n) break;  // кадр ещё не целиком
+            std::string payload = inbuf_.substr(pos + 2, n);
+            pos += 2 + n;
+            g_quic_thread->task_runner()->PostTask(
+                    FROM_HERE, base::BindOnce(&EidolonCoverBroadcaster::Distribute,
+                                              base::Unretained(this), std::move(payload)));
+        }
+        if (pos > 0) inbuf_.erase(0, pos);
+        WakeQuicLoop();
+        ReadOnIo();
+    }
+    void CloseOnIo() {
+        if (want_connected_.load()) return;  // гонка start/stop/start: оставляем жить
+        socket_.reset();
+        inbuf_.clear();
+    }
+
+    // [g_quic_thread] раздать кадр всем зацепленным cover-паблишерам. Снапшот до
+    // нотификаций: PushPayload синхронно дёргает SendDatagram, который при обрыве может
+    // ре-энтрантно снять подписчика (DetachPub) и изменить pubs_ под итерацией.
+    void Distribute(std::string payload) {
+        std::vector<EidolonCoverTrackPublisher*> snapshot(pubs_.begin(), pubs_.end());
+        for (EidolonCoverTrackPublisher* p : snapshot) p->PushPayload(payload);
+    }
+
+    absl::flat_hash_set<EidolonCoverTrackPublisher*> pubs_;  // g_quic_thread
+    std::unique_ptr<net::TCPClientSocket> socket_;           // g_io_thread
+    scoped_refptr<net::IOBufferWithSize> read_buf_;          // g_io_thread
+    std::string inbuf_;                                      // g_io_thread
+    std::atomic<bool> want_connected_{false};
+};
+
+void EidolonCoverTrackPublisher::AddObjectListener(
+        moqt::MoqtObjectListener* listener, const moqt::MessageParameters& /*parameters*/) {
+    listeners_.insert(listener);
+    listener->OnSubscribeAccepted();
+    LOG(INFO) << "EIDOLON_DIAG: cover subscribe accepted track=" << track_.ToString()
+              << " listeners=" << listeners_.size();
+    if (!attached_) {
+        attached_ = true;
+        if (broadcaster_) broadcaster_->Attach(this);  // 0->1: старт источника
+    }
+    // Backlog НЕ реплеим: живой край, прошлое не досылаем (как у датаграм-трека).
+}
+
+void EidolonCoverTrackPublisher::RemoveObjectListener(moqt::MoqtObjectListener* listener) {
+    listeners_.erase(listener);
+    if (listeners_.empty() && attached_) {
+        attached_ = false;
+        if (broadcaster_) broadcaster_->DetachPub(this);  // ->0: стоп источника
+    }
+}
+
+void EidolonCoverTrackPublisher::Detach() {
+    closed_ = true;
+    if (attached_) {
+        attached_ = false;
+        if (broadcaster_) broadcaster_->DetachPub(this);
+    }
+    listeners_.clear();
+}
+
 // Всё состояние одной MoQT-сессии; живёт, пока жива MoqtSession (держим в
 // session_deleted_callback). Сессия ссылается на publisher/visitor сырыми указателями.
 struct EidolonMoqtPeer {
@@ -2704,6 +2976,10 @@ struct EidolonMoqtPeer {
     // "u" и переданный датаграм-flow'у для meta cb_port (channel-bound к sessionKey, Go
     // валидирует). Пишется reliable-flow'ом, читается датаграм-flow'ом — оба на g_quic_thread.
     std::shared_ptr<std::string> session_token = std::make_shared<std::string>();
+
+    // --- Фаза 6: сервис-прикрытие (Вариант 3) ---
+    std::shared_ptr<EidolonCoverTrackPublisher> cover_pub;  // публичный live cover-трек
+    moqt::TrackNamespace cover_ns;                          // per-session namespace прикрытия
 };
 
 // Конфигурируем только что созданную серверную MoqtSession (вызывается из handler_factory;
@@ -2714,53 +2990,71 @@ static void ConfigureEidolonMoqtSession(moqt::MoqtSession* session, uint16_t cb_
     peer->cb_port = cb_port;
     peer->dgram_cb_port = dgram_cb_port;
 
-    moqt::TrackNamespace ns({"eidolon"});
-    moqt::FullTrackName up_track(ns, "u");
-    moqt::FullTrackName down_track(ns, "d");
-    moqt::FullTrackName up_dgram(ns, "ud");
-    moqt::FullTrackName down_dgram(ns, "dd");
-
-    peer->down_pub = std::make_shared<EidolonTrackPublisher>(
-            down_track, quic::QuicDefaultClock::Get());
     peer->known_publisher = std::make_unique<moqt::MoqtKnownTrackPublisher>();
-    peer->known_publisher->Add(peer->down_pub);
 
-    // Фаза 4: датаграм-паблишер "dd" в тот же known_publisher (если lane включён).
-    if (dgram_cb_port != 0) {
-        peer->down_dgram_pub = std::make_shared<EidolonDatagramPublisher>(
-                down_dgram, quic::QuicDefaultClock::Get());
-        peer->known_publisher->Add(peer->down_dgram_pub);
+    // Фаза 6: публичный cover-паблишер прикрытия в тот же known_publisher. namespace
+    // per-session (генератор) либо фикс-override из конфига; трек из конфига. Зонд,
+    // подписавшись на анонсированный cover-ns, получит живой контент (on-demand).
+    // Независим от туннельного ns (у прикрытия своё имя).
+    if (g_cover_enabled) {
+        peer->cover_ns = g_cover_ns_override.empty()
+                ? EidolonPlausibleNamespace()
+                : moqt::TrackNamespace({absl::string_view(g_cover_ns_override)});
+        moqt::FullTrackName cover_track(peer->cover_ns, g_cover_track);
+        peer->cover_pub = std::make_shared<EidolonCoverTrackPublisher>(
+                cover_track, quic::QuicDefaultClock::Get(), EidolonCoverBroadcaster::Get());
+        peer->known_publisher->Add(peer->cover_pub);
     }
+
     session->set_publisher(peer->known_publisher.get());
 
-    peer->flow = base::MakeRefCounted<EidolonMoqtFlow>(cb_port, peer->down_pub.get(), session,
-                                                       peer->session_token);
-    peer->up_visitor = std::make_unique<EidolonMoqtUpstreamVisitor>(peer->flow);
-    // Backpressure cb_port->"d": возобновляем чтение cb_port, когда окно "d" слилось.
-    peer->down_pub->SetOnResumable([f = peer->flow.get()] { f->ResumeDownstream(); });
-
     EidolonMoqtPeer* peer_raw = peer.get();
-    // Клиент анонсирует namespace -> принимаем и подписываемся на "u" (+ "ud").
+    // WP-D (Фаза 6): туннельный namespace выбирает КЛИЕНТ (per-session, правдоподобный),
+    // сервер ЗЕРКАЛИТ присланное имя tns из анонса. Поэтому всю туннельную проводку,
+    // зависящую от имени (down_pub "d" + мост cb_port + подписки "u"/"ud"/"dd"), создаём
+    // ЗДЕСЬ: раньше ns был захардкожен {"eidolon"} и проводка стояла в config-time, но имя
+    // известно только из анонса. Клиент сперва анонсит, ПОТОМ подписывается на "d" — так
+    // down_pub регистрируется в known_publisher ДО прихода SUBSCRIBE(d). Гейт — токен в
+    // преамбуле "u" (валидирует Go), не имя namespace.
     session->callbacks().incoming_publish_namespace_callback =
-            [session, peer_raw, up_track, up_dgram](const moqt::TrackNamespace& /*tns*/,
-                                                    const moqt::MessageParameters* params,
-                                                    moqt::MoqtResponseCallback cb) {
+            [session, peer_raw](const moqt::TrackNamespace& tns,
+                                const moqt::MessageParameters* params,
+                                moqt::MoqtResponseCallback cb) {
                 if (cb) std::move(cb)(moqt::MessageParameters{});  // accept
                 if (params == nullptr) return;                     // DONE
                 if (!peer_raw->subscribed_up) {
                     peer_raw->subscribed_up = true;
+                    moqt::FullTrackName up_track(tns, "u");
+                    moqt::FullTrackName down_track(tns, "d");
+                    // "d"-паблишер (сервер->клиент) + reliable-мост cb_port под присланным ns.
+                    peer_raw->down_pub = std::make_shared<EidolonTrackPublisher>(
+                            down_track, quic::QuicDefaultClock::Get());
+                    peer_raw->known_publisher->Add(peer_raw->down_pub);
+                    peer_raw->flow = base::MakeRefCounted<EidolonMoqtFlow>(
+                            peer_raw->cb_port, peer_raw->down_pub.get(), session,
+                            peer_raw->session_token);
+                    peer_raw->up_visitor =
+                            std::make_unique<EidolonMoqtUpstreamVisitor>(peer_raw->flow);
+                    // Backpressure cb_port->"d": возобновляем чтение cb_port при сливе окна "d".
+                    peer_raw->down_pub->SetOnResumable(
+                            [f = peer_raw->flow.get()] { f->ResumeDownstream(); });
                     moqt::MessageParameters sub((moqt::Location(0, 0)));  // AbsoluteStart
                     sub.set_forward(true);
                     session->Subscribe(up_track, peer_raw->up_visitor.get(), sub);
-                    LOG(INFO) << "EIDOLON_DIAG: MoQT server accepted namespace, subscribed(u)";
+                    LOG(INFO) << "EIDOLON_DIAG: MoQT server accepted namespace " << tns.ToString()
+                              << ", subscribed(u)";
                 }
                 // Датаграм-lane (Фаза 4): токен НЕ из namespace authorization_tokens (он не
                 // доезжает до Go сырыми 32 байтами). Отдельный свежий dgramToken приходит в
                 // reliable-преамбуле "u"; reliable-flow кладёт его в peer->session_token и
                 // триггерит ранний коннект датаграм-cb_port (StartCbPortEager) — токен свеж.
-                if (peer_raw->dgram_cb_port != 0 && peer_raw->down_dgram_pub &&
-                    !peer_raw->subscribed_up_dgram) {
+                if (peer_raw->dgram_cb_port != 0 && !peer_raw->subscribed_up_dgram) {
                     peer_raw->subscribed_up_dgram = true;
+                    moqt::FullTrackName up_dgram(tns, "ud");
+                    moqt::FullTrackName down_dgram(tns, "dd");
+                    peer_raw->down_dgram_pub = std::make_shared<EidolonDatagramPublisher>(
+                            down_dgram, quic::QuicDefaultClock::Get());
+                    peer_raw->known_publisher->Add(peer_raw->down_dgram_pub);
                     peer_raw->dgram_flow = base::MakeRefCounted<EidolonMoqtDatagramFlow>(
                             peer_raw->dgram_cb_port, peer_raw->down_dgram_pub.get(), session,
                             peer_raw->session_token);
@@ -2773,14 +3067,37 @@ static void ConfigureEidolonMoqtSession(moqt::MoqtSession* session, uint16_t cb_
                         peer_raw->flow->SetOnPreambleParsed(base::BindRepeating(
                                 &EidolonMoqtDatagramFlow::StartCbPortEager, peer_raw->dgram_flow));
                     }
-                    LOG(INFO) << "EIDOLON_DIAG: MoQT server subscribed(ud) datagram-lane";
+                    LOG(INFO) << "EIDOLON_DIAG: MoQT server subscribed(ud) datagram-lane ns="
+                              << tns.ToString();
                 }
             };
+
+    // Фаза 6: по установлению сессии (после SETUP) сервер АНОНСИРУЕТ публичный
+    // cover-namespace подписчику — чтобы зонд узнал имя (оно per-session/рандомно) и
+    // подписался. Анонс уходит ВСЕМ сессиям (и туннельным): туннельный клиент мягко
+    // отклонит его дефолтным incoming_publish_namespace_callback (kNotSupported, сессию
+    // не рвёт) — это ещё и усиливает неотличимость (все сессии несут cover-анонс).
+    if (g_cover_enabled) {
+        EidolonMoqtPeer* peer_raw2 = peer.get();
+        session->callbacks().session_established_callback = [session, peer_raw2] {
+            if (!peer_raw2->cover_pub) return;
+            moqt::MessageParameters pub_params;  // публичный трек: без auth-токена
+            session->PublishNamespace(
+                    peer_raw2->cover_ns, pub_params,
+                    [](std::variant<moqt::MessageParameters, moqt::MoqtRequestErrorInfo> r) {
+                        LOG(INFO) << "EIDOLON_DIAG: cover PublishNamespace reply ok="
+                                  << std::holds_alternative<moqt::MessageParameters>(r);
+                    },
+                    [] { LOG(INFO) << "EIDOLON_DIAG: cover namespace cancelled by peer"; });
+            LOG(INFO) << "EIDOLON_DIAG: cover announced ns=" << peer_raw2->cover_ns.ToString();
+        };
+    }
 
     // Держим peer живым до конца сессии; затем отвязываем мосты.
     session->callbacks().session_deleted_callback = [peer]() mutable {
         if (peer->flow) peer->flow->Detach();
         if (peer->dgram_flow) peer->dgram_flow->Detach();
+        if (peer->cover_pub) peer->cover_pub->Detach();  // Фаза 6: стоп источника при уходе зонда
     };
 }
 
@@ -3127,6 +3444,23 @@ static base::FileDescriptorWatcher* g_file_descriptor_watcher = nullptr;
 
 EIDOLON_EXPORT void eidolon_set_protect(EidolonProtectFunc cb) {
     g_protect_func = cb;
+}
+
+// Фаза 6 — конфигурация сервиса-прикрытия. Зовётся один раз из Go (StartCoverIngest)
+// ДО eidolon_listen_moqt. Копируем строки в глобалы (set-once pre-listen; машинерия
+// прикрытия — только серверная IS_LINUX-часть, но символ экспортируем на всех ABI,
+// т.к. cgo bridge.go ссылается на него и в android-сборке). ns=="" => per-session.
+EIDOLON_EXPORT void eidolon_cover_configure(uint16_t cover_cb_port, const char* ns,
+                                            const char* track) {
+    g_cover_cb_port = cover_cb_port;
+    g_cover_ns_override = (ns != nullptr) ? std::string(ns) : std::string();
+    if (track != nullptr && track[0] != '\0') {
+        g_cover_track = std::string(track);
+    }
+    g_cover_enabled = (cover_cb_port != 0);
+    LOG(INFO) << "EIDOLON_DIAG: cover configured enabled=" << g_cover_enabled
+              << " cb_port=" << g_cover_cb_port << " track=" << g_cover_track
+              << " ns_override=" << (g_cover_ns_override.empty() ? "<per-session>" : g_cover_ns_override);
 }
 
 #if BUILDFLAG(IS_ANDROID)

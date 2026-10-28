@@ -21,6 +21,13 @@ EIDOLON_EXPORT EidolonHandle eidolon_dial_moqt(const char* host, uint16_t port, 
 EIDOLON_EXPORT EidolonHandle eidolon_listen_quic(const char* host, uint16_t port, const uint8_t* secret, size_t secret_len, uintptr_t cb_port);
 EIDOLON_EXPORT EidolonHandle eidolon_listen_moqt(const char* host, uint16_t port, const uint8_t* secret, size_t secret_len, uintptr_t cb_port, uintptr_t datagram_cb_port);
 
+// Фаза 6 — сервис-прикрытие (Вариант 3). Публичный MoQ-трек прикрытия в том же ядре:
+// сервер анонсирует подписчикам namespace (ns=="" => per-session правдоподобный) + трек
+// track; при реальной подписке коннектит cover_cb_port к Go, получает кадры
+// [len:2 BE][payload] и публикует их datagram-объектами (on-demand). Вызывать ДО
+// eidolon_listen_moqt; не вызван — прикрытие выкл.
+EIDOLON_EXPORT void eidolon_cover_configure(uint16_t cover_cb_port, const char* ns, const char* track);
+
 // Чтение, запись и закрытие
 int eidolon_read(EidolonHandle handle, uint8_t* buffer, size_t buffer_len);
 int eidolon_write(EidolonHandle handle, const uint8_t* buffer, size_t buffer_len);
