@@ -527,7 +527,12 @@ func listenNative(ctx context.Context, host string, port int, secret []byte, onA
 		return err
 	}
 
-	go acceptMetaLoop(localListener, secret, "reliable", false,
+	// reliable-токен QUIC/MoQT-несущей теперь channel-bound к exporter'у (клиент:
+	// outbound.go DialQUIC кладёт в преамбулу GenerateToken(secret, sessionKey)).
+	// Валидируем с keyShare=серверный sessionKey → двойной MITM с иным per-leg
+	// exporter'ом не пройдёт. TCP-fallback валидируется ОТДЕЛЬНО в inbound.go
+	// (SessionID-пик), сюда не заходит, так что флаг его не касается.
+	go acceptMetaLoop(localListener, secret, "reliable", true,
 		func(conn net.Conn, sessionKey, flowID []byte) { onAccept(conn, sessionKey, flowID) })
 
 	// Фаза 4: для MoQT с датаграм-обработчиком поднимаем ВТОРОЙ локальный listener
