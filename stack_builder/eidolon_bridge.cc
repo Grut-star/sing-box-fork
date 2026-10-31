@@ -1613,6 +1613,25 @@ public:
         callbacks.session_terminated_callback =
                 +[](absl::string_view e) { LOG(ERROR) << "EIDOLON_DIAG: MoQT terminated: " << e; };
 
+        // Фикс C (quiche-156 PN-teardown): ПРИНИМАЕМ входящий PUBLISH_NAMESPACE
+        // (серверный cover-анонс) вместо дефолтного reject. Дефолт слал REQUEST_ERROR,
+        // в ответ сервер зовёт Fin() на свою половину PN-стрима; а клиентский
+        // MoqtPublishNamespaceResponseStream::OnStreamBound() в quiche-156 НЕ ставит
+        // set_allow_fin(true) (в отличие от всех прочих bidi-стримов) -> его парсер
+        // читает этот легальный FIN как "Unexpected FIN on a control stream" ->
+        // OnFatalError -> MoqtSession::Error -> ВСЯ сессия убита ~1 RTT после establish
+        // (reliable URL-тест не успевает -> EOF). Accept шлёт REQUEST_OK (fin=false) ->
+        // сервер НЕ фин-ит (Fin() лишь в RequestError-ветке) -> триггер снят. На сам
+        // cover-трек НЕ подписываемся: бродкастер on-demand, стартует только на реальный
+        // SUBSCRIBE трека, поэтому accept анонса не гонит cover-трафик туннельному клиенту.
+        // Парный корневой фикс — set_allow_fin(true) на PN-response-стрим (patch_chromium).
+        callbacks.incoming_publish_namespace_callback =
+                [](const moqt::TrackNamespace&, const moqt::MessageParameters* /*params*/,
+                   moqt::MoqtResponseCallback cb) {
+                    if (cb == nullptr) return;  // PUBLISH_NAMESPACE_DONE: отвечать нечем
+                    std::move(cb)(moqt::MessageParameters{});  // accept (REQUEST_OK, fin=false)
+                };
+
         sess_->moqt_session_ = std::make_unique<moqt::MoqtSession>(
                 wt, moqt::MoqtSessionParameters(quic::Perspective::IS_CLIENT),
                 std::move(alarm_factory), std::move(callbacks));

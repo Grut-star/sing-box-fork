@@ -237,6 +237,26 @@ def main():
         r'              linux_only_srcs + linux_only_hdrs',
     )
 
+    # 10b. MoQT PUBLISH_NAMESPACE teardown fix (quiche-156 регрессия). Все MoQT
+    #      bidi-стримы ставят stream_parser()->set_allow_fin(true) в OnStreamBound
+    #      (subscribe/publish/fetch/track_status/publish_namespace-REQUEST), КРОМЕ
+    #      MoqtPublishNamespaceResponseStream — его OnStreamBound пуст (лишь TODO о
+    #      приоритете). Из-за этого, когда publisher (наш сервер анонсит cover-ns, или
+    #      любой PUBLISH_NAMESPACE) FIN-ит PN-стрим после REQUEST_ERROR (quiche делает
+    #      это в OnControlMessage(RequestError)), подписчик читает ЛЕГАЛЬНЫЙ FIN своим
+    #      response-парсером с allow_fin_=false -> "Unexpected FIN on a control stream"
+    #      -> OnFatalError -> MoqtSession::Error -> ВСЯ сессия убита ~1 RTT после
+    #      establish. Это рвало reliable URL-тест (EOF) e2e на redroid (2026-10-31).
+    #      Ставим set_allow_fin(true), как у всех прочих. Если апстрим-версия чуть иная
+    #      (CI тянет latest Stable) и паттерн не сматчится — apply_patch просто
+    #      пропустит (клиентский accept-фикс C в eidolon_bridge.cc страхует).
+    apply_patch(
+        'net/third_party/quiche/src/quiche/quic/moqt/moqt_publish_namespace_stream.h',
+        r'(void OnStreamBound\(\) override \{\n)(\s*)(// TODO\(martinduke\): Set the priority for this stream\.)',
+        r'\1\2stream_parser()->set_allow_fin(true);  // [EIDOLON] PN response stream must allow FIN (quiche-156 regr)\n'
+        r'\2\3'
+    )
+
     # 12. Connection Migration (Фаза 3, Этап C): Wi-Fi<->сота без teardown туннеля.
     #     DedicatedWebTransportHttp3Client владеет своим QUIC-соединением, сокетом и
     #     reader'ом, но НЕ использует QuicChromiumClientSession (её миграционный
