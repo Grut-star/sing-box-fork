@@ -831,28 +831,55 @@ struct EidolonSession {
         }
 #endif
 
-        // MoQT teardown: сессию первой (она держит webtransport::Session*,
-        // владеемый wt_client_), затем клиент, затем visitor.
-        moqt_session_.reset();
-        // Data-plane после сессии: сессия держала на них сырые указатели.
-        moqt_sub_visitor_.reset();
-        moqt_dgram_sub_visitor_.reset();
-        moqt_known_publisher_.reset();
+        // MoQT/WebTransport/QUIC teardown — ОТЛОЖЕННО (критично против use-after-free).
+        // Close() зовётся в т.ч. ИЗ колбэков самой сессии (session_terminated /
+        // OnPublishDone / OnMalformedTrack, см. ~1076/1089/1090/1437/1865), а их
+        // Chromium вызывает ПОВЕРХ своего QUIC packet-reader'а (петля recvmsg на
+        // g_io_thread). Синхронный .reset() здесь удалял бы объект, чей колбэк ещё
+        // на стеке → при возврате в ридер — deref освобождённой памяти → SIGSEGV на
+        // EidolonIOThread (tombstone: recvmsg … fault addr this+0x1a0, по «Unexpected
+        // FIN on a control stream»). Поэтому переносим ВЛАДЕНИЕ объектами в задачу на
+        // g_io_thread: они доживают до следующего прохода цикла и рушатся уже вне
+        // стека Chromium-колбэка. Наблюдатели/FD уже сняты синхронно выше, данные не
+        // идут. raw_ptr-поля (не владеют) гасим сразу; остальное — в задаче, в том же
+        // порядке, что и раньше (сессия первой — она держит сырые указатели на
+        // data-plane и на webtransport::Session*, владеемый wt_client_).
         moqt_local_pub_raw_ = nullptr;
-        moqt_local_pub_.reset();
         moqt_dgram_pub_raw_ = nullptr;
-        moqt_dgram_pub_.reset();
-        wt_client_.reset();
-        wt_visitor_.reset();
-
-        if (is_quic_) {
-            quic_stream_handle.reset();
-            quic_session_handle.reset();
+        auto deferred_teardown = base::BindOnce(
+                [](std::unique_ptr<moqt::MoqtSession> moqt_session,
+                   std::unique_ptr<moqt::SubscribeVisitor> sub_v,
+                   std::unique_ptr<moqt::SubscribeVisitor> dgram_sub_v,
+                   std::unique_ptr<moqt::MoqtKnownTrackPublisher> known_pub,
+                   std::shared_ptr<moqt::MoqtTrackPublisher> local_pub,
+                   std::shared_ptr<moqt::MoqtTrackPublisher> dgram_pub,
+                   std::unique_ptr<net::WebTransportClient> wt_client,
+                   std::unique_ptr<net::WebTransportClientVisitor> wt_visitor,
+                   std::unique_ptr<net::QuicChromiumClientStream::Handle> q_stream,
+                   std::unique_ptr<net::QuicChromiumClientSession::Handle> q_session,
+                   std::unique_ptr<net::StreamSocket> tcp) {
+                    moqt_session.reset();   // сессия первой
+                    sub_v.reset();
+                    dgram_sub_v.reset();
+                    known_pub.reset();
+                    local_pub.reset();
+                    dgram_pub.reset();
+                    wt_client.reset();
+                    wt_visitor.reset();
+                    q_stream.reset();
+                    q_session.reset();
+                    if (tcp) { tcp->Disconnect(); tcp.reset(); }
+                },
+                std::move(moqt_session_), std::move(moqt_sub_visitor_),
+                std::move(moqt_dgram_sub_visitor_), std::move(moqt_known_publisher_),
+                std::move(moqt_local_pub_), std::move(moqt_dgram_pub_),
+                std::move(wt_client_), std::move(wt_visitor_),
+                std::move(quic_stream_handle), std::move(quic_session_handle),
+                std::move(tcp_socket));
+        if (g_io_thread) {
+            g_io_thread->task_runner()->PostTask(FROM_HERE, std::move(deferred_teardown));
         } else {
-            if (tcp_socket) {
-                tcp_socket->Disconnect();
-                tcp_socket.reset();
-            }
+            std::move(deferred_teardown).Run();  // на выключении рантайма — синхронно
         }
     }
 };
