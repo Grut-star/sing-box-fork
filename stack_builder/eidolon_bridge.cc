@@ -564,7 +564,7 @@ struct EidolonSession {
                                                       static_cast<size_t>(bytes_read)));
             } else if (bytes_read == 0 || (bytes_read < 0 && !is_eagain)) {
                 CloseUpstream();
-                Close();
+                Close("UPLINK_FD_EOF");
             }
             // is_eagain (<0) — просто ждём следующего события watcher'а.
             return;
@@ -785,7 +785,7 @@ struct EidolonSession {
             } else if (written < 0 && is_eagain) {
                 break;
             } else {
-                Close();  // датаграм-FD мёртв (Go-сторона ушла) -> рвём сессию
+                Close("DGRAM_FD_WRITE_DEAD");  // датаграм-FD мёртв (Go-сторона ушла) -> рвём сессию
                 return;
             }
         }
@@ -801,7 +801,13 @@ struct EidolonSession {
 #endif
     }
 
-    void Close() {
+    void Close(const char* reason = "?") {
+        // ДИАГНОСТИКА (reliable-lane teardown): кто и почему рвёт сессию, и в каком
+        // порядке относительно "MoQT terminated". Логируем КАЖДУЮ попытку (включая
+        // повторные при уже is_closed_), чтобы видеть первопричину.
+        LOG(INFO) << "EIDOLON_DIAG: client EidolonSession::Close(reason=" << reason
+                  << ") is_closed=" << is_closed_ << " is_moqt=" << is_moqt_
+                  << " is_quic=" << is_quic_;
         if (is_closed_) return;
         is_closed_ = true;
 
@@ -1100,7 +1106,7 @@ public:
                  std::variant<moqt::SubscribeOkData, moqt::MoqtRequestErrorInfo> response) override {
         if (std::holds_alternative<moqt::MoqtRequestErrorInfo>(response)) {
             LOG(ERROR) << "EIDOLON_DIAG: MoQT subscribe REJECTED track=" << ftn.ToString();
-            sess_->Close();
+            sess_->Close("DOWNLINK_SUBSCRIBE_REJECTED");
         } else {
             LOG(INFO) << "EIDOLON_DIAG: MoQT subscribe OK track=" << ftn.ToString();
         }
@@ -1113,8 +1119,8 @@ public:
         LOG(INFO) << "EIDOLON_DIAG: client downstream OnObjectFragment size=" << object.size();
         sess_->EnqueueFdWrite(object);
     }
-    void OnPublishDone(moqt::FullTrackName) override { sess_->Close(); }
-    void OnMalformedTrack(const moqt::FullTrackName&) override { sess_->Close(); }
+    void OnPublishDone(moqt::FullTrackName) override { sess_->Close("DOWNLINK_PUBLISH_DONE"); }
+    void OnMalformedTrack(const moqt::FullTrackName&) override { sess_->Close("DOWNLINK_MALFORMED"); }
     void OnStreamFin(const moqt::FullTrackName&, moqt::DataStreamIndex) override {}
     void OnStreamReset(const moqt::FullTrackName&, moqt::DataStreamIndex) override {}
 
@@ -1293,7 +1299,7 @@ void EidolonSession::OnDatagramFdReadable() {
         }
         if (off > 0) dgram_read_buf_.erase(0, off);
     } else if (n == 0 || (n < 0 && !is_eagain)) {
-        Close();
+        Close("DGRAM_FD_READ_EOF");
     }
 #endif
 }
@@ -1625,6 +1631,9 @@ public:
     }
     void OnDraining() override {}
     void OnClosed(const std::optional<net::WebTransportCloseInfo>& close_info) override {
+        LOG(INFO) << "EIDOLON_DIAG: client WebTransport OnClosed code="
+                  << (close_info ? close_info->code : 0) << " reason="
+                  << (close_info ? close_info->reason : std::string("<none>"));
         if (sess_->moqt_session_) {
             sess_->moqt_session_->OnSessionClosed(
                     close_info ? close_info->code : 0,
@@ -3134,8 +3143,17 @@ static void ConfigureEidolonMoqtSession(moqt::MoqtSession* session, uint16_t cb_
         };
     }
 
+    // ДИАГНОСТИКА (reliable-lane teardown): причина завершения серверной сессии.
+    // Если сервер видит "Unexpected FIN" — инициатор клиент; если иной повод и/или
+    // РАНЬШЕ клиента — первопричина на сервере. Пара к клиентскому session_terminated.
+    session->callbacks().session_terminated_callback =
+            +[](absl::string_view e) {
+                LOG(ERROR) << "EIDOLON_DIAG: SERVER MoQT terminated: " << e;
+            };
+
     // Держим peer живым до конца сессии; затем отвязываем мосты.
     session->callbacks().session_deleted_callback = [peer]() mutable {
+        LOG(INFO) << "EIDOLON_DIAG: SERVER session_deleted (WT session destroyed)";
         if (peer->flow) peer->flow->Detach();
         if (peer->dgram_flow) peer->dgram_flow->Detach();
         if (peer->cover_pub) peer->cover_pub->Detach();  // Фаза 6: стоп источника при уходе зонда
