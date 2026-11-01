@@ -153,6 +153,16 @@ EOF
 cat << 'EOF' > net/eidolon/moqt_ostream_shims.h
 #ifndef EIDOLON_MOQT_OSTREAM_SHIMS_H_
 #define EIDOLON_MOQT_OSTREAM_SHIMS_H_
+// На Windows компилятор — clang-cl (MSVC-драйвер): POSIX-тип ssize_t там не
+// определён, а апстрим moqt (moqt_names.cc и соседи) им пользуется. Форс-инклюд
+// этого шима идёт ПЕРЕД телом TU, поэтому объявляем ssize_t здесь, до любых
+// других include'ов. SSIZE_T из <BaseTsd.h> — знаковый, размером с указатель
+// (__int64 на x64/arm64, long на win32): ровно семантика POSIX ssize_t.
+#if defined(_WIN32) && !defined(_SSIZE_T_DEFINED)
+#include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
+#define _SSIZE_T_DEFINED
+#endif
 #include <ostream>
 #include "absl/strings/str_cat.h"
 #include "quiche/quic/moqt/moqt_bitrate_adjuster.h"
