@@ -294,9 +294,22 @@ public:
         bssl::UniquePtr<SSL_SESSION> sess(SSL_SESSION_from_bytes(
                 reinterpret_cast<const uint8_t*>(blob.data()), blob.size(), ctx));
         if (!sess) return nullptr;
+        // Снимаем early-data с тикета. Сессия от сервера early-data-capable, поэтому с ней
+        // BoringSSL входит в 0-RTT → TlsClientHandshaker::OnEnterEarlyData →
+        // PrepareZeroRttConfig, который ТРЕБУЕТ cached transport_params. Мы их не храним,
+        // поэтому handshake падал ("Unable to parse cached transport parameters", проверено
+        // на redroid 2026-11-02). Без early-data идёт чистый 1-RTT resumption, а cached
+        // transport_params там не нужны вовсе (их читает лишь 0-RTT-путь). Это ровно наш
+        // замысел: с диска ТОЛЬКО 1-RTT (anti-replay 0-RTT живёт в памяти и гибнет с
+        // процессом). SSL_SESSION_copy_without_early_data: если early-data уже нет — вернёт
+        // тот же объект с ++refcount; владение результатом наше.
+        bssl::UniquePtr<SSL_SESSION> sess_1rtt(
+                SSL_SESSION_copy_without_early_data(sess.get()));
+        if (!sess_1rtt) return nullptr;
         auto state = std::make_unique<quic::QuicResumptionState>();
-        state->tls_session = std::move(sess);
-        // transport_params / application_state ОСТАВЛЯЕМ null → quiche не пойдёт в 0-RTT (1-RTT).
+        state->tls_session = std::move(sess_1rtt);
+        // transport_params / application_state ОСТАВЛЯЕМ null: они нужны лишь 0-RTT-пути,
+        // который мы только что исключили, сняв early-data с сессии.
         LOG(INFO) << "EIDOLON_DIAG: P5.4 resumption ticket loaded from disk (1-RTT) for "
                   << server_id.host() << ":" << server_id.port();
         return state;
