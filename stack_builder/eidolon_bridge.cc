@@ -254,11 +254,15 @@ static std::string& EidolonResumptionDirRef() {
 // восстанавливаем ТОЛЬКО 1-RTT-резумпцию (короткий handshake без пере-проверки серта), но
 // НЕ 0-RTT early-data: anti-replay-кэш 0-RTT (привязка к key_share, окно 5с) живёт в памяти
 // и гибнет с процессом, поэтому 0-RTT из персистентного тикета открыл бы окно replay. 0-RTT
-// остаётся только для in-process пере-дозвонов (там anti-replay жив — это ветка inner_).
-// Механика запрета 0-RTT с диска: сохраняем лишь SSL_SESSION (quiche смотрит на
-// transport_params/application_state ТОЛЬКО для 0-RTT — мы их не кладём), а на загрузке
-// дополнительно ставим max_early_data=0. Тикеты одноразовые (single-use): прочитал → удалил.
-class EidolonPersistentSessionCache : public quic::SessionCache {
+// остаётся только для in-process пере-дозвонов (там anti-replay жив — это ветка базы).
+// Механика запрета 0-RTT с диска: сохраняем лишь SSL_SESSION, а transport_params/
+// application_state НЕ кладём — quiche включает early-data ТОЛЬКО при наличии кэшированных
+// transport params (см. QuicResumptionState в quic_crypto_client_config.h), поэтому с диска
+// всегда 1-RTT. Тикеты одноразовые (single-use): прочитал → удалил.
+// Наследуемся от конкретного QuicClientSessionCache (не от абстрактного SessionCache): база
+// уже реализует in-memory хранилище + GetSize/GetMaxSize/UpdateMaxSize/ClearEarlyData/
+// OnNewTokenReceived/RemoveExpiredEntries/Clear, а мы переопределяем лишь Insert+Lookup.
+class EidolonPersistentSessionCache : public quic::QuicClientSessionCache {
 public:
     explicit EidolonPersistentSessionCache(std::string dir) : dir_(std::move(dir)) {}
 
@@ -266,18 +270,19 @@ public:
                 bssl::UniquePtr<SSL_SESSION> session,
                 const quic::TransportParameters& params,
                 const quic::ApplicationState* application_state) override {
-        // Сериализуем ДО move в inner_ (после move session опустеет).
+        // Сериализуем ДО передачи в базу (после move session опустеет).
         if (!dir_.empty() && session) {
             PersistSession(server_id, session.get());
         }
-        inner_.Insert(server_id, std::move(session), params, application_state);
+        quic::QuicClientSessionCache::Insert(server_id, std::move(session), params,
+                                             application_state);
     }
 
     std::unique_ptr<quic::QuicResumptionState> Lookup(
             const quic::QuicServerId& server_id, quic::QuicWallTime now,
             const SSL_CTX* ctx) override {
         // 1) In-process тикет этого запуска → 0-RTT разрешён (anti-replay-кэш жив).
-        if (auto st = inner_.Lookup(server_id, now, ctx)) {
+        if (auto st = quic::QuicClientSessionCache::Lookup(server_id, now, ctx)) {
             return st;
         }
         // 2) Тикет с диска, переживший перезапуск → ТОЛЬКО 1-RTT.
@@ -289,31 +294,17 @@ public:
         bssl::UniquePtr<SSL_SESSION> sess(SSL_SESSION_from_bytes(
                 reinterpret_cast<const uint8_t*>(blob.data()), blob.size(), ctx));
         if (!sess) return nullptr;
-        SSL_SESSION_set_max_early_data(sess.get(), 0);  // запрет 0-RTT из персистентного тикета
         auto state = std::make_unique<quic::QuicResumptionState>();
         state->tls_session = std::move(sess);
-        // transport_params / application_state оставляем null → quiche не пойдёт в 0-RTT.
+        // transport_params / application_state ОСТАВЛЯЕМ null → quiche не пойдёт в 0-RTT (1-RTT).
         LOG(INFO) << "EIDOLON_DIAG: P5.4 resumption ticket loaded from disk (1-RTT) for "
                   << server_id.host() << ":" << server_id.port();
         return state;
     }
 
-    void ClearEarlyData(const quic::QuicServerId& server_id) override {
-        inner_.ClearEarlyData(server_id);
-    }
-    void OnNewTokenReceived(const quic::QuicServerId& server_id,
-                            absl::string_view token) override {
-        inner_.OnNewTokenReceived(server_id, token);
-    }
-    void RemoveExpiredEntries(quic::QuicWallTime now) override {
-        inner_.RemoveExpiredEntries(now);
-    }
-    void Clear() override {
-        // Диск не трогаем: файлы одноразовые (перезатираются на Insert, удаляются на Lookup),
-        // так что устаревшие максимум занимают пару КБ до следующего дозвона.
-        inner_.Clear();
-    }
-    size_t size() const override { return inner_.size(); }
+    // ClearEarlyData/OnNewTokenReceived/RemoveExpiredEntries/Clear/GetSize/GetMaxSize/
+    // UpdateMaxSize НАСЛЕДУЕМ от QuicClientSessionCache без изменений. Диск на Clear() не
+    // чистим: файлы одноразовые (перезатираются на Insert, удаляются на Lookup).
 
 private:
     std::string PathFor(const quic::QuicServerId& server_id) const {
@@ -384,7 +375,6 @@ private:
         return true;
     }
 
-    quic::QuicClientSessionCache inner_;
     std::string dir_;
 };
 
