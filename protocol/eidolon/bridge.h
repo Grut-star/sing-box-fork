@@ -79,6 +79,12 @@ EIDOLON_EXPORT EidolonHandle eidolon_listen_moqt(const char* host, uint16_t port
 // пока есть подписка (on-demand). Вызывать ДО eidolon_listen_moqt. Не вызван — выкл.
 EIDOLON_EXPORT void eidolon_cover_configure(uint16_t cover_cb_port, const char* ns, const char* track);
 
+// P5.4 — директория для персистентного session-cache (тикеты TLS1.3-резумпции переживают
+// перезапуск процесса). Зовётся из Go ОДИН РАЗ ДО первого дозвона; путь — app-private.
+// Пустой/NULL => без персистентности. С диска поднимается ТОЛЬКО 1-RTT (0-RTT запрещён:
+// anti-replay-кэш гибнет с процессом).
+EIDOLON_EXPORT void eidolon_set_resumption_cache_dir(const char* dir);
+
 EIDOLON_EXPORT void eidolon_init();
 
 #ifdef __cplusplus

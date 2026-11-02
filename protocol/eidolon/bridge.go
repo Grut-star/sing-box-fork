@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -158,11 +159,34 @@ func RawDialBoundaryStress(isQUIC bool, host string, port int, tokenPtr unsafe.P
 }
 
 func init() {
-    // Гарантирует, что среда Chromium инициализируется один раз при старте
-    C.eidolon_init()
-    // Регистрируем нативный колбэк защиты сокета (сама функция protect ставится позже
-    // через SetProtectFunc, когда известен platform interface бокса).
-    C.eidolon_register_protect()
+	// Гарантирует, что среда Chromium инициализируется один раз при старте
+	C.eidolon_init()
+	// Регистрируем нативный колбэк защиты сокета (сама функция protect ставится позже
+	// через SetProtectFunc, когда известен platform interface бокса).
+	C.eidolon_register_protect()
+}
+
+// resumptionDirOnce гарантирует единичную установку директории персистентного
+// session-cache (P5.4): тикеты TLS1.3-резумпции переживают перезапуск процесса (:bg
+// рестарт иначе терял in-memory кэш → холодный старт шёл полным handshake). Путь
+// app-private (рабочая директория бокса). С диска поднимается ТОЛЬКО 1-RTT —
+// см. EidolonPersistentSessionCache в нативке.
+var resumptionDirOnce sync.Once
+
+// setResumptionCacheDir передаёт нативке директорию для персистентной резумпции.
+// Зовётся из NewOutbound (есть ctx с app-private путём) ДО первого дозвона. Идемпотентно.
+func setResumptionCacheDir(dir string) {
+	resumptionDirOnce.Do(func() {
+		if dir == "" {
+			return
+		}
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return
+		}
+		cDir := C.CString(dir)
+		defer C.free(unsafe.Pointer(cDir))
+		C.eidolon_set_resumption_cache_dir(cDir)
+	})
 }
 
 // globalProtect хранит функцию защиты сокета (Android VpnService.protect через platform interface).
@@ -182,10 +206,10 @@ func SetProtectFunc(f func(fd int) error) {
 // NativeStackConn реализует стандартный интерфейс net.Conn,
 // но физически I/O операции идут через платформозависимый пайп напрямую в ядро Chromium.
 type NativeStackConn struct {
-	closeMu    sync.RWMutex
-	closed     bool
-	handle     C.EidolonHandle
-	dataConn   net.Conn
+	closeMu  sync.RWMutex
+	closed   bool
+	handle   C.EidolonHandle
+	dataConn net.Conn
 	// Фаза 4: ненадёжный датаграм-канал (MoQT datagram-objects). nil для TCP/QUIC
 	// и для MoQT-сессий без датаграм-lane. Кадрирование [len:2 BE][payload].
 	datagramConn net.Conn

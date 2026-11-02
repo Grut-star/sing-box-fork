@@ -119,6 +119,7 @@ typedef SSIZE_T ssize_t;
 #include <sys/socket.h>
 #include "net/http/http_network_session.h"
 #include "quiche/quic/core/quic_path_validator.h"
+#include "quiche/quic/core/quic_crypto_client_stream.h" // P5.4: IsResumption()/EarlyDataAccepted()
 #include "net/quic/quic_chromium_alarm_factory.h"
 #include "net/quic/platform/impl/quic_chromium_clock.h"
 #include "net/http/http_response_headers.h"
@@ -238,9 +239,166 @@ static constexpr size_t kEidolonMigrationSafeMtu = 1200;
 // 0-RTT early-data. Replay-риск 0-RTT закрыт нашим токен-replay-cache (привязка к
 // key_share, окно 5с — см. патч key_share binding). shared_ptr: один инстанс общий
 // для crypto_config всех WT-клиентов (каждый дозвон строит свой url_context/клиент).
+// P5.4+ — директория для ПЕРСИСТЕНТНОГО session-cache (тикеты резумпции, переживающие
+// перезапуск процесса, а не только пере-дозвон в пределах одного запуска). Ставится из Go
+// (eidolon_set_resumption_cache_dir) ДО первого дозвона в app-private рабочую директорию.
+// Пусто → персистентности нет, только in-memory на жизнь процесса (прежнее поведение).
+static std::string& EidolonResumptionDirRef() {
+    static base::NoDestructor<std::string> dir;
+    return *dir;
+}
+
+// EidolonPersistentSessionCache — обёртка над quic::QuicClientSessionCache, добавляющая
+// ПЕРЕЖИВАНИЕ тикетов TLS1.3-резумпции через перезапуск процесса (:bg рестарт теряет
+// in-memory кэш → холодный старт шёл полным handshake). ВАЖНО по безопасности: с диска
+// восстанавливаем ТОЛЬКО 1-RTT-резумпцию (короткий handshake без пере-проверки серта), но
+// НЕ 0-RTT early-data: anti-replay-кэш 0-RTT (привязка к key_share, окно 5с) живёт в памяти
+// и гибнет с процессом, поэтому 0-RTT из персистентного тикета открыл бы окно replay. 0-RTT
+// остаётся только для in-process пере-дозвонов (там anti-replay жив — это ветка inner_).
+// Механика запрета 0-RTT с диска: сохраняем лишь SSL_SESSION (quiche смотрит на
+// transport_params/application_state ТОЛЬКО для 0-RTT — мы их не кладём), а на загрузке
+// дополнительно ставим max_early_data=0. Тикеты одноразовые (single-use): прочитал → удалил.
+class EidolonPersistentSessionCache : public quic::SessionCache {
+public:
+    explicit EidolonPersistentSessionCache(std::string dir) : dir_(std::move(dir)) {}
+
+    void Insert(const quic::QuicServerId& server_id,
+                bssl::UniquePtr<SSL_SESSION> session,
+                const quic::TransportParameters& params,
+                const quic::ApplicationState* application_state) override {
+        // Сериализуем ДО move в inner_ (после move session опустеет).
+        if (!dir_.empty() && session) {
+            PersistSession(server_id, session.get());
+        }
+        inner_.Insert(server_id, std::move(session), params, application_state);
+    }
+
+    std::unique_ptr<quic::QuicResumptionState> Lookup(
+            const quic::QuicServerId& server_id, quic::QuicWallTime now,
+            const SSL_CTX* ctx) override {
+        // 1) In-process тикет этого запуска → 0-RTT разрешён (anti-replay-кэш жив).
+        if (auto st = inner_.Lookup(server_id, now, ctx)) {
+            return st;
+        }
+        // 2) Тикет с диска, переживший перезапуск → ТОЛЬКО 1-RTT.
+        if (dir_.empty()) return nullptr;
+        const std::string path = PathFor(server_id);
+        std::string blob;
+        if (!ReadFileRaw(path, &blob) || blob.empty()) return nullptr;
+        unlink(path.c_str());  // single-use: тикет одноразовый (TLS1.3 anti-replay на сервере)
+        bssl::UniquePtr<SSL_SESSION> sess(SSL_SESSION_from_bytes(
+                reinterpret_cast<const uint8_t*>(blob.data()), blob.size(), ctx));
+        if (!sess) return nullptr;
+        SSL_SESSION_set_max_early_data(sess.get(), 0);  // запрет 0-RTT из персистентного тикета
+        auto state = std::make_unique<quic::QuicResumptionState>();
+        state->tls_session = std::move(sess);
+        // transport_params / application_state оставляем null → quiche не пойдёт в 0-RTT.
+        LOG(INFO) << "EIDOLON_DIAG: P5.4 resumption ticket loaded from disk (1-RTT) for "
+                  << server_id.host() << ":" << server_id.port();
+        return state;
+    }
+
+    void ClearEarlyData(const quic::QuicServerId& server_id) override {
+        inner_.ClearEarlyData(server_id);
+    }
+    void OnNewTokenReceived(const quic::QuicServerId& server_id,
+                            absl::string_view token) override {
+        inner_.OnNewTokenReceived(server_id, token);
+    }
+    void RemoveExpiredEntries(quic::QuicWallTime now) override {
+        inner_.RemoveExpiredEntries(now);
+    }
+    void Clear() override {
+        // Диск не трогаем: файлы одноразовые (перезатираются на Insert, удаляются на Lookup),
+        // так что устаревшие максимум занимают пару КБ до следующего дозвона.
+        inner_.Clear();
+    }
+    size_t size() const override { return inner_.size(); }
+
+private:
+    std::string PathFor(const quic::QuicServerId& server_id) const {
+        std::string key = server_id.host() + ":" + std::to_string(server_id.port());
+        std::string san;
+        san.reserve(key.size());
+        for (char c : key) {
+            const bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                              (c >= '0' && c <= '9') || c == '.' || c == '-';
+            san.push_back(safe ? c : '_');
+        }
+        return dir_ + "/eidolon_rs_" + san + ".bin";
+    }
+
+    void PersistSession(const quic::QuicServerId& server_id, const SSL_SESSION* session) {
+        uint8_t* out = nullptr;
+        size_t out_len = 0;
+        if (!SSL_SESSION_to_bytes(session, &out, &out_len) || out_len == 0) {
+            if (out) OPENSSL_free(out);
+            return;
+        }
+        // Атомарно: temp + fsync + rename, чтобы прерывание процесса не оставило полу-файл
+        // (тот же приём, что в Go-распаковке ассетов). O_CLOEXEC — тикет не утечёт в ffmpeg-cover.
+        const std::string path = PathFor(server_id);
+        const std::string tmp = path + ".tmp";
+        int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        if (fd >= 0) {
+            bool ok = WriteAll(fd, out, out_len);
+            if (ok) ok = (fsync(fd) == 0);
+            close(fd);
+            if (ok && rename(tmp.c_str(), path.c_str()) == 0) {
+                // успех
+            } else {
+                unlink(tmp.c_str());
+            }
+        }
+        OPENSSL_free(out);
+    }
+
+    static bool WriteAll(int fd, const uint8_t* p, size_t n) {
+        size_t off = 0;
+        while (off < n) {
+            ssize_t w = write(fd, p + off, n - off);
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                return false;
+            }
+            off += static_cast<size_t>(w);
+        }
+        return true;
+    }
+
+    static bool ReadFileRaw(const std::string& path, std::string* out) {
+        int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return false;
+        char buf[4096];
+        for (;;) {
+            ssize_t r = read(fd, buf, sizeof(buf));
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                close(fd);
+                return false;
+            }
+            if (r == 0) break;
+            out->append(buf, static_cast<size_t>(r));
+        }
+        close(fd);
+        return true;
+    }
+
+    quic::QuicClientSessionCache inner_;
+    std::string dir_;
+};
+
 static std::shared_ptr<quic::SessionCache>& EidolonSharedSessionCacheRef() {
-    static base::NoDestructor<std::shared_ptr<quic::SessionCache>> cache(
-            std::make_shared<quic::QuicClientSessionCache>());
+    static base::NoDestructor<std::shared_ptr<quic::SessionCache>> cache([]() {
+        const std::string& dir = EidolonResumptionDirRef();
+        if (!dir.empty()) {
+            LOG(INFO) << "EIDOLON_DIAG: P5.4 persistent session-cache dir=" << dir;
+            return std::shared_ptr<quic::SessionCache>(
+                    std::make_shared<EidolonPersistentSessionCache>(dir));
+        }
+        return std::shared_ptr<quic::SessionCache>(
+                std::make_shared<quic::QuicClientSessionCache>());
+    }());
     return *cache;
 }
 
@@ -1536,6 +1694,18 @@ public:
                             quic::QuicTime::Delta::FromMilliseconds(kEidolonKeepAliveActiveMs));
                     LOG(INFO) << "EIDOLON_DIAG: P5.1 initial keep-alive armed ("
                               << kEidolonKeepAliveActiveMs << "ms)";
+
+                    // P5.4 — зафиксировать в логе, РЕЗЮМИРОВАЛСЯ ли TLS-handshake (короткий,
+                    // из session-cache) и принял ли сервер 0-RTT early-data. Иначе «резумпция
+                    // работает» нечем подтвердить рантайм-наблюдением. Клиентская сессия →
+                    // crypto-stream это QuicCryptoClientStream; обе функции const.
+                    const auto* ccs = static_cast<const quic::QuicCryptoClientStream*>(
+                            qs0->GetCryptoStream());
+                    if (ccs) {
+                        LOG(INFO) << "EIDOLON_DIAG: P5.4 handshake resumption="
+                                  << ccs->IsResumption() << " early_data_accepted="
+                                  << ccs->EarlyDataAccepted();
+                    }
                 }
             }
 
@@ -3539,6 +3709,17 @@ EIDOLON_EXPORT void eidolon_cover_configure(uint16_t cover_cb_port, const char* 
     LOG(INFO) << "EIDOLON_DIAG: cover configured enabled=" << g_cover_enabled
               << " cb_port=" << g_cover_cb_port << " track=" << g_cover_track
               << " ns_override=" << (g_cover_ns_override.empty() ? "<per-session>" : g_cover_ns_override);
+}
+
+// P5.4 — путь к app-private директории для персистентного session-cache. Зовётся из Go
+// ОДИН РАЗ ДО первого дозвона (NewOutbound). Ставит глобал, который читает ленивый
+// конструктор EidolonSharedSessionCacheRef при первом EidolonEnableResumption. Пустой/нулевой
+// путь => без персистентности (in-memory). Символ экспортируем на всех ABI (cgo ссылается).
+EIDOLON_EXPORT void eidolon_set_resumption_cache_dir(const char* dir) {
+    if (dir != nullptr && dir[0] != '\0') {
+        EidolonResumptionDirRef() = std::string(dir);
+        LOG(INFO) << "EIDOLON_DIAG: P5.4 resumption cache dir set=" << EidolonResumptionDirRef();
+    }
 }
 
 #if BUILDFLAG(IS_ANDROID)

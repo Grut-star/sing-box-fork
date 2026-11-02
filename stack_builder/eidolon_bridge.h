@@ -28,6 +28,11 @@ EIDOLON_EXPORT EidolonHandle eidolon_listen_moqt(const char* host, uint16_t port
 // eidolon_listen_moqt; не вызван — прикрытие выкл.
 EIDOLON_EXPORT void eidolon_cover_configure(uint16_t cover_cb_port, const char* ns, const char* track);
 
+// P5.4 — app-private директория для персистентного session-cache (тикеты резумпции
+// переживают перезапуск процесса). Зовётся из Go ДО первого дозвона; пусто/NULL => выкл.
+// С диска восстанавливается ТОЛЬКО 1-RTT (0-RTT запрещён: anti-replay гибнет с процессом).
+EIDOLON_EXPORT void eidolon_set_resumption_cache_dir(const char* dir);
+
 // Чтение, запись и закрытие
 int eidolon_read(EidolonHandle handle, uint8_t* buffer, size_t buffer_len);
 int eidolon_write(EidolonHandle handle, const uint8_t* buffer, size_t buffer_len);
