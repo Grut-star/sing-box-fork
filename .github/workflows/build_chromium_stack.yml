@@ -9,6 +9,17 @@ on:
           - quick
           - full
         default: quick
+      platform:
+        description: "solo: собрать только одну платформу (all = по полю mode выше; выбор конкретной платформы собирает ТОЛЬКО её, даже в quick)"
+        type: choice
+        options:
+          - all
+          - linux
+          - android
+          - win
+          - mac-x64
+          - mac-arm64
+        default: all
 
 permissions:
   contents: write
@@ -69,7 +80,7 @@ jobs:
 
   cache-toolchains-posix:
     needs: prepare
-    if: needs.prepare.outputs.should_build == 'true'
+    if: needs.prepare.outputs.should_build == 'true' && (inputs.platform == 'all' || inputs.platform == 'linux' || inputs.platform == 'android')
     runs-on: ubuntu-22.04
     env:
       CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
@@ -116,7 +127,7 @@ jobs:
 
   cache-toolchains-win:
     needs: prepare
-    if: needs.prepare.outputs.should_build == 'true' && inputs.mode == 'full'
+    if: needs.prepare.outputs.should_build == 'true' && (inputs.platform == 'win' || (inputs.platform == 'all' && inputs.mode == 'full'))
     runs-on: windows-2022
     env:
       CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
@@ -151,7 +162,7 @@ jobs:
 
   cache-toolchains-mac-x64:
     needs: prepare
-    if: needs.prepare.outputs.should_build == 'true' && inputs.mode == 'full'
+    if: needs.prepare.outputs.should_build == 'true' && (inputs.platform == 'mac-x64' || (inputs.platform == 'all' && inputs.mode == 'full'))
     runs-on: macos-15-intel
     env:
       CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
@@ -174,7 +185,7 @@ jobs:
 
   cache-toolchains-mac-arm64:
     needs: prepare
-    if: needs.prepare.outputs.should_build == 'true' && inputs.mode == 'full'
+    if: needs.prepare.outputs.should_build == 'true' && (inputs.platform == 'mac-arm64' || (inputs.platform == 'all' && inputs.mode == 'full'))
     runs-on: macos-15
     env:
       CHROMIUM_VERSION: ${{ needs.prepare.outputs.chromium_version }}
@@ -197,7 +208,7 @@ jobs:
 
   linux:
     needs: [prepare, cache-toolchains-posix]
-    if: needs.prepare.outputs.should_build == 'true'
+    if: needs.prepare.outputs.should_build == 'true' && (inputs.platform == 'all' || inputs.platform == 'linux')
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -260,7 +271,7 @@ jobs:
 
   android:
     needs: [prepare, cache-toolchains-posix]
-    if: needs.prepare.outputs.should_build == 'true'
+    if: needs.prepare.outputs.should_build == 'true' && (inputs.platform == 'all' || inputs.platform == 'android')
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -322,7 +333,7 @@ jobs:
 
   win:
     needs: [prepare, cache-toolchains-win]
-    if: needs.prepare.outputs.should_build == 'true' && inputs.mode == 'full'
+    if: needs.prepare.outputs.should_build == 'true' && (inputs.platform == 'win' || (inputs.platform == 'all' && inputs.mode == 'full'))
     runs-on: windows-2022
     strategy:
       fail-fast: false
@@ -375,7 +386,7 @@ jobs:
 
   mac-x64:
     needs: [prepare, cache-toolchains-mac-x64]
-    if: needs.prepare.outputs.should_build == 'true' && inputs.mode == 'full'
+    if: needs.prepare.outputs.should_build == 'true' && (inputs.platform == 'mac-x64' || (inputs.platform == 'all' && inputs.mode == 'full'))
     runs-on: macos-15-intel
     strategy:
       fail-fast: false
@@ -419,7 +430,7 @@ jobs:
 
   mac-arm64:
     needs: [prepare, cache-toolchains-mac-arm64]
-    if: needs.prepare.outputs.should_build == 'true' && inputs.mode == 'full'
+    if: needs.prepare.outputs.should_build == 'true' && (inputs.platform == 'mac-arm64' || (inputs.platform == 'all' && inputs.mode == 'full'))
     runs-on: macos-15
     strategy:
       fail-fast: false
