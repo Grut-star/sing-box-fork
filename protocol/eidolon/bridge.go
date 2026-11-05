@@ -38,6 +38,7 @@ import (
 	"unsafe"
 
 	"github.com/sagernet/sing-box/protocol/eidolon/flowctl"
+	"github.com/sagernet/sing-box/protocol/eidolon/weaver"
 )
 
 var (
@@ -187,6 +188,46 @@ func setResumptionCacheDir(dir string) {
 		defer C.free(unsafe.Pointer(cDir))
 		C.eidolon_set_resumption_cache_dir(cDir)
 	})
+}
+
+// ConfigureJA4 передаёт нативному стеку версионный JA4 allow-set (Weaver W1 #4) ДО listen
+// (модель eidolon_cover_configure). Пустой набор => выключено (QUIC-линия пускает всех).
+// Строки копируются внутрь нативки, так что освобождаем C-буфер сразу после вызова.
+func ConfigureJA4(allow []string) {
+	if len(allow) == 0 {
+		C.eidolon_ja4_configure(nil, 0)
+		return
+	}
+	cArr := make([]*C.char, len(allow))
+	for i, s := range allow {
+		cArr[i] = C.CString(s)
+	}
+	C.eidolon_ja4_configure((**C.char)(unsafe.Pointer(&cArr[0])), C.size_t(len(allow)))
+	for _, p := range cArr {
+		C.free(unsafe.Pointer(p))
+	}
+}
+
+// ComputeJA4 считает JA4-отпечаток сырого ClientHello через нативный BoringSSL-парсер
+// (авторитетный, тот же, что на QUIC-линии). helloBody начинается с legacy_version
+// (record+handshake заголовки сняты). transport — 't' или 'q'. ok=false при ошибке разбора
+// или стабовой нативке. Символ резолвится только при линковке .so в CI.
+func ComputeJA4(helloBody []byte, transport byte) (string, bool) {
+	if len(helloBody) == 0 {
+		return "", false
+	}
+	out := make([]byte, 64) // JA4 = 36 символов + NUL; 64 с запасом
+	n := C.eidolon_ja4_compute(
+		(*C.uint8_t)(unsafe.Pointer(&helloBody[0])),
+		C.size_t(len(helloBody)),
+		C.char(transport),
+		(*C.char)(unsafe.Pointer(&out[0])),
+		C.size_t(len(out)),
+	)
+	if n <= 0 || int(n) > len(out) {
+		return "", false
+	}
+	return string(out[:int(n)]), true
 }
 
 // globalProtect хранит функцию защиты сокета (Android VpnService.protect через platform interface).
@@ -500,8 +541,24 @@ func dialNative(ctx context.Context, host string, port int, token []byte, transp
 	}
 }
 
-func ListenNativeQUIC(ctx context.Context, host string, port int, secret []byte, onAccept func(net.Conn, []byte, []byte)) error {
-	return listenNative(ctx, host, port, secret, onAccept, nil, transportQUIC)
+// AuthFunc validates a lane token against the live exporter and per-lane context
+// (weaver.Ctx*). On success it returns the inner-AEAD salt (AEADSalt(D,capKey,exporter))
+// and the authenticated identity. The eidolon Inbound supplies it (weaver.Validator).
+type AuthFunc func(token, exporter, context []byte) (ok bool, aeadSalt []byte, principal [weaver.PrincipalSize]byte, tier uint8)
+
+// LaneAuth carries a validated lane handshake to the accept/datagram handler: the raw
+// session exporter and flowID (unchanged), plus the weaver-derived AEAD salt and the
+// authenticated principal/tier.
+type LaneAuth struct {
+	SessionKey []byte
+	FlowID     []byte
+	AEADSalt   []byte
+	Principal  [weaver.PrincipalSize]byte
+	Tier       uint8
+}
+
+func ListenNativeQUIC(ctx context.Context, host string, port int, secret []byte, auth AuthFunc, onAccept func(net.Conn, LaneAuth)) error {
+	return listenNative(ctx, host, port, secret, auth, onAccept, nil, transportQUIC)
 }
 
 // ListenNativeMoQT поднимает серверный MoQT (WebTransport-over-H3) слушатель через стек
@@ -509,13 +566,14 @@ func ListenNativeQUIC(ctx context.Context, host string, port int, secret []byte,
 // onDatagram (Фаза 4, может быть nil) — обработчик ненадёжного датаграм-lane: натив
 // коннектит второй cb_port, шлёт meta(80)=token‖key‖flowID(zeros), далее кадры
 // [len:2 BE][payload]; conn отдаётся обработчику ПОСЛЕ чтения meta.
-func ListenNativeMoQT(ctx context.Context, host string, port int, secret []byte, onAccept func(net.Conn, []byte, []byte), onDatagram func(conn net.Conn, sessionKey []byte)) error {
-	return listenNative(ctx, host, port, secret, onAccept, onDatagram, transportMoQT)
+func ListenNativeMoQT(ctx context.Context, host string, port int, secret []byte, auth AuthFunc, onAccept func(net.Conn, LaneAuth), onDatagram func(net.Conn, LaneAuth)) error {
+	return listenNative(ctx, host, port, secret, auth, onAccept, onDatagram, transportMoQT)
 }
 
 // acceptMetaLoop принимает соединения от натива, читает 80-байтовую meta
-// (token‖sessionKey‖flowID), валидирует токен и отдаёт conn обработчику.
-func acceptMetaLoop(ln net.Listener, secret []byte, tag string, channelBind bool, handle func(conn net.Conn, sessionKey, flowID []byte)) {
+// (token‖sessionKey‖flowID), валидирует токен через weaver (с per-lane context) и
+// отдаёт conn обработчику вместе с LaneAuth (inner-AEAD salt + principal/tier).
+func acceptMetaLoop(ln net.Listener, auth AuthFunc, laneCtx []byte, tag string, handle func(conn net.Conn, a LaneAuth)) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -530,34 +588,29 @@ func acceptMetaLoop(ln net.Listener, secret []byte, tag string, channelBind bool
 		token := meta[:32]
 		sessionKey := meta[32:64]
 		flowID := meta[64:]
-		// Для датаграм-линии токен channel-bound к sessionKey (Option A):
-		// валидируем с keyShare=sessionKey, иначе nil (reliable-линия).
-		var keyShare []byte
-		if channelBind {
-			keyShare = sessionKey
-		}
-		if !ValidateTokenConstantTime(string(secret), token, keyShare) {
+		// Токен channel-bound к exporter'у (sessionKey) + разделён по lane через laneCtx.
+		ok, salt, principal, tier := auth(token, sessionKey, laneCtx)
+		if !ok {
 			fmt.Printf("EIDOLON_QUIC_DIAG: %s token validation FAILED -> closing\n", tag)
 			conn.Close()
 			continue
 		}
-		go handle(conn, sessionKey, flowID)
+		go handle(conn, LaneAuth{SessionKey: sessionKey, FlowID: flowID, AEADSalt: salt, Principal: principal, Tier: tier})
 	}
 }
 
-func listenNative(ctx context.Context, host string, port int, secret []byte, onAccept func(net.Conn, []byte, []byte), onDatagram func(net.Conn, []byte), transport nativeTransport) error {
+func listenNative(ctx context.Context, host string, port int, secret []byte, auth AuthFunc, onAccept func(net.Conn, LaneAuth), onDatagram func(net.Conn, LaneAuth), transport nativeTransport) error {
 	localListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return err
 	}
 
-	// reliable-токен QUIC/MoQT-несущей теперь channel-bound к exporter'у (клиент:
-	// outbound.go DialQUIC кладёт в преамбулу GenerateToken(secret, sessionKey)).
-	// Валидируем с keyShare=серверный sessionKey → двойной MITM с иным per-leg
-	// exporter'ом не пройдёт. TCP-fallback валидируется ОТДЕЛЬНО в inbound.go
-	// (SessionID-пик), сюда не заходит, так что флаг его не касается.
-	go acceptMetaLoop(localListener, secret, "reliable", true,
-		func(conn net.Conn, sessionKey, flowID []byte) { onAccept(conn, sessionKey, flowID) })
+	// reliable-токен QUIC/MoQT-несущей channel-bound к exporter'у (клиент: outbound.go
+	// DialQUIC кладёт в преамбулу weaver-слот с context=CtxMoQTReliable). Валидируем с
+	// exporter=серверный sessionKey + lane-context → двойной MITM с иным per-leg
+	// exporter'ом не пройдёт. TCP-fallback валидируется ОТДЕЛЬНО в inbound.go (SessionID).
+	go acceptMetaLoop(localListener, auth, weaver.CtxMoQTReliable, "reliable",
+		func(conn net.Conn, a LaneAuth) { onAccept(conn, a) })
 
 	// Фаза 4: для MoQT с датаграм-обработчиком поднимаем ВТОРОЙ локальный listener
 	// (датаграм cb_port). Натив шлёт туда meta(80), затем кадрированные датаграммы.
@@ -570,8 +623,8 @@ func listenNative(ctx context.Context, host string, port int, secret []byte, onA
 			return err
 		}
 		datagramPort = datagramListener.Addr().(*net.TCPAddr).Port
-		go acceptMetaLoop(datagramListener, secret, "datagram", true,
-			func(conn net.Conn, sessionKey, _ []byte) { onDatagram(conn, sessionKey) })
+		go acceptMetaLoop(datagramListener, auth, weaver.CtxMoQTDatagram, "datagram",
+			func(conn net.Conn, a LaneAuth) { onDatagram(conn, a) })
 	}
 
 	localPort := localListener.Addr().(*net.TCPAddr).Port

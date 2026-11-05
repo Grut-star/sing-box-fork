@@ -37,6 +37,8 @@ typedef SSIZE_T ssize_t;
 #include <vector>
 #include <string>
 #include <atomic>
+#include <algorithm>  // JA4: std::sort для sorted cipher/extension-списков
+#include <mutex>      // JA4: g_ja4_mu вокруг allow-set
 
 #include "net/socket/tcp_client_socket.h"
 #include "net/socket/ssl_client_socket_impl.h"
@@ -52,6 +54,7 @@ typedef SSIZE_T ssize_t;
 #include "components/version_info/version_info.h"
 #include "base/strings/string_number_conversions.h"
 #include "third_party/boringssl/src/include/openssl/ssl.h"
+#include "third_party/boringssl/src/include/openssl/sha2.h"  // JA4: SHA256() one-shot
 
 #include "base/compiler_specific.h"
 #include "base/functional/callback_helpers.h"
@@ -2061,8 +2064,8 @@ private:
         net::SSLConfig ssl_config;
         ssl_config.eidolon_active = true;
 
-        // token_ теперь несёт мастер-секрет; сам токен (nonce||tag) BoringSSL
-        // считает над key_share уже внутри рукопожатия.
+        // token_ теперь несёт Weaver-blob capKey(32)||D(32)||Data (clientWeaverBlob);
+        // слот wire_id||MAC BoringSSL считает над key_share внутри рукопожатия (patch 2b).
         ssl_config.eidolon_secret.assign(token_.begin(), token_.end());
 
         // 5. Создаем SSLClientSocket штатным фабричным методом Chromium
@@ -3695,6 +3698,276 @@ static base::FileDescriptorWatcher* g_file_descriptor_watcher = nullptr;
 
 EIDOLON_EXPORT void eidolon_set_protect(EidolonProtectFunc cb) {
     g_protect_func = cb;
+}
+
+// =====================================================================================
+// Weaver W1 #4 — JA4 enforcement (native-first, обе линии). См. weaver-w1-ja4-spec.md.
+//
+// EidolonJA4Compute() — ЕДИНСТВЕННАЯ реализация FoxIO JA4 над SSL_CLIENT_HELLO
+// (авторитетный парсер BoringSSL). Обе линии кормят её: QUIC — из пропатченного
+// TlsServerHandshaker::EarlySelectCertCallback (eidolon_ja4_quic_observe), TCP — через
+// eidolon_ja4_compute (SSL_parse_client_hello над сырым hello, присланным Go-терминатором).
+// Алгоритм БАЙТ-В-БАЙТ совпадает с Go-оракулом protocol/eidolon/ja4/ja4.go — CI-кросс-чек
+// утверждает равенство выходов на одном и том же ClientHello (защита от дрейфа от стандарта).
+// =====================================================================================
+namespace {
+
+// GREASE (RFC 8701): оба байта равны и младший ниббл == 0xa.
+    inline bool EidolonJA4IsGREASE(uint16_t v) {
+        return (v >> 8) == (v & 0xff) && (v & 0x0f) == 0x0a;
+    }
+
+    inline uint16_t EidolonJA4BE16(const uint8_t* p) {
+        return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
+    }
+
+// hex4: uint16 как "%04x" (строчный, 4 цифры) — как fmt.Sprintf("%04x") в Go.
+    std::string EidolonJA4Hex4(uint16_t v) {
+        static const char kHex[] = "0123456789abcdef";
+        char b[4] = { kHex[(v >> 12) & 0xf], kHex[(v >> 8) & 0xf],
+                      kHex[(v >> 4) & 0xf], kHex[v & 0xf] };
+        return std::string(b, 4);
+    }
+
+// hash12: первые 12 hex-символов SHA-256(s), строчные (hex.EncodeToString(h[:])[:12]).
+    std::string EidolonJA4Hash12(const std::string& s) {
+        uint8_t d[SHA256_DIGEST_LENGTH];
+        SHA256(reinterpret_cast<const uint8_t*>(s.data()), s.size(), d);
+        static const char kHex[] = "0123456789abcdef";
+        std::string out;
+        out.reserve(12);
+        for (int i = 0; i < 6; i++) {  // 6 байт = 12 hex
+            out.push_back(kHex[d[i] >> 4]);
+            out.push_back(kHex[d[i] & 0xf]);
+        }
+        return out;
+    }
+
+// count2: min(n,99), "%02d" (Go count2).
+    std::string EidolonJA4Count2(size_t n) {
+    if (n > 99) n = 99;
+    char b[2] = { static_cast<char>('0' + n / 10), static_cast<char>('0' + n % 10) };
+    return std::string(b, 2);
+}
+
+// sortedHex: отсортированный список %04x через ',' (пусто => ""). Числовая сортировка ==
+// лексикографической для fixed-width hex, т.е. совпадает с Go sort.Strings по %04x-строкам.
+std::string EidolonJA4SortedHex(std::vector<uint16_t> vs) {
+    if (vs.empty()) return std::string();
+    std::sort(vs.begin(), vs.end());
+    std::string out;
+    for (size_t i = 0; i < vs.size(); i++) {
+        if (i) out.push_back(',');
+        out += EidolonJA4Hex4(vs[i]);
+    }
+    return out;
+}
+
+// orderedHex: список %04x В ПОРЯДКЕ следования через ',' (Go orderedHex).
+std::string EidolonJA4OrderedHex(const std::vector<uint16_t>& vs) {
+    std::string out;
+    for (size_t i = 0; i < vs.size(); i++) {
+        if (i) out.push_back(',');
+        out += EidolonJA4Hex4(vs[i]);
+    }
+    return out;
+}
+
+// version: старшая не-GREASE supported_versions, иначе legacy ch->version (Go version()).
+std::string EidolonJA4Version(uint16_t legacy, const std::vector<uint16_t>& sup) {
+    uint16_t v = legacy;
+    if (!sup.empty()) {
+        uint16_t mx = 0;
+        for (uint16_t s : sup) if (s > mx) mx = s;
+        if (mx != 0) v = mx;
+    }
+    switch (v) {
+        case 0x0304: return "13";
+        case 0x0303: return "12";
+        case 0x0302: return "11";
+        case 0x0301: return "10";
+        case 0x0300: return "s3";
+        case 0x0002: return "s2";
+        default:     return "00";
+    }
+}
+
+// readU16s: последовательность uint16 из d[0:len], GREASE отброшены (Go readU16s).
+std::vector<uint16_t> EidolonJA4ReadU16s(const uint8_t* d, size_t len) {
+    std::vector<uint16_t> out;
+    for (size_t i = 0; i + 2 <= len; i += 2) {
+        uint16_t v = EidolonJA4BE16(d + i);
+        if (!EidolonJA4IsGREASE(v)) out.push_back(v);
+    }
+    return out;
+}
+
+// u16ListU16: 2-байтный префикс длины + uint16-список (signature_algorithms). Go u16ListU16.
+std::vector<uint16_t> EidolonJA4U16ListU16(const uint8_t* d, size_t len) {
+    if (len < 2) return {};
+    size_t n = EidolonJA4BE16(d);
+    if (n % 2 != 0 || 2 + n > len) return {};
+    return EidolonJA4ReadU16s(d + 2, n);
+}
+
+// u16ListU8: 1-байтный префикс длины + uint16-список (supported_versions). Go u16ListU8.
+std::vector<uint16_t> EidolonJA4U16ListU8(const uint8_t* d, size_t len) {
+    if (len < 1) return {};
+    size_t n = d[0];
+    if (n % 2 != 0 || 1 + n > len) return {};
+    return EidolonJA4ReadU16s(d + 1, n);
+}
+
+// alpnCode: первый+последний символ первого ALPN ("h2"->"h2","http/1.1"->"h1"), иначе "00".
+std::string EidolonJA4ALPNCode(const std::string& first) {
+    if (first.empty()) return "00";
+    char b[2] = { first.front(), first.back() };
+    return std::string(b, 2);
+}
+
+// firstALPN: первый протокол в ALPN-расширении ([listLen:2]{[len:1]proto}). Go firstALPN.
+std::string EidolonJA4FirstALPN(const uint8_t* d, size_t len) {
+    if (len < 3) return std::string();
+    size_t l = d[2];
+    if (3 + l > len) return std::string();
+    return std::string(reinterpret_cast<const char*>(d + 3), l);
+}
+
+// EidolonJA4Compute: JA4a_JA4b_JA4c над SSL_CLIENT_HELLO. transport: 't' (TCP) / 'q' (QUIC).
+std::string EidolonJA4Compute(const SSL_CLIENT_HELLO* ch, char transport) {
+    // Ciphers: cipher_suites — уже СОДЕРЖИМОЕ списка (без 2-байтного префикса длины).
+    std::vector<uint16_t> ciphers;
+    for (size_t i = 0; i + 2 <= ch->cipher_suites_len; i += 2) {
+        uint16_t c = EidolonJA4BE16(ch->cipher_suites + i);
+        if (!EidolonJA4IsGREASE(c)) ciphers.push_back(c);
+    }
+
+    // Extensions: последовательность [type:2][len:2][data].
+    std::vector<uint16_t> exts;
+    bool sni = false;
+    std::string alpnFirst;
+    std::vector<uint16_t> sigAlgs;
+    std::vector<uint16_t> supVers;
+    {
+        const uint8_t* e = ch->extensions;
+        size_t end = ch->extensions_len;
+        size_t pos = 0;
+        while (pos + 4 <= end) {
+            uint16_t etype = EidolonJA4BE16(e + pos);
+            size_t elen = EidolonJA4BE16(e + pos + 2);
+            pos += 4;
+            if (pos + elen > end) break;
+            const uint8_t* edata = e + pos;
+            pos += elen;
+            if (EidolonJA4IsGREASE(etype)) continue;
+            exts.push_back(etype);
+            switch (etype) {
+                case 0x0000: sni = true; break;                                  // server_name
+                case 0x0010: alpnFirst = EidolonJA4FirstALPN(edata, elen); break; // ALPN
+                case 0x000d: sigAlgs = EidolonJA4U16ListU16(edata, elen); break;  // sig_algs
+                case 0x002b: supVers = EidolonJA4U16ListU8(edata, elen); break;   // supported_versions
+            }
+        }
+    }
+
+    // JA4_a: transport + version + SNI-флаг + cipher-count + ext-count + ALPN-код.
+    std::string a;
+    a.push_back(transport);
+    a += EidolonJA4Version(ch->version, supVers);
+    a += (sni ? "d" : "i");
+    a += EidolonJA4Count2(ciphers.size());
+    a += EidolonJA4Count2(exts.size());  // счёт ВКЛЮЧАЕТ SNI+ALPN (как Go)
+    a += EidolonJA4ALPNCode(alpnFirst);
+
+    // JA4_b: sha256[:12] отсортированных ciphers; пусто => "000000000000".
+    std::string b = ciphers.empty() ? std::string("000000000000")
+                                    : EidolonJA4Hash12(EidolonJA4SortedHex(ciphers));
+
+    // JA4_c: sha256[:12] от sorted(exts \ {SNI,ALPN}) + "_" + sigalgs в порядке.
+    std::vector<uint16_t> cExts;
+    cExts.reserve(exts.size());
+    for (uint16_t t : exts) {
+        if (t == 0x0000 || t == 0x0010) continue;
+        cExts.push_back(t);
+    }
+    std::string c = EidolonJA4Hash12(EidolonJA4SortedHex(cExts) + "_" +
+                                     EidolonJA4OrderedHex(sigAlgs));
+
+    return a + "_" + b + "_" + c;
+}
+
+// g_ja4_allow — allow-set ТОЛЬКО для QUIC-линии (TCP проверяет членство на Go-стороне,
+// натив лишь считает отпечаток). Пусто => выключено. Set-once до listen, читается на
+// QUIC-потоке — всё под g_ja4_mu.
+std::mutex g_ja4_mu;
+std::vector<std::string> g_ja4_allow;
+
+bool EidolonJA4Allowed(const std::string& fp) {
+    std::lock_guard<std::mutex> lk(g_ja4_mu);
+    if (g_ja4_allow.empty()) return true;  // выключено
+    for (const auto& a : g_ja4_allow) if (a == fp) return true;
+    return false;
+}
+
+// Процессный серверный SSL_CTX для SSL_parse_client_hello (нужен лишь для TLS-vs-DTLS).
+// Создаётся один раз, живёт до конца процесса. Потокобезопасная статическая инициализация.
+SSL_CTX* EidolonJA4ServerCtx() {
+    static SSL_CTX* ctx = SSL_CTX_new(TLS_method());
+    return ctx;
+}
+
+}  // namespace
+
+// eidolon_ja4_configure — set-once ДО eidolon_listen_quic/moqt. Копируем allow-set в глобал.
+// n==0 / allow==nullptr => выключено (QUIC пускает всех). C-линкинг через объявление в bridge.h.
+EIDOLON_EXPORT void eidolon_ja4_configure(const char* const* allow, size_t n) {
+    std::lock_guard<std::mutex> lk(g_ja4_mu);
+    g_ja4_allow.clear();
+    if (allow != nullptr) {
+        for (size_t i = 0; i < n; i++) {
+            if (allow[i] != nullptr && allow[i][0] != '\0') {
+                g_ja4_allow.emplace_back(allow[i]);
+            }
+        }
+    }
+    LOG(INFO) << "EIDOLON_DIAG: JA4 configure allow_count=" << g_ja4_allow.size();
+}
+
+// eidolon_ja4_compute — JA4 сырого ClientHello (hello начинается с legacy_version, т.е.
+// record+handshake заголовки уже сняты вызывающим). Пишет NUL-терминированную строку в out,
+// возвращает её длину (без NUL) или <0 при ошибке разбора / нехватке буфера. Используется
+// Go TCP-терминатором (ComputeJA4): считает только отпечаток, членство проверяет Go.
+EIDOLON_EXPORT int eidolon_ja4_compute(const uint8_t* hello, size_t hello_len,
+                                       char transport, char* out, size_t out_len) {
+    if (hello == nullptr || hello_len == 0 || out == nullptr || out_len == 0) return -1;
+    SSL_CTX* ctx = EidolonJA4ServerCtx();
+    if (ctx == nullptr) return -1;
+    SSL* ssl = SSL_new(ctx);
+    if (ssl == nullptr) return -1;
+    SSL_set_accept_state(ssl);  // серверный разбор
+    SSL_CLIENT_HELLO ch;
+    int ok = SSL_parse_client_hello(ssl, &ch, hello, hello_len);
+    // Поля ch алиасят `hello` (валидны пока hello не изменён), НЕ ssl — считаем до SSL_free.
+    std::string fp;
+    if (ok) fp = EidolonJA4Compute(&ch, transport);
+    SSL_free(ssl);
+    if (!ok) return -1;
+    if (fp.size() + 1 > out_len) return -1;  // не влезает вместе с NUL
+    for (size_t i = 0; i < fp.size(); i++) out[i] = fp[i];
+    out[fp.size()] = '\0';
+    return static_cast<int>(fp.size());
+}
+
+// eidolon_ja4_quic_observe — QUIC-линия (из пропатченного TlsServerHandshaker::
+// EarlySelectCertCallback, см. patch_chromium_v152.py). Считает JA4 той же реализацией и
+// сверяет с allow-set. NON-FATAL: только логирует. Handshake НЕ прерываем (TLS-alert
+// демаскировал бы порт — запрещено спекой; доступ к туннелю на QUIC и так гейтится токеном
+// в 80-байтной meta, см. acceptMetaLoop). Жёсткий decoy на QUIC-линии — CI-доработка (§9).
+extern "C" void eidolon_ja4_quic_observe(const SSL_CLIENT_HELLO* ch) {
+    if (ch == nullptr) return;
+    std::string fp = EidolonJA4Compute(ch, 'q');
+    bool allowed = EidolonJA4Allowed(fp);
+    LOG(INFO) << "EIDOLON_DIAG: QUIC JA4=" << fp << " allowed=" << allowed;
 }
 
 // Фаза 6 — конфигурация сервиса-прикрытия. Зовётся один раз из Go (StartCoverIngest)

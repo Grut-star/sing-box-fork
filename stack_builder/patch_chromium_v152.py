@@ -33,30 +33,39 @@ def apply_patch(filepath, pattern, replacement, flags=0, replace_all=False):
 def main():
     print("=== Eidolon Chromium v152 Auto-Patcher ===")
 
-    # 1. SSLConfig: секрет для HMAC. Токен (nonce||tag) считается внутри BoringSSL
-    #    над key_share, поэтому наверх отдаём только мастер-секрет.
+    # 1. SSLConfig: Weaver W1 blob для привязки токена к key_share. eidolon_secret
+    #    теперь несёт НЕ master_secret, а capKey(32)||D(32)||Data(>=36) (clientWeaverBlob,
+    #    outbound_weaver.go). Сам слот wire_id||MAC считает BoringSSL над key_share.
+    #    Имя поля eidolon_secret сохраняем (меняется семантика, не ABI).
     apply_patch(
         'net/ssl/ssl_config.h',
         r'(bool ignore_certificate_errors = false;)',
-        r'\1\n\n  // EIDOLON: привязка токена к key_share\n'
+        r'\1\n\n  // EIDOLON: Weaver-blob (capKey||D||Data) для привязки токена к key_share\n'
         r'  bool eidolon_active = false;\n'
         r'  std::vector<uint8_t> eidolon_secret;\n'
     )
 
-    # 2a. BoringSSL: заголовки для HMAC / time / vector
+    # 2a. BoringSSL: заголовки для HMAC / HKDF / time / vector
     apply_patch(
         'third_party/boringssl/src/ssl/handshake_client.cc',
         r'#include "internal.h"',
         r'#include <time.h>\n'
         r'#include <vector>\n'
         r'#include <openssl/hmac.h>\n'
+        r'#include <openssl/hkdf.h>\n'
         r'#include "internal.h"'
     )
 
-    # 2b. BoringSSL: SessionID = nonce || HMAC(secret, window || nonce || key_share_bytes).
-    #     Инъекция ПОСЛЕ ssl_setup_key_shares (key_share_bytes уже готов) и ДО
-    #     ssl_add_client_hello (ClientHello ещё не сериализован). Это даёт реальную
-    #     привязку токена к эфемерному ключу клиента.
+    # 2b. BoringSSL: Weaver W1 слот. SessionID(32) = wire_id(8) || MAC(24), где
+    #     wire_id = trunc8(HMAC-SHA256(capKey, "weaver-wireid-v1" || BE64(bucket5))),
+    #     k = HKDF-SHA256(ikm=D||capKey, info="weaver-k-v1"),
+    #     MAC = trunc24(HMAC-SHA256(k, "weaver-mac-v1" || Data || key_share || CtxTCP)).
+    #     wire_id (а не случайный nonce, как в легаси) позволяет серверу ВЫБРАТЬ, под
+    #     какой capKey проверять (один общий master_secret ушёл). Инъекция ПОСЛЕ
+    #     ssl_setup_key_shares (key_share_bytes готов) и ДО ssl_add_client_hello. Сервер
+    #     (inbound.go: Validator.Validate ctx=CtxTCP, exporter=key_share) индексирует cap
+    #     по wire_id, реконструирует Data через cap.MarshalData() и пересчитывает MAC.
+    #     Формулы — protocol/eidolon/weaver/primitives.go (byte-exact).
     apply_patch(
         'third_party/boringssl/src/ssl/handshake_client.cc',
         r'if \(!ssl_setup_pre_shared_keys\(hs\) \|\|\s*//\s*'
@@ -69,30 +78,58 @@ def main():
         r'    return ssl_hs_error;\n'
         r'  }\n'
         r'\n'
-        r'  // EIDOLON key_share binding (eidolon_active)\n'
+        r'  // EIDOLON weaver W1 key_share binding (eidolon_active).\n'
+        r'  // ex_data(0) blob = capKey(32) || D(32) || Data(>=36). Slot = wire_id(8)||MAC(24).\n'
         r'  {\n'
-        r'    const std::vector<uint8_t>* eidolon_secret =\n'
+        r'    const std::vector<uint8_t>* eidolon_blob =\n'
         r'        static_cast<const std::vector<uint8_t>*>(SSL_get_ex_data(ssl, 0));\n'
-        r'    if (eidolon_secret != nullptr && !eidolon_secret->empty()) {\n'
-        r'      uint8_t eidolon_nonce[16];\n'
-        r'      RAND_bytes(eidolon_nonce, sizeof(eidolon_nonce));\n'
-        r'      uint64_t eidolon_window = (uint64_t)(time(nullptr) / 5);\n'
-        r'      std::vector<uint8_t> eidolon_input;\n'
-        r'      eidolon_input.reserve(8 + 16 + hs->key_share_bytes.size());\n'
+        r'    if (eidolon_blob != nullptr && eidolon_blob->size() >= 64) {\n'
+        r'      const uint8_t* ew_capkey = eidolon_blob->data();\n'
+        r'      const uint8_t* ew_d = eidolon_blob->data() + 32;\n'
+        r'      const uint8_t* ew_data = eidolon_blob->data() + 64;\n'
+        r'      size_t ew_data_len = eidolon_blob->size() - 64;\n'
+        r'      uint64_t ew_bucket = (uint64_t)(time(nullptr) / 5);\n'
+        r'      uint8_t ew_be_bucket[8];\n'
         r'      for (int i = 0; i < 8; i++) {\n'
-        r'        eidolon_input.push_back((uint8_t)((eidolon_window >> ((7 - i) * 8)) & 0xff));\n'
+        r'        ew_be_bucket[i] = (uint8_t)((ew_bucket >> ((7 - i) * 8)) & 0xff);\n'
         r'      }\n'
-        r'      eidolon_input.insert(eidolon_input.end(), eidolon_nonce, eidolon_nonce + 16);\n'
-        r'      eidolon_input.insert(eidolon_input.end(), hs->key_share_bytes.data(),\n'
-        r'                           hs->key_share_bytes.data() + hs->key_share_bytes.size());\n'
-        r'      uint8_t eidolon_mac[SHA256_DIGEST_LENGTH];\n'
-        r'      unsigned eidolon_mac_len = 0;\n'
-        r'      if (HMAC(EVP_sha256(), eidolon_secret->data(), eidolon_secret->size(),\n'
-        r'               eidolon_input.data(), eidolon_input.size(), eidolon_mac,\n'
-        r'               &eidolon_mac_len) != nullptr && eidolon_mac_len >= 16) {\n'
+        r'      // wire_id = trunc8(HMAC-SHA256(capKey, "weaver-wireid-v1" || BE64(bucket)))\n'
+        r'      static const char kEwWireLabel[] = "weaver-wireid-v1";  // 16 bytes\n'
+        r'      std::vector<uint8_t> ew_wid_in;\n'
+        r'      ew_wid_in.insert(ew_wid_in.end(), kEwWireLabel, kEwWireLabel + 16);\n'
+        r'      ew_wid_in.insert(ew_wid_in.end(), ew_be_bucket, ew_be_bucket + 8);\n'
+        r'      uint8_t ew_wid[SHA256_DIGEST_LENGTH];\n'
+        r'      unsigned ew_wid_len = 0;\n'
+        r'      HMAC(EVP_sha256(), ew_capkey, 32, ew_wid_in.data(), ew_wid_in.size(),\n'
+        r'           ew_wid, &ew_wid_len);\n'
+        r'      // k = HKDF-SHA256(ikm = D || capKey, salt = "", info = "weaver-k-v1")\n'
+        r'      uint8_t ew_kin[64];\n'
+        r'      OPENSSL_memcpy(ew_kin, ew_d, 32);\n'
+        r'      OPENSSL_memcpy(ew_kin + 32, ew_capkey, 32);\n'
+        r'      uint8_t ew_k[32];\n'
+        r'      static const char kEwKLabel[] = "weaver-k-v1";  // 11 bytes\n'
+        r'      int ew_hkdf_ok = HKDF(ew_k, sizeof(ew_k), EVP_sha256(), ew_kin,\n'
+        r'                            sizeof(ew_kin), nullptr, 0,\n'
+        r'                            (const uint8_t*)kEwKLabel, 11);\n'
+        r'      // MAC = trunc24(HMAC(k, "weaver-mac-v1" || Data || key_share || CtxTCP))\n'
+        r'      static const char kEwMacLabel[] = "weaver-mac-v1";     // 13 bytes\n'
+        r'      static const char kEwTcpCtx[]  = "weaver-ctx-tcp-v1";  // 17 bytes\n'
+        r'      std::vector<uint8_t> ew_mac_in;\n'
+        r'      ew_mac_in.reserve(13 + ew_data_len + hs->key_share_bytes.size() + 17);\n'
+        r'      ew_mac_in.insert(ew_mac_in.end(), kEwMacLabel, kEwMacLabel + 13);\n'
+        r'      ew_mac_in.insert(ew_mac_in.end(), ew_data, ew_data + ew_data_len);\n'
+        r'      ew_mac_in.insert(ew_mac_in.end(), hs->key_share_bytes.data(),\n'
+        r'                       hs->key_share_bytes.data() + hs->key_share_bytes.size());\n'
+        r'      ew_mac_in.insert(ew_mac_in.end(), kEwTcpCtx, kEwTcpCtx + 17);\n'
+        r'      uint8_t ew_mac[SHA256_DIGEST_LENGTH];\n'
+        r'      unsigned ew_mac_len = 0;\n'
+        r'      if (ew_hkdf_ok && ew_wid_len >= 8 &&\n'
+        r'          HMAC(EVP_sha256(), ew_k, sizeof(ew_k), ew_mac_in.data(),\n'
+        r'               ew_mac_in.size(), ew_mac, &ew_mac_len) != nullptr &&\n'
+        r'          ew_mac_len >= 24) {\n'
         r'        hs->session_id.ResizeForOverwrite(32);\n'
-        r'        OPENSSL_memcpy(hs->session_id.data(), eidolon_nonce, 16);\n'
-        r'        OPENSSL_memcpy(hs->session_id.data() + 16, eidolon_mac, 16);\n'
+        r'        OPENSSL_memcpy(hs->session_id.data(), ew_wid, 8);\n'
+        r'        OPENSSL_memcpy(hs->session_id.data() + 8, ew_mac, 24);\n'
         r'      }\n'
         r'    }\n'
         r'  }\n'
@@ -123,12 +160,13 @@ def main():
         replace_all=True
     )
 
-    # 5. TCP: передаём СЕКРЕТ вниз в BoringSSL (токен считается там над key_share)
+    # 5. TCP: передаём Weaver-blob (capKey||D||Data) вниз в BoringSSL через ex_data(0)
+    #    (слот wire_id||MAC считается там над key_share, см. 2b).
     apply_patch(
         'net/socket/ssl_client_socket_impl.cc',
         r'(if \(!ssl_ \|\| !context->SetClientSocketForSSL\(ssl_\.get\(\), this\)\)[\s\n]*return ERR_UNEXPECTED;)',
         r'\1\n\n'
-        r'  // EIDOLON: передаём секрет в BoringSSL для привязки токена к key_share\n'
+        r'  // EIDOLON: передаём Weaver-blob в BoringSSL для привязки токена к key_share\n'
         r'  if (ssl_config_.eidolon_active) {\n'
         r'    ssl_config_.ignore_certificate_errors = true;\n'
         r'    SSL_set_ex_data(ssl_.get(), 0, (void*)&ssl_config_.eidolon_secret);\n'
@@ -351,6 +389,27 @@ def main():
         r'  // [EIDOLON] M.1: заново взвести path-MTU discovery (growth-пробинг) после\n'
         r'  // миграции несущей на новую сеть. Реализация в eidolon_bridge.cc.\n'
         r'  void EidolonRestartMtuDiscovery();'
+    )
+
+    # 15. Weaver W1 #4 — JA4 observe на QUIC-линии. EarlySelectCertCallback — единственное
+    #     место с сырым SSL_CLIENT_HELLO на сервере. Вставляем ПОСЛЕ первого входа в колбэк
+    #     вызов eidolon_ja4_quic_observe (реализация в net/eidolon/eidolon_bridge.cc): считает
+    #     JA4 той же реализацией, что TCP-линия, и логирует сверку с allow-set. NON-FATAL:
+    #     возврат колбэка НЕ меняем — TLS-alert демаскировал бы порт (запрещено спекой), а
+    #     доступ к туннелю на QUIC и так гейтится токеном в 80-байтной meta (acceptMetaLoop).
+    #     Жёсткий decoy на QUIC-линии — CI-доработка (weaver-w1-ja4-spec.md §9). Объявление —
+    #     block-scope extern "C" (SSL_CLIENT_HELLO уже в области видимости: это тип параметра),
+    #     поэтому отдельный patch include/forward-decl не нужен.
+    apply_patch(
+        'net/third_party/quiche/src/quiche/quic/core/tls_server_handshaker.cc',
+        r'(  // This is the first call\.\n  select_cert_status_ = QUIC_PENDING;)',
+        r'\1\n'
+        r'\n'
+        r'  // [EIDOLON] Weaver W1 #4 — JA4 observe (native-first, обе линии), NON-FATAL.\n'
+        r'  {\n'
+        r'    extern "C" void eidolon_ja4_quic_observe(const SSL_CLIENT_HELLO*);\n'
+        r'    eidolon_ja4_quic_observe(client_hello);\n'
+        r'  }'
     )
 
 

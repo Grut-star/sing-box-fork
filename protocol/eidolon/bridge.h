@@ -79,6 +79,19 @@ EIDOLON_EXPORT EidolonHandle eidolon_listen_moqt(const char* host, uint16_t port
 // пока есть подписка (on-demand). Вызывать ДО eidolon_listen_moqt. Не вызван — выкл.
 EIDOLON_EXPORT void eidolon_cover_configure(uint16_t cover_cb_port, const char* ns, const char* track);
 
+// Weaver W1 #4 — JA4 enforcement (native-first, both lanes). allow — массив JA4-строк
+// (санкционированные стеки); n==0 => выключено (всех пускаем). Копируется внутрь нативки,
+// Go-буфер после вызова свободен. Вызывать ДО eidolon_listen_quic/moqt (как cover_configure).
+EIDOLON_EXPORT void eidolon_ja4_configure(const char* const* allow, size_t n);
+
+// Считает JA4 сырого ClientHello через BoringSSL (авторитетный парсер). hello начинается с
+// legacy_version (record+handshake заголовки уже сняты), как требует SSL_parse_client_hello.
+// transport — 't' (TLS/TCP) или 'q' (QUIC). Пишет NUL-терминированную строку в out
+// (<= out_len), возвращает её длину (без NUL) или <0 при ошибке разбора. Это путь TCP-линии:
+// Go-терминатор делегирует вычисление вниз, чтобы обе линии использовали один парсер.
+EIDOLON_EXPORT int eidolon_ja4_compute(const uint8_t* hello, size_t hello_len,
+                                       char transport, char* out, size_t out_len);
+
 // P5.4 — директория для персистентного session-cache (тикеты TLS1.3-резумпции переживают
 // перезапуск процесса). Зовётся из Go ОДИН РАЗ ДО первого дозвона; путь — app-private.
 // Пустой/NULL => без персистентности. С диска поднимается ТОЛЬКО 1-RTT (0-RTT запрещён:

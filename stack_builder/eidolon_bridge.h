@@ -67,6 +67,19 @@ typedef struct {
 
 EIDOLON_EXPORT int eidolon_get_stats(EidolonHandle handle, EidolonStats* out);
 
+// Weaver W1 #4 — JA4 enforcement (native-first, both lanes). allow — массив JA4-строк
+// (санкционированные стеки); n==0 => выключено (всех пускаем). Копируется внутрь нативки,
+// Go-буфер после вызова свободен. Вызывать ДО eidolon_listen_quic/moqt.
+// Layout/сигнатура обязаны совпадать с protocol/eidolon/bridge.h (ABI cgo<->нативка).
+EIDOLON_EXPORT void eidolon_ja4_configure(const char* const* allow, size_t n);
+
+// Считает JA4 сырого ClientHello через BoringSSL. hello начинается с legacy_version
+// (record+handshake заголовки сняты), как требует SSL_parse_client_hello. transport —
+// 't' (TLS/TCP) или 'q' (QUIC). Пишет NUL-терминированную строку в out (<= out_len),
+// возвращает её длину (без NUL) или <0 при ошибке разбора.
+EIDOLON_EXPORT int eidolon_ja4_compute(const uint8_t* hello, size_t hello_len,
+                                       char transport, char* out, size_t out_len);
+
 #ifdef __cplusplus
 }
 #endif
