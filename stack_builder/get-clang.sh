@@ -56,10 +56,29 @@ if [ "$SYSROOT_ARCH" -a ! -d ./"$WITH_SYSROOT/lib" ]; then
   # БЕЗ "|| true": раньше провал sysroot_creator глотался, пустой sysroot доживал до
   # gn gen, и 158 падал НЕПОНЯТНОЙ ошибкой в build/modules/BUILD.gn (скан
   # ${sysroot}/usr/include на этапе конфигурации). Теперь фейлим громко здесь, на
-  # правильном шаге, с реальной ошибкой (set -ex). Срабатывает только при реальном
-  # ребилде sysroot (cache-miss на bump CHROMIUM_VERSION): при cache-hit $WITH_SYSROOT/lib
+  # правильном шаге, с реальной ошибкой. Срабатывает только при реальном ребилде
+  # sysroot (cache-miss на bump CHROMIUM_VERSION): при cache-hit $WITH_SYSROOT/lib
   # уже есть и блок пропускается.
-  ./build/linux/sysroot_scripts/sysroot_creator.py build "$SYSROOT_ARCH"
+  #
+  # snapshot.debian.org периодически отдаёт 503 "No healthy backends" на отдельные
+  # пакеты; встроенного ретрая sysroot_creator (5 попыток, ~31с суммарно) не всегда
+  # хватает, чтобы пережить такое окно. Оборачиваем в ретрай ВСЕГО скрипта:
+  #  - download_or_copy пропускает уже скачанные .deb (os.path.exists), а download_file
+  #    пишет атомарно (temp→rename) — битых частичных файлов не остаётся;
+  #  - значит повтор до-качивает ТОЛЬКО провалившийся пакет, остальное сетевое уже на диске;
+  #  - build_sysroot чистит лишь staging (clear_install_dir), debian-packages/ — сосед,
+  #    не трогается; пере-распаковка staging локальная (секунды).
+  # До 5 проходов с нарастающей паузой (30/60/90/120с ≈ 5 мин пережидания + внутренний
+  # ~31с ретрай на каждый пакет).
+  _sr_ok=0
+  for _sr in 1 2 3 4 5; do
+    if ./build/linux/sysroot_scripts/sysroot_creator.py build "$SYSROOT_ARCH"; then
+      _sr_ok=1; break
+    fi
+    echo "get-clang: sysroot build attempt $_sr/5 failed (snapshot.debian.org 503?); resuming after pause..." >&2
+    if [ "$_sr" -lt 5 ]; then sleep $((_sr * 30)); fi
+  done
+  [ "$_sr_ok" = 1 ] || { echo "get-clang: sysroot build FAILED after 5 attempts" >&2; exit 1; }
 fi
 
 if [ "$OPENWRT_FLAGS" ]; then
