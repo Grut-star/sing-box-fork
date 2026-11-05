@@ -392,24 +392,35 @@ def main():
     )
 
     # 15. Weaver W1 #4 — JA4 observe на QUIC-линии. EarlySelectCertCallback — единственное
-    #     место с сырым SSL_CLIENT_HELLO на сервере. Вставляем ПОСЛЕ первого входа в колбэк
-    #     вызов eidolon_ja4_quic_observe (реализация в net/eidolon/eidolon_bridge.cc): считает
-    #     JA4 той же реализацией, что TCP-линия, и логирует сверку с allow-set. NON-FATAL:
-    #     возврат колбэка НЕ меняем — TLS-alert демаскировал бы порт (запрещено спекой), а
-    #     доступ к туннелю на QUIC и так гейтится токеном в 80-байтной meta (acceptMetaLoop).
-    #     Жёсткий decoy на QUIC-линии — CI-доработка (weaver-w1-ja4-spec.md §9). Объявление —
-    #     block-scope extern "C" (SSL_CLIENT_HELLO уже в области видимости: это тип параметра),
-    #     поэтому отдельный patch include/forward-decl не нужен.
+    #     место с сырым SSL_CLIENT_HELLO на сервере. Реализация eidolon_ja4_quic_observe в
+    #     net/eidolon/eidolon_bridge.cc: считает JA4 той же реализацией, что TCP-линия, и
+    #     логирует сверку с allow-set. NON-FATAL: возврат колбэка НЕ меняем — TLS-alert
+    #     демаскировал бы порт (запрещено спекой), а доступ к туннелю на QUIC и так гейтится
+    #     токеном в 80-байтной meta (acceptMetaLoop). Жёсткий decoy на QUIC — CI-доработка (§9).
+    #
+    #     15a: forward-decl НА NAMESPACE-SCOPE (внутри namespace quic, перед определением
+    #     функции). ВАЖНО: linkage-specification `extern "C"` НЕЛЬЗЯ ставить в block-scope
+    #     (ошибка "expected unqualified-id") — только на namespace scope. SSL_CLIENT_HELLO уже
+    #     виден (openssl/ssl.h включён выше; это тип параметра функции-якоря).
+    apply_patch(
+        'net/third_party/quiche/src/quiche/quic/core/tls_server_handshaker.cc',
+        r'(ssl_select_cert_result_t TlsServerHandshaker::EarlySelectCertCallback\(\n'
+        r'    const SSL_CLIENT_HELLO\* client_hello\) \{)',
+        r'// [EIDOLON] Weaver W1 #4 — forward-decl нативного JA4-observe (namespace-scope;\n'
+        r'// block-scope extern "C" запрещён стандартом). Реализация — net/eidolon/eidolon_bridge.cc.\n'
+        r'extern "C" void eidolon_ja4_quic_observe(const SSL_CLIENT_HELLO*);\n'
+        r'\n'
+        r'\1'
+    )
+
+    #     15b: сам вызов — обычный statement в block-scope (без extern "C").
     apply_patch(
         'net/third_party/quiche/src/quiche/quic/core/tls_server_handshaker.cc',
         r'(  // This is the first call\.\n  select_cert_status_ = QUIC_PENDING;)',
         r'\1\n'
         r'\n'
         r'  // [EIDOLON] Weaver W1 #4 — JA4 observe (native-first, обе линии), NON-FATAL.\n'
-        r'  {\n'
-        r'    extern "C" void eidolon_ja4_quic_observe(const SSL_CLIENT_HELLO*);\n'
-        r'    eidolon_ja4_quic_observe(client_hello);\n'
-        r'  }'
+        r'  eidolon_ja4_quic_observe(client_hello);'
     )
 
 
