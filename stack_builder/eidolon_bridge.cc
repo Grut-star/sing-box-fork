@@ -1225,7 +1225,7 @@ public:
     // MoqtFailedFetch удалён — сообщаем kNotSupported через callback и отдаём nullptr
     // (как MoqtOutgoingQueue для неподдерживаемого Fetch).
     std::unique_ptr<moqt::MoqtFetchTask> StandaloneFetch(
-            moqt::Location, moqt::Location, moqt::MoqtDeliveryOrder,
+            moqt::Location, moqt::Location, moqt::MoqtGroupOrder,
             moqt::FetchResponseCallback callback) override {
         std::move(callback)(moqt::MoqtRequestErrorInfo(
                 moqt::RequestErrorCode::kNotSupported, std::nullopt,
@@ -1233,14 +1233,14 @@ public:
         return nullptr;
     }
     std::unique_ptr<moqt::MoqtFetchTask> RelativeFetch(
-            uint64_t, moqt::MoqtDeliveryOrder, moqt::FetchResponseCallback callback) override {
+            uint64_t, moqt::MoqtGroupOrder, moqt::FetchResponseCallback callback) override {
         std::move(callback)(moqt::MoqtRequestErrorInfo(
                 moqt::RequestErrorCode::kNotSupported, std::nullopt,
                 "eidolon tunnel: fetch unsupported"));
         return nullptr;
     }
     std::unique_ptr<moqt::MoqtFetchTask> AbsoluteFetch(
-            uint64_t, moqt::MoqtDeliveryOrder, moqt::FetchResponseCallback callback) override {
+            uint64_t, moqt::MoqtGroupOrder, moqt::FetchResponseCallback callback) override {
         std::move(callback)(moqt::MoqtRequestErrorInfo(
                 moqt::RequestErrorCode::kNotSupported, std::nullopt,
                 "eidolon tunnel: fetch unsupported"));
@@ -1364,7 +1364,7 @@ public:
     // Fetch датаграм-треку не нужен (fire-and-forget). В 156 +FetchResponseCallback,
     // MoqtFailedFetch удалён -> kNotSupported через callback + nullptr.
     std::unique_ptr<moqt::MoqtFetchTask> StandaloneFetch(
-            moqt::Location, moqt::Location, moqt::MoqtDeliveryOrder,
+            moqt::Location, moqt::Location, moqt::MoqtGroupOrder,
             moqt::FetchResponseCallback callback) override {
         std::move(callback)(moqt::MoqtRequestErrorInfo(
                 moqt::RequestErrorCode::kNotSupported, std::nullopt,
@@ -1372,14 +1372,14 @@ public:
         return nullptr;
     }
     std::unique_ptr<moqt::MoqtFetchTask> RelativeFetch(
-            uint64_t, moqt::MoqtDeliveryOrder, moqt::FetchResponseCallback callback) override {
+            uint64_t, moqt::MoqtGroupOrder, moqt::FetchResponseCallback callback) override {
         std::move(callback)(moqt::MoqtRequestErrorInfo(
                 moqt::RequestErrorCode::kNotSupported, std::nullopt,
                 "eidolon dgram: fetch unsupported"));
         return nullptr;
     }
     std::unique_ptr<moqt::MoqtFetchTask> AbsoluteFetch(
-            uint64_t, moqt::MoqtDeliveryOrder, moqt::FetchResponseCallback callback) override {
+            uint64_t, moqt::MoqtGroupOrder, moqt::FetchResponseCallback callback) override {
         std::move(callback)(moqt::MoqtRequestErrorInfo(
                 moqt::RequestErrorCode::kNotSupported, std::nullopt,
                 "eidolon dgram: fetch unsupported"));
@@ -3014,20 +3014,20 @@ public:
     }
     const moqt::TrackProperties& properties() const override { return properties_; }
     std::unique_ptr<moqt::MoqtFetchTask> StandaloneFetch(
-            moqt::Location, moqt::Location, moqt::MoqtDeliveryOrder,
+            moqt::Location, moqt::Location, moqt::MoqtGroupOrder,
             moqt::FetchResponseCallback callback) override {
         std::move(callback)(moqt::MoqtRequestErrorInfo(
                 moqt::RequestErrorCode::kNotSupported, std::nullopt, "eidolon cover: fetch unsupported"));
         return nullptr;
     }
     std::unique_ptr<moqt::MoqtFetchTask> RelativeFetch(
-            uint64_t, moqt::MoqtDeliveryOrder, moqt::FetchResponseCallback callback) override {
+            uint64_t, moqt::MoqtGroupOrder, moqt::FetchResponseCallback callback) override {
         std::move(callback)(moqt::MoqtRequestErrorInfo(
                 moqt::RequestErrorCode::kNotSupported, std::nullopt, "eidolon cover: fetch unsupported"));
         return nullptr;
     }
     std::unique_ptr<moqt::MoqtFetchTask> AbsoluteFetch(
-            uint64_t, moqt::MoqtDeliveryOrder, moqt::FetchResponseCallback callback) override {
+            uint64_t, moqt::MoqtGroupOrder, moqt::FetchResponseCallback callback) override {
         std::move(callback)(moqt::MoqtRequestErrorInfo(
                 moqt::RequestErrorCode::kNotSupported, std::nullopt, "eidolon cover: fetch unsupported"));
         return nullptr;
@@ -3710,6 +3710,10 @@ EIDOLON_EXPORT void eidolon_set_protect(EidolonProtectFunc cb) {
 // Алгоритм БАЙТ-В-БАЙТ совпадает с Go-оракулом protocol/eidolon/ja4/ja4.go — CI-кросс-чек
 // утверждает равенство выходов на одном и том же ClientHello (защита от дрейфа от стандарта).
 // =====================================================================================
+// Файл с ~3690 обёрнут в extern "C" {...}; восстанавливаем C++ linkage для внутренних
+// C++-хелперов (иначе функции с std::string/std::vector получают C-linkage → предупреждения
+// -Wreturn-type-c-linkage и риск ODR-коллизии по немангленному имени).
+extern "C++" {
 namespace {
 
 // GREASE (RFC 8701): оба байта равны и младший ниббл == 0xa.
@@ -3917,6 +3921,7 @@ SSL_CTX* EidolonJA4ServerCtx() {
 }
 
 }  // namespace
+}  // extern "C++"
 
 // eidolon_ja4_configure — set-once ДО eidolon_listen_quic/moqt. Копируем allow-set в глобал.
 // n==0 / allow==nullptr => выключено (QUIC пускает всех). C-линкинг через объявление в bridge.h.
