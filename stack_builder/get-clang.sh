@@ -43,7 +43,23 @@ fetch_src() {
 }
 
 if [ "$SYSROOT_ARCH" -a ! -d ./"$WITH_SYSROOT/lib" ]; then
-  ./build/linux/sysroot_scripts/sysroot_creator.py build "$SYSROOT_ARCH" || true
+  # keyring.gpg из chromium-тарбола со временем протухает (подписные ключи Debian
+  # истекают), а 158-й sysroot_creator.py верит Release.gpg через gpgv по этому
+  # keyring'у. Регенерим свежий keyring (как делают naive-workflow'ы linux.yml/
+  # build.yml/docker.yml ПЕРЕД сборкой — build_chromium_stack.yml этого не делал).
+  # Best-effort: если keyserver недоступен, оставляем бандл-keyring и пробуем дальше
+  # (generate_keyring.sh перезаписывает keyring.gpg, поэтому rm не нужен).
+  if [ -f build/linux/sysroot_scripts/generate_keyring.sh ]; then
+    GPG_TTY=/dev/null ./build/linux/sysroot_scripts/generate_keyring.sh \
+      || echo "get-clang: keyring regen failed; fall back to bundled keyring.gpg" >&2
+  fi
+  # БЕЗ "|| true": раньше провал sysroot_creator глотался, пустой sysroot доживал до
+  # gn gen, и 158 падал НЕПОНЯТНОЙ ошибкой в build/modules/BUILD.gn (скан
+  # ${sysroot}/usr/include на этапе конфигурации). Теперь фейлим громко здесь, на
+  # правильном шаге, с реальной ошибкой (set -ex). Срабатывает только при реальном
+  # ребилде sysroot (cache-miss на bump CHROMIUM_VERSION): при cache-hit $WITH_SYSROOT/lib
+  # уже есть и блок пропускается.
+  ./build/linux/sysroot_scripts/sysroot_creator.py build "$SYSROOT_ARCH"
 fi
 
 if [ "$OPENWRT_FLAGS" ]; then
